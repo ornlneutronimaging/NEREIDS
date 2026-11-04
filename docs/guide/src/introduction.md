@@ -35,7 +35,9 @@ NEREIDS ships in several interfaces:
 
 NEREIDS implements the same physics as SAMMY
 (a Fortran code for multilevel R-matrix analysis of neutron data, ORNL/TM-9179/R8), rewritten in
-Rust with modern tooling. All physics modules reference specific SAMMY source files
+Rust with modern tooling. An exception is the crystal lattice's Doppler broadening: its
+recoil energy is E/A, where SAMMY's crystal-lattice model takes E/(A + 1).
+All physics modules reference specific SAMMY source files
 and equation numbers in their documentation.
 
 Key formalisms from SAMMY:

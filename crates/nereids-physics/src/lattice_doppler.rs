@@ -1,13 +1,11 @@
 //! Doppler broadening by nuclei bound in a harmonic crystal.
 //!
-//! Lamb's incoherent harmonic model, the one SAMMY's crystal-lattice model
-//! (DOPUSH, after NJOY's LEAPR) expands in phonons: a neutron of energy `E`
-//! absorbed by a nucleus of mass ratio `A` leaves an energy `ε` to the
-//! lattice, drawn from
+//! Lamb's incoherent harmonic model: a neutron of energy `E` absorbed by a
+//! nucleus of mass ratio `A` leaves an energy `ε` to the lattice, drawn from
 //!
 //! ```text
 //! P(ε) = (1/2π) ∫ e^{iεt} Φ(t) dt,   Φ(t) = exp(R·[G(t) − G(0)]),
-//! G(t) = ∫ ρ(ω)/ω · [coth(ω/2kT)·cos ωt − i·sin ωt] dω,   R = E/(A + 1),
+//! G(t) = ∫ ρ(ω)/ω · [coth(ω/2kT)·cos ωt − i·sin ωt] dω,   R = E/A,
 //! ```
 //!
 //! `ρ` the phonon density of states, so the cross section is
@@ -17,8 +15,11 @@
 //! ```
 //!
 //! the first term the zero-phonon line and `P_c = P − e^{−2W}·δ`.  `P` has
-//! mean `R` and variance `2R·kT_eff` with `kT_eff = ½∫ρ·ω·coth(ω/2kT) dω`,
-//! so a free gas at `T_eff` has the same two moments.
+//! mean `R` and variance `2R·kT_eff = Δ²/2`, `kT_eff = ½∫ρ·ω·coth(ω/2kT) dω`
+//! and `Δ` the Doppler width of a free gas at `T_eff` (Fröhner Eq. 241).
+//!
+//! SAMMY's crystal-lattice model takes `R = E/(A + 1)`, which gives
+//! `A/(A + 1)` of this variance.
 //!
 //! `σ` is sampled once on a uniform grid of step `h`, the integral is the
 //! trapezoid rule on that grid, and `P_c` comes on the grid's nodes from a
@@ -28,6 +29,11 @@
 //! makes the trapezoid rule's error `≈ e^{−πΓ/h}`, so `h ≤ πΓ/30` for every
 //! resonance the kernel reaches, `h ≤ π·ω_max/100`, and `h` is a tenth of
 //! every File-3 knot interval within reach.
+//!
+//! # References
+//! - W. E. Lamb, Phys. Rev. 55, 190 (1939).
+//! - A. Courcelle and J. Rowlands, arXiv:0709.2767 (2007), Eqs. (8)–(10).
+//! - F. H. Fröhner, JEFF Report 18, OECD/NEA (2000), Eqs. (241)–(243).
 
 use std::f64::consts::PI;
 
@@ -109,7 +115,7 @@ impl std::fmt::Display for LatticeError {
             Self::TooManyPoints(n) => {
                 write!(
                     f,
-                    "lattice broadening needs {n} points, more than {MAX_POINTS}"
+                    "lattice broadening needs at least {n} points, more than {MAX_POINTS}"
                 )
             }
             Self::Jump(e) => write!(
@@ -214,8 +220,8 @@ impl PhononSpectrum {
         self.step_ev * (self.density.len() - 1) as f64
     }
 
-    /// `T_eff`, the free gas's temperature with the kernel's variance at
-    /// `temperature_k`: `k·T_eff = ½∫ρ·ω·coth(ω/2kT) dω`.
+    /// `T_eff` at `temperature_k`, `k·T_eff = ½∫ρ·ω·coth(ω/2kT) dω`: the kernel's
+    /// variance is `Δ²/2`, `Δ` the Doppler width of a free gas at `T_eff`.
     #[must_use]
     pub fn effective_temperature_k(&self, temperature_k: f64) -> f64 {
         Phonons::new(&self.nodes(0.0), temperature_k, 0.0, 0).kt_eff / BOLTZMANN_EV_PER_K
@@ -227,7 +233,7 @@ impl PhononSpectrum {
     #[must_use]
     pub fn reach_ev(&self, energy_ev: f64, temperature_k: f64, awr: f64) -> f64 {
         let kt_eff = BOLTZMANN_EV_PER_K * self.effective_temperature_k(temperature_k);
-        reach(energy_ev / (awr + 1.0), kt_eff, self.max_ev())
+        reach(energy_ev / awr, kt_eff, self.max_ev())
     }
 
     /// The number of quadrature nodes [`Self::nodes`] gives for `t_max`.
@@ -370,7 +376,7 @@ pub fn broaden_in_lattice(
     if energies.is_empty() {
         return Err(DopplerError::EmptyGrid.into());
     }
-    let recoil = |energy: f64| energy / (data.awr + 1.0);
+    let recoil = |energy: f64| energy / data.awr;
     let omega_max = spectrum.max_ev();
     let kt_eff = BOLTZMANN_EV_PER_K * spectrum.effective_temperature_k(temperature_k);
     let reach_at = |energy: f64| reach(recoil(energy), kt_eff, omega_max);
@@ -408,17 +414,19 @@ pub fn broaden_in_lattice(
         }
     }
     let widest = energies.iter().map(|&e| reach_at(e)).fold(0.0, f64::max);
-    let transform = ((2.0 * widest / h).ceil() as usize + 1).next_power_of_two();
+    let span = ((2.0 * widest / h).ceil() as usize).saturating_add(1);
     let origin = lowest - 2.0 * h;
     if origin <= 0.0 {
         return Err(LatticeError::BelowZero(origin));
     }
-    let grid_points = ((highest - origin) / h).ceil() as usize + 3;
-    for needed in [transform, grid_points] {
+    let grid_points = (((highest - origin) / h).ceil() as usize).saturating_add(3);
+    for needed in [span, grid_points] {
         if needed > MAX_POINTS {
             return Err(LatticeError::TooManyPoints(needed));
         }
     }
+    // MAX_POINTS is a power of 2, so the transform fits when its span does.
+    let transform = span.next_power_of_two();
     let half = transform / 2;
     let dt = 2.0 * PI / (transform as f64 * h);
     let t_max = (100.0 / omega_max).min(PI / h);

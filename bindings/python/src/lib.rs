@@ -3166,8 +3166,8 @@ impl PyPhononSpectrum {
         self.inner.max_ev()
     }
 
-    /// The free gas's temperature whose broadening has the lattice's variance
-    /// at temperature_k, finite and positive.
+    /// The temperature of the free gas whose Doppler width Delta gives the
+    /// lattice's variance Delta**2/2 at temperature_k, finite and positive.
     fn effective_temperature_k(&self, temperature_k: f64) -> PyResult<f64> {
         if !(temperature_k.is_finite() && temperature_k > 0.0) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(

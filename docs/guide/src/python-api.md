@@ -82,8 +82,8 @@ values every step_ev eV from 0, the first 0, quadratic in the energy up to the
 first point and linear between the others, scaled to unit area.
 PhononSpectrum.debye(theta_k, points=1000) is Debye's, 3*w**2/w_D**3 up to
 w_D = k*theta_k. max_ev is the highest phonon energy, and
-effective_temperature_k(temperature_k) the free gas's temperature whose
-broadening has the lattice's variance.
+effective_temperature_k(temperature_k) the temperature of the free gas whose
+Doppler width Delta gives the lattice's variance Delta**2/2.
 
 #### Material
 

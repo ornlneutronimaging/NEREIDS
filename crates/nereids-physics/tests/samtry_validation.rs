@@ -210,12 +210,8 @@ fn validate_unbroadened_cross_sections(
 /// `RslResolutionFunction_M.f90`.
 fn build_instrument_params(inp: &SammyInpConfig) -> Option<InstrumentParams> {
     let (flight_path, delta_t, delta_l, delta_e) = sammy_to_nereids_resolution(inp)?;
-    // T-1: Negative SAMMY resolution parameters indicate special broadening
-    // modes (e.g., CLM = Crystal Lattice Model, channel-specific widths) that
-    // NEREIDS does not yet implement.  Clamping to zero disables that
-    // broadening term, producing narrower peaks than SAMMY.  This is a known
-    // limitation — affected cases (tr008 has negative Deltae) show higher
-    // mean error because the exponential tail is effectively absent.
+    // SAMMY reads a negative Deltag as |Deltag| plus a channel-width table; this helper
+    // has no channel widths, and its clamp to zero drops |Deltag|.
     let res_params = ResolutionParams::new(
         flight_path,
         delta_t.max(0.0),
@@ -2923,9 +2919,8 @@ fn test_tr098_u238_broadened() {
         "t098a.par",
         "raa.plt",
     );
-    // Known limitation: CLM (Crystal Lattice Model) Doppler broadening.
-    // NEREIDS uses FGM instead; CLM also uses negative Deltag which we clamp
-    // to zero, removing the timing resolution component entirely.
+    // raa.plt has no SAMMY theory for this case (Th_initial is 0), so this bounds only the
+    // helper's mean |σ|.
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.15);
     eprintln!(
         "tr098: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
@@ -2933,7 +2928,7 @@ fn test_tr098_u238_broadened() {
     );
     assert!(
         result.mean_rel_error < 1.50,
-        "mean {:.4} > 150%",
+        "mean |σ| {:.4} b > 1.5 b",
         result.mean_rel_error
     );
 }
@@ -3031,9 +3026,8 @@ fn test_tr135_si28_broadened() {
         "t135a.par",
         "raa.plt",
     );
-    // Known limitation: Si-28 multi-nuclide total XS with resolution broadening.
-    // Large energy range (300-1810 keV) with CLM-like broadening (negative
-    // Deltag clamped to zero) and potential scattering differences.
+    // Known limitation: Si-28 multi-nuclide total XS with a negative Deltag, which this
+    // helper drops.
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.15);
     eprintln!(
         "tr135: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
@@ -3134,8 +3128,7 @@ fn test_tr157_u238_broadened() {
         "t157a.par",
         "raa.plt",
     );
-    // Known limitation: U-238 with CLM broadening options (negative Deltag).
-    // Resolution broadening timing component is zeroed, causing large error.
+    // Known limitation: U-238 with a negative Deltag, which this helper drops.
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.15);
     eprintln!(
         "tr157: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",

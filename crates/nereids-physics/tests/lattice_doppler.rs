@@ -109,7 +109,7 @@ fn the_lattice_keeps_the_kernel_s_mass_mean_variance_and_skew() {
     };
     let [one, first, second, third] = [0.0, 1.0, 2.0, 3.0].map(broadened);
     for (k, &e) in energies.iter().enumerate() {
-        let r = e / (AWR + 1.0);
+        let r = e / AWR;
         let variance = 2.0 * r * kt_eff;
         assert!(
             (one.values[k] - 1.0).abs() <= 1e-10,
@@ -165,7 +165,7 @@ fn a_resonance_broadened_in_the_lattice_is_the_direct_fourier_integral() {
     let lattice = broaden_in_lattice(&energies, &isotope, KELVIN, &spectrum(), Channel::Total)
         .expect("broadened");
     for (k, &e) in energies.iter().enumerate() {
-        let r = e / (isotope.awr + 1.0);
+        let r = e / isotope.awr;
         assert!((-r * g0).exp() < 1e-20);
         let (end, dt) = ((40.0 / (r * kt_eff)).sqrt(), 0.04);
         let steps = 2 * (end / (2.0 * dt)).ceil() as usize;
@@ -261,15 +261,40 @@ fn spectra_temperatures_and_reaches_below_zero_are_refused() {
     assert!(matches!(broaden(&[], KELVIN), Err(LatticeError::Grid(_))));
 }
 
+/// The text of the SAMMY case's file `name`.
+fn sammy_clm(name: &str) -> String {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/sammy-clm");
+    std::fs::read_to_string(dir.join(name)).expect(name)
+}
+
+/// The rows of the SAMMY case's table `name`.
+fn rows<const N: usize>(name: &str) -> Vec<[f64; N]> {
+    sammy_clm(name)
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| {
+            let f: Vec<f64> = l
+                .split_whitespace()
+                .map(|x| x.parse().expect("number"))
+                .collect();
+            f.try_into().expect("columns")
+        })
+        .collect()
+}
+
 #[test]
 fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/sammy-clm");
-    let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect(name);
-    let inp = parse_sammy_inp(&read("clm.inp")).expect("inp");
+    let inp = parse_sammy_inp(&sammy_clm("clm.inp")).expect("inp");
     assert_eq!(inp.temperature_k, 293.16);
-    let data = sammy_to_resonance_data(&inp, &parse_sammy_par(&read("u238.par")).expect("par"))
-        .expect("resonances");
-    let spectrum_file = read("taper.clm");
+    let data =
+        sammy_to_resonance_data(&inp, &parse_sammy_par(&sammy_clm("u238.par")).expect("par"))
+            .expect("resonances");
+    // SAMMY's crystal-lattice model recoils by E/(A + 1).
+    let data = ResonanceData {
+        awr: data.awr + 1.0,
+        ..data
+    };
+    let spectrum_file = sammy_clm("taper.clm");
     let mut lines = spectrum_file
         .lines()
         .skip_while(|l| !l.starts_with("CONTINUOUS"))
@@ -289,17 +314,7 @@ fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() 
         .collect();
     assert_eq!(density.len(), header[1] as usize);
     let spectrum = PhononSpectrum::new(header[0], density).expect("spectrum");
-    let answers: Vec<[f64; 3]> = read("answers.txt")
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
-            [f[0], f[1], f[2]]
-        })
-        .collect();
+    let answers: Vec<[f64; 3]> = rows("answers.txt");
     let energies: Vec<f64> = answers.iter().map(|a| a[0]).collect();
     let ours = broaden_in_lattice(
         &energies,
@@ -309,15 +324,35 @@ fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() 
         Channel::Total,
     )
     .expect("broadened");
-    let plan = CrossSectionPlan::new(&data);
-    for (k, &[energy, lattice, bare]) in answers.iter().enumerate() {
-        let broadened = ours.values[k] / lattice - 1.0;
-        let unbroadened = plan.evaluate_one(energy).total / bare - 1.0;
-        assert!(
-            (broadened - unbroadened).abs() <= 1e-5,
-            "{energy}: {broadened:e} {unbroadened:e}"
-        );
+    for (k, &[energy, lattice, _]) in answers.iter().enumerate() {
+        let residual = ours.values[k] / lattice - 1.0;
+        assert!(residual.abs() <= 1e-5, "{energy}: {residual:e}");
     }
+}
+
+#[test]
+fn a_weakly_bound_lattice_has_the_squared_norm_of_sammy_s_free_gas() {
+    let inp = parse_sammy_inp(&sammy_clm("clm.inp")).expect("inp");
+    let data =
+        sammy_to_resonance_data(&inp, &parse_sammy_par(&sammy_clm("u238.par")).expect("par"))
+            .expect("resonances");
+    let spectrum = PhononSpectrum::debye(5.0, 2).expect("spectrum");
+    let free_gas: Vec<[f64; 2]> = rows("free_gas.txt");
+    let energies: Vec<f64> = free_gas.iter().map(|a| a[0]).collect();
+    let ours = broaden_in_lattice(
+        &energies,
+        &data,
+        inp.temperature_k,
+        &spectrum,
+        Channel::Total,
+    )
+    .expect("broadened");
+    // Σσ² hardly sees a shift of the kernel, such as the free gas's 2.5kT/A;
+    // here R = E/A leaves −2.7e-5 and R = E/(A + 1) leaves +1.45e-3.
+    let ratio = ours.values.iter().map(|s| s * s).sum::<f64>()
+        / free_gas.iter().map(|a| a[1] * a[1]).sum::<f64>()
+        - 1.0;
+    assert!(ratio.abs() <= 2.5e-4, "{ratio:e}");
 }
 
 fn constant_with(table: Vec<(f64, f64)>) -> ResonanceData {
@@ -372,9 +407,19 @@ fn spectra_masses_bands_tables_and_spans_the_kernel_cannot_resolve_are_refused()
         broaden(&narrow, &many, KELVIN, &spectrum()),
         Err(LatticeError::TooMuchWork(_))
     ));
-    let wide = broaden(&one, &[1.0, 100.0], KELVIN, &spectrum()).expect("each in reach");
-    for value in wide.values {
-        assert!((value - 1.0).abs() <= 1e-7, "{value}");
+    let soft = PhononSpectrum::debye(1e-16, 2).expect("soft");
+    assert!(matches!(
+        broaden(&one, &[20.0], KELVIN, &soft),
+        Err(LatticeError::TooManyPoints(_))
+    ));
+    // σ = E stays E at every temperature, and at 1 eV the zero-phonon line
+    // weighs e^{−2W} ≈ 0.05.
+    let energies = [1.0, 100.0];
+    let wide = broaden(&power(1.0), &energies, KELVIN, &spectrum()).expect("each in reach");
+    for (k, &e) in energies.iter().enumerate() {
+        let (value, slope) = (wide.values[k], wide.derivatives[k]);
+        assert!((value / e - 1.0).abs() <= 1e-7, "{e}: {value}");
+        assert!(slope.abs() <= 1e-9 * value, "{e}: {slope}");
     }
 }
 
