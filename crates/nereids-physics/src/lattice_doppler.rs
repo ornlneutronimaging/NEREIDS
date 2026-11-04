@@ -115,7 +115,7 @@ impl std::fmt::Display for LatticeError {
             Self::TooManyPoints(n) => {
                 write!(
                     f,
-                    "lattice broadening needs {n} points, more than {MAX_POINTS}"
+                    "lattice broadening needs at least {n} points, more than {MAX_POINTS}"
                 )
             }
             Self::Jump(e) => write!(
@@ -414,17 +414,19 @@ pub fn broaden_in_lattice(
         }
     }
     let widest = energies.iter().map(|&e| reach_at(e)).fold(0.0, f64::max);
-    let transform = ((2.0 * widest / h).ceil() as usize + 1).next_power_of_two();
+    let span = ((2.0 * widest / h).ceil() as usize).saturating_add(1);
     let origin = lowest - 2.0 * h;
     if origin <= 0.0 {
         return Err(LatticeError::BelowZero(origin));
     }
-    let grid_points = ((highest - origin) / h).ceil() as usize + 3;
-    for needed in [transform, grid_points] {
+    let grid_points = (((highest - origin) / h).ceil() as usize).saturating_add(3);
+    for needed in [span, grid_points] {
         if needed > MAX_POINTS {
             return Err(LatticeError::TooManyPoints(needed));
         }
     }
+    // MAX_POINTS is a power of 2, so the transform fits when its span does.
+    let transform = span.next_power_of_two();
     let half = transform / 2;
     let dt = 2.0 * PI / (transform as f64 * h);
     let t_max = (100.0 / omega_max).min(PI / h);
