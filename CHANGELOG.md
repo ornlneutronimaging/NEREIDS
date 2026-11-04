@@ -78,7 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `lattice_doppler::broaden_in_lattice` Doppler-broadens a cross section by
   nuclei bound in a harmonic crystal (Lamb's model), from a `PhononSpectrum`
   (tabulated, or Debye) at the thermodynamic temperature, with its temperature
-  derivative.
+  derivative. Its recoil is `E/A`; SAMMY's crystal-lattice model takes
+  `E/(A + 1)`, which gives `A/(A + 1)` of the kernel's variance.
 - ENDF File 3 is read with File 2: each channel's File-3 cross section
   (MT 1, 2, 102, 18) is added to the resonances' before Doppler
   broadening. An evaluation File 1 marks LRP=2 is refused.

@@ -18,6 +18,9 @@
 //! mean `R` and variance `2R·kT_eff = Δ²/2`, `kT_eff = ½∫ρ·ω·coth(ω/2kT) dω`
 //! and `Δ` the Doppler width of a free gas at `T_eff` (Fröhner Eq. 241).
 //!
+//! SAMMY's crystal-lattice model takes `R = E/(A + 1)`, which gives
+//! `A/(A + 1)` of this variance.
+//!
 //! `σ` is sampled once on a uniform grid of step `h`, the integral is the
 //! trapezoid rule on that grid, and `P_c` comes on the grid's nodes from a
 //! fast Fourier transform of `Φ − e^{−2W}`, sampled at `t = j·dt` up to

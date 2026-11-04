@@ -65,7 +65,9 @@ Density and temperature, one region or a map of patches [output]
 ### Exact SAMMY Physics
 
 All physics modules implement the exact formalisms from the SAMMY Fortran code,
-with no ad-hoc approximations. Every module references specific SAMMY source
+with no ad-hoc approximations. An exception is the crystal lattice's Doppler
+broadening: its recoil energy is E/A, where SAMMY's crystal-lattice model takes
+E/(A + 1). Every module references specific SAMMY source
 files and equation numbers. See the [API documentation](api/nereids_physics/) for
 details.
 
