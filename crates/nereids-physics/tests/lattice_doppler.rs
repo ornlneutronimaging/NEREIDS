@@ -403,9 +403,14 @@ fn spectra_masses_bands_tables_and_spans_the_kernel_cannot_resolve_are_refused()
         broaden(&narrow, &many, KELVIN, &spectrum()),
         Err(LatticeError::TooMuchWork(_))
     ));
-    let wide = broaden(&one, &[1.0, 100.0], KELVIN, &spectrum()).expect("each in reach");
-    for value in wide.values {
-        assert!((value - 1.0).abs() <= 1e-7, "{value}");
+    // σ = E stays E at every temperature, and at 1 eV the zero-phonon line
+    // weighs e^{−2W} ≈ 0.05.
+    let energies = [1.0, 100.0];
+    let wide = broaden(&power(1.0), &energies, KELVIN, &spectrum()).expect("each in reach");
+    for (k, &e) in energies.iter().enumerate() {
+        let (value, slope) = (wide.values[k], wide.derivatives[k]);
+        assert!((value / e - 1.0).abs() <= 1e-7, "{e}: {value}");
+        assert!(slope.abs() <= 1e-9 * value, "{e}: {slope}");
     }
 }
 
