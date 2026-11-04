@@ -331,7 +331,7 @@ fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() 
 }
 
 #[test]
-fn a_weakly_bound_lattice_broadens_as_sammy_s_free_gas() {
+fn a_weakly_bound_lattice_has_the_squared_norm_of_sammy_s_free_gas() {
     let inp = parse_sammy_inp(&sammy_clm("clm.inp")).expect("inp");
     let data =
         sammy_to_resonance_data(&inp, &parse_sammy_par(&sammy_clm("u238.par")).expect("par"))

@@ -15,8 +15,8 @@
 //! ```
 //!
 //! the first term the zero-phonon line and `P_c = P − e^{−2W}·δ`.  `P` has
-//! mean `R` and variance `2R·kT_eff` with `kT_eff = ½∫ρ·ω·coth(ω/2kT) dω`,
-//! so a free gas at `T_eff` has the same two moments.
+//! mean `R` and variance `2R·kT_eff = Δ²/2`, `kT_eff = ½∫ρ·ω·coth(ω/2kT) dω`
+//! and `Δ` the Doppler width of a free gas at `T_eff` (Fröhner Eq. 241).
 //!
 //! `σ` is sampled once on a uniform grid of step `h`, the integral is the
 //! trapezoid rule on that grid, and `P_c` comes on the grid's nodes from a
@@ -217,8 +217,8 @@ impl PhononSpectrum {
         self.step_ev * (self.density.len() - 1) as f64
     }
 
-    /// `T_eff`, the free gas's temperature with the kernel's variance at
-    /// `temperature_k`: `k·T_eff = ½∫ρ·ω·coth(ω/2kT) dω`.
+    /// `T_eff` at `temperature_k`, `k·T_eff = ½∫ρ·ω·coth(ω/2kT) dω`: the kernel's
+    /// variance is `Δ²/2`, `Δ` the Doppler width of a free gas at `T_eff`.
     #[must_use]
     pub fn effective_temperature_k(&self, temperature_k: f64) -> f64 {
         Phonons::new(&self.nodes(0.0), temperature_k, 0.0, 0).kt_eff / BOLTZMANN_EV_PER_K
