@@ -58,3 +58,15 @@ selects the general RPI routine. Without a burst, `Chantd`
 python3 tests/data/sammy-ta181/generate.py endf <ENDF/B-VIII.1 Ta-181 tape>
 python3 tests/data/sammy-ta181/generate.py sammy <sammy executable> <work directory> --jobs 8
 ```
+
+## sammy-clm
+
+`crates/nereids-physics/tests/lattice_doppler.rs` compares NEREIDS with these
+SAMMY `8.1.pre-b1 - 0aa6ee20` runs for U-238 from 6.4 to 6.9 eV. The inputs
+are `clm.inp`, `u238.par` and `grid.dat`, and the crystal-lattice runs also
+read the phonon spectrum `taper.clm`.
+
+| File | Content |
+|---|---|
+| `answers.txt` | Columns 1 and 4 of `SAMMY.LST` for `clm.inp`, and column 2 of `SAMUNB.DAT` at those energies for `clm.inp` with `PUT UNBROADENED CROSs sections into plot file` after its clm line. |
+| `free_gas.txt` | Columns 1 and 4 of `SAMMY.LST` for `clm.inp` without its clm line. |

@@ -1,4 +1,4 @@
-# E (eV), SAMMY free-gas total (b), from clm.inp without its clm line
+# E (eV), SAMMY free-gas total (b)
 6.4000000000 51.3135266291
 6.4100000000 55.0844518098
 6.4200000000 59.3773722598
