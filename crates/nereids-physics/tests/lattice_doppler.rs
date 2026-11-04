@@ -347,8 +347,8 @@ fn a_weakly_bound_lattice_has_the_squared_norm_of_sammy_s_free_gas() {
         Channel::Total,
     )
     .expect("broadened");
-    // ∫σ² dE sees the kernel only through |K̂|², so the free gas's 2.5kT/A shift
-    // drops out: its kT/A terms leave 2e-5, the compound recoil E/(A + 1) 1.5e-3.
+    // Σσ² hardly sees a shift of the kernel, such as the free gas's 2.5kT/A;
+    // here R = E/A leaves −2.7e-5 and R = E/(A + 1) leaves +1.45e-3.
     let ratio = ours.values.iter().map(|s| s * s).sum::<f64>()
         / free_gas.iter().map(|a| a[1] * a[1]).sum::<f64>()
         - 1.0;
