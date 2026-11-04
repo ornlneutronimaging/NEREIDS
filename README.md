@@ -23,7 +23,7 @@ output spatially resolved isotopic composition maps.
   in its Reich-Moore form (KRM=3), with Coulomb penetrabilities for
   charged-particle channels and without fission channels; unresolved (LRU=2)
   ranges are parsed-and-skipped, not evaluated
-- **Doppler broadening** -- Free Gas Model (crystal-lattice model planned, not yet implemented)
+- **Doppler broadening** -- Free Gas Model, or Lamb's harmonic crystal lattice from a phonon density of states
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions
 - **ENDF nuclear data** -- automatic retrieval and caching (ENDF/B-VIII.0
