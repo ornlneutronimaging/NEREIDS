@@ -337,12 +337,16 @@ fn a_weakly_bound_lattice_has_the_squared_norm_of_sammy_s_free_gas() {
         sammy_to_resonance_data(&inp, &parse_sammy_par(&sammy_clm("u238.par")).expect("par"))
             .expect("resonances");
     let spectrum = PhononSpectrum::debye(5.0, 2).expect("spectrum");
-    // One fixed-point step puts the lattice's T_eff at SAMMY's temperature.
-    let kelvin = 2.0 * inp.temperature_k - spectrum.effective_temperature_k(inp.temperature_k);
     let free_gas: Vec<[f64; 2]> = rows("free_gas.txt");
     let energies: Vec<f64> = free_gas.iter().map(|a| a[0]).collect();
-    let ours =
-        broaden_in_lattice(&energies, &data, kelvin, &spectrum, Channel::Total).expect("broadened");
+    let ours = broaden_in_lattice(
+        &energies,
+        &data,
+        inp.temperature_k,
+        &spectrum,
+        Channel::Total,
+    )
+    .expect("broadened");
     // ∫σ² dE sees the kernel only through |K̂|², so the free gas's 2.5kT/A shift
     // drops out: its kT/A terms leave 2e-5, the compound recoil E/(A + 1) 1.5e-3.
     let ratio = ours.values.iter().map(|s| s * s).sum::<f64>()
