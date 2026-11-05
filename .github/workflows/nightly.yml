@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        shard: ["1", "2", "3", rest]
+        shard: ["1", "2", "3", "4", rest]
         include:
           - shard: "1"
             filter: >-
@@ -34,12 +34,16 @@ jobs:
             filter: >-
               pulse_calibration::calibrated_experiments_have_error_bars_that_are_their_scatter
               maps::
+          - shard: "4"
+            filter: >-
+              s3_a_lattice_foil_calibrates_on_sammy_crystal_lattice_counts
           - shard: rest
             filter: >-
               --skip pulse_calibration::two_foils_on_the_same_pulse_agree_as_chi_squared_says
               --skip pulse_calibration::experiments_calibrated_with_a_moderation_rate_at_its_bound_keep_density_and_temperature
               --skip pulse_calibration::calibrated_experiments_have_error_bars_that_are_their_scatter
               --skip maps::
+              --skip s3_a_lattice_foil_calibrates_on_sammy_crystal_lattice_counts
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

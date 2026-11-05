@@ -16,11 +16,13 @@ use nereids_endf::retrieval::EndfLibrary;
 use nereids_physics::continuous_doppler::{Channel, QuadratureBudget, broaden_with_budget};
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{DEFAULT_N_TAU, DetectorPulse, IkedaCarpenterParams};
+use nereids_physics::lattice_doppler::PhononSpectrum;
 use nereids_physics::thickness::uneven_transmission;
 use nereids_pipeline::counts_fit::{
-    Material, Measurement, NO_TIME_BACKGROUND, Region, Value, fit_counts,
+    CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, Value, fit_counts,
 };
 use nereids_pipeline::open_beam::{Calibration, Pulse};
+use nereids_pipeline::pulse_calibration::{Provenance, PulseCalibration};
 
 /// The reference folder, relative to this crate.
 const DATA: &str = "../../tests/data/sammy-ta181";
@@ -53,6 +55,20 @@ const ALPHA: f64 = 2.0;
 const OPEN_PER_US: f64 = 1e9;
 /// Start of the fitted temperature in S2b, relative to the true one.
 const START_FACTOR: f64 = 1.1;
+/// SAMMY's crystal-lattice transmission: the energy, then the values at 295, 296 and 297 K.
+const S3_FILE: &str = "s3_clm_rpi_alpha2.txt";
+/// SAMMY's lattice convergence: temperature in K, `eps_S` and `eps_L`.
+const EPS_S3: &str = "eps_s3.txt";
+/// The phonon spectrum both codes broaden S3 with.
+const SPECTRUM: &str = "../../tests/data/sammy-clm/taper.clm";
+/// The S3 foil's thermodynamic temperature in K.
+const LATTICE_K: f64 = 296.0;
+/// Limit of `|T_fit − T|` in K of the S3 lattice calibrations.
+const LATTICE_FIT_LIMIT_K: f64 = 0.1;
+/// Limit of the S3 lattice calibrations' `d²` from the true pulse.
+const LATTICE_D2_LIMIT: f64 = 2.0;
+/// Least `d²` from the true pulse of the S3 free-gas calibration, whose misfit it resolves.
+const FREE_GAS_D2_LEAST: f64 = 25.0;
 
 /// One compared temperature.
 struct Case {
@@ -130,18 +146,19 @@ fn bins() -> Bins {
 
 /// The rows of `S2_FILE` in the order of `bins`.
 fn sammy(bins: &Bins) -> Vec<Vec<f64>> {
-    let mut rows = table(S2_FILE, 7);
-    assert_eq!(
-        rows.len(),
-        bins.centres_ev.len(),
-        "{S2_FILE}: one row per bin"
-    );
+    reference(bins, S2_FILE, 7)
+}
+
+/// The rows of the SAMMY reference `name`, `columns` wide, in the order of `bins`.
+fn reference(bins: &Bins, name: &str, columns: usize) -> Vec<Vec<f64>> {
+    let mut rows = table(name, columns);
+    assert_eq!(rows.len(), bins.centres_ev.len(), "{name}: one row per bin");
     rows.sort_by(|a, b| b[0].total_cmp(&a[0]));
     for (row, energy) in rows.iter().zip(&bins.centres_ev) {
         // 12 significant digits round by at most 5e-12.
         assert!(
             (row[0] / energy - 1.0).abs() <= 1e-11,
-            "{S2_FILE}: {} eV is not the bin centre {energy} eV",
+            "{name}: {} eV is not the bin centre {energy} eV",
             row[0]
         );
     }
@@ -392,7 +409,11 @@ fn compare(
 #[test]
 fn references_match_the_venus_bins() {
     ta181();
-    sammy(&bins());
+    let bins = bins();
+    sammy(&bins);
+    reference(&bins, S3_FILE, 4);
+    eps_s3();
+    taper();
     for case in &CASES {
         eps_s(case.kelvin);
     }
@@ -468,34 +489,13 @@ fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
             .zip(&rows)
             .map(|(o, row)| (o * row[at]).round())
             .collect();
-        let measurement = Measurement {
-            time_edges_us: bins.edges_us.clone(),
-            charge_ratio: 1.0,
-            normalization: Value::Known(1.0),
-            time_background: NO_TIME_BACKGROUND,
-            room_background: None,
-            spread: None,
-            regions: vec![Region {
-                open_counts: open.clone(),
-                sample_counts: sample,
-                open_live: None,
-                sample_live: None,
-                background: [Value::Known(0.0); 5],
-                pixels: 1.0,
-                gamma_transmission: Value::Known(1.0),
-                capture_gammas: Value::Known(0.0),
-                in_scatter: Value::Known(0.0),
-                timing_offset_us: Value::Known(0.0),
-                material: Some(Material {
-                    isotopes: vec![(data.clone(), Value::Known(DENSITY))],
-                    temperature_k: Value::Fitted(START_FACTOR * case.kelvin),
-                    thickness_variance: Value::Known(0.0),
-                    library: EndfLibrary::EndfB8_1,
-                    covariances: Vec::new(),
-                    lattice: None,
-                }),
-            }],
-        };
+        let measurement = foil_alone(
+            &bins.edges_us,
+            [&open, &sample],
+            (data.clone(), Value::Known(DENSITY)),
+            Value::Fitted(START_FACTOR * case.kelvin),
+            None,
+        );
         let label = format!("S2b alpha {ALPHA}/us at {} K", case.kelvin);
         let fit = match fit_counts(&measurement, &calibration) {
             Ok(fit) => fit,
@@ -531,6 +531,257 @@ fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
         }
         if !sigma_t.is_finite() {
             failures.push(format!("{label}: (iv) sigma_T = {sigma_t} is not finite"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The phonon spectrum of `SPECTRUM`: the step and values of its CONTINUOUS card set.
+fn taper() -> PhononSpectrum {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(SPECTRUM);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut lines = text
+        .lines()
+        .skip_while(|line| !line.starts_with("CONTINUOUS"))
+        .skip(1);
+    let header: Vec<f64> = lines
+        .next()
+        .expect("the step line")
+        .split_whitespace()
+        .map(|x| x.parse().expect("a number"))
+        .collect();
+    let density: Vec<f64> = lines
+        .take_while(|line| !line.trim().is_empty())
+        .flat_map(|line| {
+            line.split_whitespace()
+                .map(|x| x.parse::<f64>().expect("a number"))
+        })
+        .collect();
+    assert_eq!(density.len() as f64, header[1], "{SPECTRUM}: the values");
+    PhononSpectrum::new(header[0], density).expect("the spectrum")
+}
+
+/// SAMMY's S3 convergence `[eps_S, eps_L]` at `LATTICE_K`, from `EPS_S3`.
+fn eps_s3() -> [f64; 2] {
+    let rows = table(EPS_S3, 3);
+    assert!(
+        rows.len() == 1 && rows[0][0] == LATTICE_K,
+        "{EPS_S3}: one row, at {LATTICE_K} K"
+    );
+    [rows[0][1], rows[0][2]]
+}
+
+/// `d² = dᵀC⁻¹d` of the prior in the file of `calibration`, with `d` its mean
+/// less `truth` over the numbers it fitted, of `(α₀, α₁, β₀, β₁, R, h²)`.
+fn prior_distance(calibration: &PulseCalibration, truth: [f64; 6]) -> f64 {
+    let file: serde_json::Value = serde_json::from_str(&calibration.to_json()).expect("json");
+    let number = |v: &serde_json::Value| v.as_f64().expect("a number");
+    let fitted = file["numbers"]
+        .as_array()
+        .expect("the numbers")
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n["status"] == "fitted")
+        .map(|(i, _)| truth[i]);
+    let d: Vec<f64> = file["mean"]
+        .as_array()
+        .expect("the mean")
+        .iter()
+        .zip(fitted)
+        .map(|(mean, truth)| number(mean) - truth)
+        .collect();
+    let covariance: Vec<Vec<f64>> = file["covariance"]
+        .as_array()
+        .expect("the covariance")
+        .iter()
+        .map(|row| row.as_array().expect("a row").iter().map(number).collect())
+        .collect();
+    // Cholesky C = LLᵀ, then d² = |y|² with Ly = d.
+    let mut l: Vec<Vec<f64>> = Vec::with_capacity(d.len());
+    for (i, row) in covariance.iter().enumerate() {
+        let mut lower: Vec<f64> = Vec::with_capacity(i + 1);
+        for (j, done) in l.iter().enumerate() {
+            lower.push((row[j] - dot(&lower, &done[..j])) / done[j]);
+        }
+        lower.push((row[i] - dot(&lower, &lower)).sqrt());
+        l.push(lower);
+    }
+    let mut y: Vec<f64> = Vec::with_capacity(d.len());
+    for (row, difference) in l.iter().zip(&d) {
+        let i = y.len();
+        y.push((difference - dot(&row[..i], &y)) / row[i]);
+    }
+    dot(&y, &y)
+}
+
+/// The foil alone in one region, `isotope` at its density, with the open-beam
+/// and sample `counts` in the bins of `edges_us`.
+fn foil_alone(
+    edges_us: &[f64],
+    counts: [&[f64]; 2],
+    isotope: (ResonanceData, Value),
+    temperature_k: Value,
+    lattice: Option<PhononSpectrum>,
+) -> Measurement {
+    Measurement {
+        time_edges_us: edges_us.to_vec(),
+        charge_ratio: 1.0,
+        normalization: Value::Known(1.0),
+        time_background: NO_TIME_BACKGROUND,
+        room_background: None,
+        spread: None,
+        regions: vec![Region {
+            open_counts: counts[0].to_vec(),
+            sample_counts: counts[1].to_vec(),
+            open_live: None,
+            sample_live: None,
+            background: [Value::Known(0.0); 5],
+            pixels: 1.0,
+            gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
+            in_scatter: Value::Known(0.0),
+            timing_offset_us: Value::Known(0.0),
+            material: Some(Material {
+                isotopes: vec![isotope],
+                temperature_k,
+                thickness_variance: Value::Known(0.0),
+                library: EndfLibrary::EndfB8_1,
+                covariances: Vec::new(),
+                lattice,
+            }),
+        }],
+    }
+}
+
+/// `t0`, the flight path, `α₀`, `α₁` and `R` fitted from starts away from the
+/// truth; `β` and `h²` known.
+fn fitted_pulse() -> Calibration {
+    Calibration {
+        t0_us: Value::Fitted(T0_US + 0.05),
+        flight_path_m: Value::Fitted(FLIGHT_PATH_M + 0.01),
+        pulse: Pulse {
+            alpha: [Value::Fitted(0.02), Value::Fitted(START_FACTOR * ALPHA)],
+            // β changes the pulse only through R, whose truth is 0.
+            beta: [Value::Known(0.0), Value::Known(1.0)],
+            r: Value::Fitted(0.05),
+            fwhm_squared_us2: Value::Known(0.0),
+            r_high: None,
+            detector_tail: None,
+            energy_span_ev: PULSE_SPAN_EV,
+            n_tau: DEFAULT_N_TAU,
+            line_span_ev: None,
+            prior: None,
+        },
+    }
+}
+
+/// S3: pulse calibrations on counts from SAMMY's crystal-lattice transmission with the S2
+/// pulse: the lattice at 310 ± 30 K and 296 ± 2 K, the free gas at T_eff ± 2 K.
+#[test]
+#[ignore = "slow; runs nightly"]
+fn s3_a_lattice_foil_calibrates_on_sammy_crystal_lattice_counts() {
+    let ta = ta181();
+    // SAMMY's crystal-lattice model recoils by E/(A + 1).
+    let data = ResonanceData {
+        awr: ta.awr + 1.0,
+        ..ta
+    };
+    let bins = bins();
+    let rows = reference(&bins, S3_FILE, 4);
+    let spectrum = taper();
+    // Counts must be whole numbers. Rounding moves a ratio by less than 4e-9.
+    let open: Vec<f64> = bins
+        .edges_us
+        .windows(2)
+        .map(|w| (OPEN_PER_US * (w[1] - w[0])).round())
+        .collect();
+    let sample: Vec<f64> = open
+        .iter()
+        .zip(&rows)
+        .map(|(o, row)| (o * row[2]).round())
+        .collect();
+    let largest_d = rows.iter().fold(0.0, |top: f64, row| {
+        top.max((0.5 * (row[3] - row[1])).abs())
+    });
+    let [eps_s, eps_l] = eps_s3();
+    let eps_limit = 0.02 * largest_d;
+    eprintln!(
+        "S3: max|D| = {largest_d:.4e} /K; eps_S = {eps_s:.2e}, eps_L = {eps_l:.2e} \
+         (limit {eps_limit:.2e})"
+    );
+    let mut failures = Vec::new();
+    for (eps, name) in [(eps_s, "eps_S"), (eps_l, "eps_L")] {
+        if !below(eps, eps_limit) {
+            failures.push(format!(
+                "S3: {name} = {eps:.2e} is not below {eps_limit:.2e}"
+            ));
+        }
+    }
+    let effective_k = spectrum.effective_temperature_k(LATTICE_K);
+    let truth = [0.0, ALPHA, 0.0, 1.0, 0.0, 0.0];
+    let cases = [
+        ("lattice, T 310 ± 30 K", Some(spectrum.clone()), 310.0, 30.0),
+        ("lattice, T 296 ± 2 K", Some(spectrum), LATTICE_K, 2.0),
+        ("free gas, T_eff ± 2 K", None, effective_k, 2.0),
+    ];
+    let density = Value::Measured {
+        value: DENSITY,
+        sd: 0.01 * DENSITY,
+    };
+    for (label, lattice, value, sd) in cases {
+        let bound = lattice.is_some();
+        let measurement = foil_alone(
+            &bins.edges_us,
+            [&open, &sample],
+            (data.clone(), density),
+            Value::Measured { value, sd },
+            lattice,
+        );
+        let provenance = Provenance {
+            foil: "sammy-s3".into(),
+            open: "open".into(),
+            sample: "sample".into(),
+        };
+        let start = std::time::Instant::now();
+        let (calibration, fit): (PulseCalibration, CountsFit) =
+            match PulseCalibration::new(&measurement, &fitted_pulse(), provenance) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("S3 {label}: refused: {e}");
+                    failures.push(format!("S3 {label}: refused: {e}"));
+                    continue;
+                }
+            };
+        let fitted_k = fit.regions[0].temperature_k.expect("a material");
+        let d2 = prior_distance(&calibration, truth);
+        eprintln!(
+            "S3 {label}: T_fit = {fitted_k:.4} K (T = {LATTICE_K} K, T_eff = {effective_k:.4} K), \
+             t0 = {:+.3e} µs, L = {:.7} m, alpha = [{:.3e}, {:.6}], R = {:.3e}, \
+             d2 = {d2:.4e}, converged {}, {} points, {:.0} s",
+            fit.t0_us,
+            fit.flight_path_m,
+            fit.alpha[0],
+            fit.alpha[1],
+            fit.r,
+            fit.converged,
+            fit.points,
+            start.elapsed().as_secs_f64()
+        );
+        let error_k = (fitted_k - LATTICE_K).abs();
+        if bound && !within(error_k, LATTICE_FIT_LIMIT_K) {
+            failures.push(format!(
+                "S3 {label}: |T_fit - T| = {error_k:.4} K exceeds {LATTICE_FIT_LIMIT_K} K"
+            ));
+        }
+        if bound && !within(d2, LATTICE_D2_LIMIT) {
+            failures.push(format!(
+                "S3 {label}: d2 = {d2:.4e} exceeds {LATTICE_D2_LIMIT}"
+            ));
+        }
+        if !bound && !within(FREE_GAS_D2_LEAST, d2) {
+            failures.push(format!(
+                "S3 {label}: d2 = {d2:.4e} is below {FREE_GAS_D2_LEAST}"
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
