@@ -1,0 +1,5 @@
+# SAMMY 8.1.pre-b1 - 0aa6ee20: the largest change of the S3 transmission at 296 K from
+# phonon order 1600 to 3200 over all the bins (eps_L), and from NXTRA = 29 to a run of
+# NXTRA 99 on each window alone, 7.8-9, 190-200 eV, over its bins (eps_S).
+# Columns: temperature (K), eps_S, eps_L.
+296 3.300000e-08 0.000000e+00
