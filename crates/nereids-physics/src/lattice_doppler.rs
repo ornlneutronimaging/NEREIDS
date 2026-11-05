@@ -220,6 +220,18 @@ impl PhononSpectrum {
         self.step_ev * (self.density.len() - 1) as f64
     }
 
+    /// The spacing of the spectrum's values, eV.
+    #[must_use]
+    pub fn step_ev(&self) -> f64 {
+        self.step_ev
+    }
+
+    /// The spectrum's values at `ω = i·step`, scaled to unit area, 1/eV.
+    #[must_use]
+    pub fn density(&self) -> &[f64] {
+        &self.density
+    }
+
     /// `T_eff` at `temperature_k`, `k·T_eff = ½∫ρ·ω·coth(ω/2kT) dω`: the kernel's
     /// variance is `Δ²/2`, `Δ` the Doppler width of a free gas at `T_eff`.
     #[must_use]

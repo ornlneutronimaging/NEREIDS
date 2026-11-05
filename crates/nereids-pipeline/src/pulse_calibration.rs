@@ -7,6 +7,7 @@ use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::Prior;
 use nereids_fitting::statistics::{Consistency, agreement};
+use nereids_physics::lattice_doppler::PhononSpectrum;
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::resonance_center_energies;
 use serde::{Deserialize, Serialize};
@@ -45,7 +46,7 @@ impl Pulse {
     }
 }
 
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 const PULSE_MODEL: &str = "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, \
      E in eV, a storage fraction R constant over the energy span, folded with the proton \
@@ -120,9 +121,18 @@ mod nuclide {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Lattice {
+    step_ev: f64,
+    density: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Foil {
     isotopes: Vec<FoilIsotope>,
     temperature_k: Stated,
+    #[serde(deserialize_with = "Option::deserialize")]
+    lattice: Option<Lattice>,
     library: EndfLibrary,
 }
 
@@ -162,8 +172,9 @@ impl PulseCalibration {
     /// from `provenance`, with `calibration`, and that fit.  The measurement
     /// is the foil alone, one region holding it.  Each isotope of the foil
     /// not known to be absent (`Value::Known(0.0)`) has a measured density,
-    /// and the foil's effective temperature is measured.  The prior over the
-    /// pulse numbers takes the resonance parameters as exact.
+    /// and the foil's temperature is measured: the thermodynamic temperature
+    /// with a lattice, the effective one without.  The prior over the pulse
+    /// numbers takes the resonance parameters and the phonon spectrum as exact.
     ///
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if the measurement is not one
@@ -215,11 +226,6 @@ impl PulseCalibration {
         if pulse.detector_tail.is_some() {
             return Err(PipelineError::InvalidParameter(
                 "a pulse calibration records a pulse without a detector tail".into(),
-            ));
-        }
-        if foil_material(measurement)?.lattice.is_some() {
-            return Err(PipelineError::InvalidParameter(
-                "a calibration foil is broadened by the free gas, without a lattice".into(),
             ));
         }
         let fit = fit_counts(measurement, calibration)?;
@@ -444,13 +450,14 @@ impl PulseCalibration {
         }
     }
 
-    /// The calibration file: JSON of format version 3 that names the pulse
+    /// The calibration file: JSON of format version 4 that names the pulse
     /// model and, in the order `α₀, α₁, β₀, β₁, R, h²`, each pulse number with
     /// its unit, value and status (fitted or known), then the prior over the
     /// fitted numbers: its mean, which may lie past a number's bound, its
     /// covariance and rank; then `t0` and the flight path, the pulse's energy
-    /// span and `n_tau`, the line span, the foil's isotopes and effective
-    /// temperature with their stated uncertainties and its library, the foil and run
+    /// span and `n_tau`, the line span, the foil's isotopes and temperature
+    /// with their stated uncertainties, its phonon spectrum's step and values,
+    /// or null for the free gas, and its library, the foil and run
     /// identifiers, the sample run's overdispersion, and the transfer to
     /// another foil: `"unchecked"`, or the other foil and its identifiers, its
     /// sample run's overdispersion, `d2`, `dof` and `p`.
@@ -502,13 +509,14 @@ impl PulseCalibration {
     ///
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if `text` is not such a file: not
-    /// format version 3 of this pulse model, a field missing or unknown, the
+    /// format version 4 of this pulse model, a field missing or unknown, the
     /// pulse numbers' names or units not in their order, the mean, the
     /// covariance or the rank not over the fitted numbers, the line span
     /// missing while a pulse number
     /// was fitted, present when none was, or not `low ≤ high` within the
     /// energy span, a provenance [`Self::new`] refuses, the overdispersion
-    /// below 1, the foil without isotopes, with one listed twice, or not as
+    /// below 1, the foil without isotopes, with one listed twice, with a
+    /// phonon spectrum [`PhononSpectrum::new`] refuses, or not as
     /// [`Self::new`] takes it, a value outside its quantity's range or one
     /// [`DetectorPulse::new`](nereids_physics::ikeda_carpenter::DetectorPulse::new)
     /// refuses, or a recorded transfer [`Self::record_transfer`] could not
@@ -837,6 +845,10 @@ fn foil(measurement: &Measurement) -> Result<Foil, PipelineError> {
             value,
             sd: Some(sd),
         },
+        lattice: material.lattice.as_ref().map(|spectrum| Lattice {
+            step_ev: spectrum.step_ev(),
+            density: spectrum.density().to_vec(),
+        }),
         library: material.library,
     })
 }
@@ -875,6 +887,11 @@ fn check_foil(foil: &Foil) -> Result<(), PipelineError> {
         low..=high,
         &format!("within {low}–{high} K"),
     )?;
+    if let Some(lattice) = &foil.lattice {
+        PhononSpectrum::new(lattice.step_ev, lattice.density.clone()).map_err(|e| {
+            PipelineError::InvalidParameter(format!("a calibration foil's lattice has an {e}"))
+        })?;
+    }
     Ok(())
 }
 
@@ -1233,22 +1250,33 @@ mod tests {
             0.012_537_345_881_063_615_f64.to_bits()
         );
         for expected in [
-            "\"format_version\": 3",
+            "\"format_version\": 4",
             "\"name\": \"alpha0\"",
             "\"unit\": \"1/(µs·√eV)\"",
             "\"status\": \"fitted\"",
             "\"rank\": 4",
+            "\"lattice\": null",
             "\"sample_overdispersion\": 1.5",
             "\"transfer\": \"unchecked\"",
         ] {
             assert!(text.contains(expected), "{expected} in {text}");
         }
+        let mut crystal = measurement(Some(55.0));
+        let spectrum = PhononSpectrum::debye(240.0, 4).expect("Debye");
+        material(&mut crystal).lattice = Some(spectrum.clone());
+        let bound = calibrated(&crystal, &calibration(Value::Known(0.01)), fit(8)).unwrap();
+        let text = bound.to_json();
+        let read = PulseCalibration::from_json(&text).unwrap();
+        assert_eq!(read.to_json(), text);
+        let lattice = read.foil.lattice.expect("the spectrum");
+        assert_eq!(lattice.step_ev.to_bits(), spectrum.step_ev().to_bits());
+        assert_eq!(lattice.density, spectrum.density());
     }
 
     #[test]
     fn files_that_are_not_such_a_calibration_are_refused() {
         let original: serde_json::Value = serde_json::from_str(&file()).unwrap();
-        let edits: [Edit; 22] = [
+        let edits: [Edit; 24] = [
             ("version", |v| v["format_version"] = 1.into()),
             ("mean", |v| {
                 v["mean"].as_array_mut().unwrap().pop();
@@ -1290,6 +1318,12 @@ mod tests {
             }),
             ("temperature sd", |v| {
                 v["foil"]["temperature_k"]["sd"] = serde_json::Value::Null;
+            }),
+            ("lattice missing", |v| {
+                v["foil"].as_object_mut().unwrap().remove("lattice");
+            }),
+            ("phonon spectrum", |v| {
+                v["foil"]["lattice"] = serde_json::json!({"step_ev": 0.0, "density": [0.0, 1.0]});
             }),
             ("span beyond the pulse", |v| {
                 v["line_span_ev"] = serde_json::json!([10.0, 300.0]);
@@ -1397,20 +1431,10 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        let mut lattice = measurement(None);
-        material(&mut lattice).lattice = Some(
-            nereids_physics::lattice_doppler::PhononSpectrum::debye(240.0, 100).expect("Debye"),
-        );
-        match PulseCalibration::new(&lattice, &c, provenance()) {
-            Err(PipelineError::InvalidParameter(message)) => {
-                assert!(message.contains("without a lattice"), "{message}")
-            }
-            other => panic!("{other:?}"),
-        }
     }
 
-    const VERSION_3: &str = r#"{
-  "format_version": 3,
+    const VERSION_4: &str = r#"{
+  "format_version": 4,
   "pulse_model": "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, E in eV, a storage fraction R constant over the energy span, folded with the proton pulse's triangle of FWHM h",
   "numbers": [
     {
@@ -1521,6 +1545,7 @@ mod tests {
       "value": 300.0,
       "sd": 10.0
     },
+    "lattice": null,
     "library": "ENDF/B-VIII.0"
   },
   "provenance": {
@@ -1533,10 +1558,10 @@ mod tests {
 }"#;
 
     #[test]
-    fn the_file_is_format_version_3_byte_for_byte() {
+    fn the_file_is_format_version_4_byte_for_byte() {
         let original = original();
-        assert_eq!(original.to_json(), VERSION_3);
-        let read = PulseCalibration::from_json(VERSION_3).unwrap();
+        assert_eq!(original.to_json(), VERSION_4);
+        let read = PulseCalibration::from_json(VERSION_4).unwrap();
         assert_eq!(format!("{read:?}"), format!("{original:?}"));
     }
 

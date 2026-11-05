@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission and a
-  `fit_counts` temperature fit with SAMMY at the VENUS bins.
+- `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission, a
+  `fit_counts` temperature fit and a pulse calibration of the foil with a
+  lattice with SAMMY at the VENUS bins.
 - R-Matrix Limited (LRF=7) ranges in the Reich-Moore form (KRM=3) are
   evaluated: neutron, eliminated-capture, neutral exit (such as inelastic)
   and charged-particle exit channels, the last with Coulomb penetrabilities
@@ -73,8 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A counts-fit `Material` gains `lattice`, a `PhononSpectrum`: its cross
   sections are broadened by the harmonic lattice and its temperature is the
   thermodynamic one. Python gains `PhononSpectrum` and `Material(lattice=...)`;
-  MCP fits accept `fit.debye_temperature_k`. A pulse calibration refuses a
-  lattice.
+  MCP fits accept `fit.debye_temperature_k`. A pulse calibration takes a foil
+  with a lattice, and its file, format version 4, records the foil's phonon
+  spectrum, or null for the free gas.
 - `lattice_doppler::broaden_in_lattice` Doppler-broadens a cross section by
   nuclei bound in a harmonic crystal (Lamb's model), from a `PhononSpectrum`
   (tabulated, or Debye) at the thermodynamic temperature, with its temperature

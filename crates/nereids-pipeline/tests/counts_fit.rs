@@ -4137,6 +4137,44 @@ fn the_pulse_is_calibrated_on_one_foil() {
     assert_recovered(&ONE_FOIL.1, &CALIBRATION_PULSE, 8, "start above the truth");
 }
 
+#[test]
+fn a_crystal_foil_calibrates_the_pulse_and_its_file_keeps_the_lattice() {
+    let setup = calibration_foil(&CALIBRATION_PULSE, T0_US, FLIGHT_PATH_M);
+    let [(isotope, density)] = calibration_sample(CALIBRATION_DENSITY);
+    let spectrum = PhononSpectrum::debye(240.0, 400).expect("Debye");
+    let open = run(&setup, 1.0, &beam(CALIBRATION_LEVEL), &[], TEMPERATURE_K);
+    let transmitted = run_through(
+        &setup,
+        CHARGE_RATIO,
+        &beam(CALIBRATION_LEVEL),
+        &|energies: &[f64]| {
+            let sigma =
+                broaden_in_lattice(energies, &isotope, TEMPERATURE_K, &spectrum, Channel::Total)
+                    .expect("broadened");
+            sigma.values.iter().map(|s| (-density * s).exp()).collect()
+        },
+    );
+    let mut m = calibration_measurement(&setup, (rounded(&open), rounded(&transmitted)));
+    m.material_mut().lattice = Some(spectrum.clone());
+    let (calibrated, fit) = PulseCalibration::new(
+        &m,
+        &calibration_start(&CALIBRATION_PULSE, 1.0, None),
+        foil_provenance(),
+    )
+    .expect("a crystal foil calibrates");
+    assert_recovered(&fit, &CALIBRATION_PULSE, 8, "crystal");
+    let text = calibrated.to_json();
+    let file: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(
+        file["foil"]["lattice"]["density"].as_array().map(Vec::len),
+        Some(spectrum.density().len())
+    );
+    assert_eq!(
+        PulseCalibration::from_json(&text).expect("file").to_json(),
+        text
+    );
+}
+
 const EXPERIMENT_K: f64 = 1500.0;
 
 fn experiment_foil(pulse: &[f64], t0_us: f64, flight_path_m: f64) -> Setup {

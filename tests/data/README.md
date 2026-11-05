@@ -38,15 +38,19 @@ end-to-end counts-fitting validation fixture.
 these SAMMY references for VENUS Ta-181 thermometry. S2 compares the free-gas
 transmission and its slope per K, folded over the bins with only the prompt
 Ikeda-Carpenter term (α = 2 per µs, R = 0). S2b fits the temperature with
-`fit_counts` to counts made from the S2 references. No test compares the counts
-that `fit_counts` predicts.
+`fit_counts` to counts made from the S2 references. S3 calibrates the pulse with
+`PulseCalibration::new` on counts made from SAMMY's crystal-lattice transmission
+at 296 K, with the S2 pulse and the phonon spectrum `../sammy-clm/taper.clm`. No
+test compares the counts that `fit_counts` predicts.
 
 | File | Content |
 |---|---|
 | `Ta-181-mf2.endf` | MF1 MT451 and MF2 MT151 of ENDF/B-VIII.1 MAT 7328, with the CRLF bytes of the tape (MD5 `e9cae860785d7ea503430300e4428663`). |
 | `s2_rpi_alpha2.txt` | SAMMY transmission at each VENUS bin centre, at 299, 300, 301, 1099, 1100 and 1101 K. |
 | `eps_s.txt` | SAMMY's convergence at 300 K and 1100 K. |
-| `generate.py` | Writes the files above. |
+| `s3_clm_rpi_alpha2.txt` | SAMMY crystal-lattice transmission at each VENUS bin centre, at 295, 296 and 297 K, to phonon order 1600. |
+| `eps_s3.txt` | SAMMY's S3 convergence at 296 K: from phonon order 1600 to 3200 over all the bins (`eps_L`), and from NXTRA 29 to a run of NXTRA 99 on each of 7.8–9 and 190–200 eV alone, over its bins (`eps_S`). |
+| `generate.py` | Writes the files above: `--set s2` the S2 files, `--set s3` the S3 files, both by default. |
 
 The bins are t_j = 1.12 + 0.16 j µs (L = 25 m) with a centre energy from 7.8 to
 200 eV. SAMMY is `8.1.pre-b1 - 0aa6ee20` (`sammy` MD5
@@ -56,7 +60,8 @@ selects the general RPI routine. Without a burst, `Chantd`
 
 ```sh
 python3 tests/data/sammy-ta181/generate.py endf <ENDF/B-VIII.1 Ta-181 tape>
-python3 tests/data/sammy-ta181/generate.py sammy <sammy executable> <work directory> --jobs 8
+python3 tests/data/sammy-ta181/generate.py sammy <sammy executable> <work directory> --jobs 8 --set s2
+python3 tests/data/sammy-ta181/generate.py sammy <sammy executable> <work directory> --jobs 8 --set s3
 ```
 
 ## sammy-clm
@@ -64,7 +69,8 @@ python3 tests/data/sammy-ta181/generate.py sammy <sammy executable> <work direct
 `crates/nereids-physics/tests/lattice_doppler.rs` compares NEREIDS with these
 SAMMY `8.1.pre-b1 - 0aa6ee20` runs for U-238 from 6.4 to 6.9 eV. The inputs
 are `clm.inp`, `u238.par` and `grid.dat`, and the crystal-lattice runs also
-read the phonon spectrum `taper.clm`.
+read the phonon spectrum `taper.clm`. The S3 runs of `sammy-ta181` read it too,
+with its phonon order set by their `generate.py`.
 
 | File | Content |
 |---|---|
