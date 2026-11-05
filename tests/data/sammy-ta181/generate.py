@@ -303,7 +303,7 @@ def run_case(exe: Path, work: Path, name: str, spec: dict,
     lst, log = case / "SAMMY.LST", case / "sammy.out"
     expected = {f: text.encode() for f, text in inputs.items()}
     expected[ENDF_FILE] = (HERE / ENDF_FILE).read_bytes()
-    kept = (keep and lst.is_file() and log.is_file()
+    kept = (keep and lst.is_file() and log.is_file() and (case / "SAMMY.LPT").is_file()
             and "Normal finish to SAMMY" in log.read_text()
             and all((case / f).is_file() and (case / f).read_bytes() == data
                     # An input written after the run is not the one SAMMY read.
