@@ -15,25 +15,40 @@ use crate::error::IoError;
 use crate::fits_stack::Shutter;
 
 /// Each frame's shutter: the last one opening by the frame's start, within rounding.
+///
+/// A frame that ends after the next shutter opens is refused: its counts mix
+/// two shutters.
 fn shutter_of_frames(edges_us: &[f64], shutters: &[Shutter]) -> Result<Vec<usize>, IoError> {
     let width = edges_us
         .windows(2)
         .map(|w| w[1] - w[0])
         .fold(f64::INFINITY, f64::min);
     let slack = 1e-6 * width;
-    edges_us[..edges_us.len() - 1]
-        .iter()
+    edges_us
+        .windows(2)
         .enumerate()
-        .map(|(k, &t)| {
-            shutters
+        .map(|(k, w)| {
+            let i = shutters
                 .iter()
-                .rposition(|s| s.start_us - slack <= t)
-                .filter(|&i| t < shutters[i].end_us)
+                .rposition(|s| s.start_us - slack <= w[0])
+                .filter(|&i| w[0] < shutters[i].end_us)
                 .ok_or_else(|| {
                     IoError::InvalidParameter(format!(
-                        "frame {k} starts at {t} µs, outside every shutter"
+                        "frame {k} starts at {} µs, outside every shutter",
+                        w[0]
                     ))
-                })
+                })?;
+            match shutters.get(i + 1) {
+                Some(next) if w[1] > next.start_us + slack => {
+                    Err(IoError::InvalidParameter(format!(
+                        "frame {k} ends at {} µs, after shutter {} opens at {} µs",
+                        w[1],
+                        i + 1,
+                        next.start_us
+                    )))
+                }
+                _ => Ok(i),
+            }
         })
         .collect()
 }
@@ -46,7 +61,7 @@ fn shutter_of_frames(edges_us: &[f64], shutters: &[Shutter]) -> Result<Vec<usize
 /// # Arguments
 /// * `counts` — Raw counts in (time bin, row, column), finite and 0 or more.
 /// * `edges_us` — Time-bin edges in µs, ascending, one more than the bins.
-/// * `shutters` — The run's shutters; each bin starts inside one.
+/// * `shutters` — The run's shutters; each bin starts inside one and ends by the next.
 ///
 /// # Returns
 /// `L` in (time bin, row, column), each in (0, 1].
@@ -54,8 +69,8 @@ fn shutter_of_frames(edges_us: &[f64], shutters: &[Shutter]) -> Result<Vec<usize
 /// # Errors
 /// [`IoError::ShapeMismatch`] if `counts` is empty or `edges_us` does not fit it;
 /// [`IoError::InvalidParameter`] if a count is invalid, a bin starts outside
-/// every shutter, shutters overlap, or a pixel's counts in a shutter reach
-/// its triggers.
+/// every shutter or ends after the next opens, shutters overlap, or a pixel's
+/// counts in a shutter reach its triggers.
 pub fn live_fractions(
     counts: ArrayView3<f64>,
     edges_us: &[f64],
@@ -146,11 +161,12 @@ pub fn live_fraction_sigma(live: f64, triggers: f64) -> f64 {
 /// # Arguments
 /// * `counts` — Raw counts in (time bin, row, column), finite and 0 or more.
 /// * `live` — Live fractions in (0, 1] of `counts`, the same shape.
-/// * `cells` — The region's pixels as `[row, column]`, at least one.
+/// * `cells` — The region's pixels as `[row, column]`, at least one, each once.
 ///
 /// # Errors
 /// [`IoError::ShapeMismatch`] if the shapes differ or a cell is outside them;
-/// [`IoError::InvalidParameter`] if `cells` or the bins are empty, a region
+/// [`IoError::InvalidParameter`] if `cells` or the bins are empty, a cell
+/// repeats, a region
 /// count is not finite and 0 or more or its live fraction not in (0, 1], or
 /// the counts overflow the sums.
 pub fn region_live(
@@ -174,6 +190,14 @@ pub fn region_live(
     if let Some(cell) = cells.iter().find(|[r, c]| *r >= rows || *c >= columns) {
         return Err(IoError::ShapeMismatch(format!(
             "cell {cell:?} is outside the {rows} × {columns} image"
+        )));
+    }
+    let mut sorted = cells.to_vec();
+    sorted.sort_unstable();
+    if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
+        return Err(IoError::InvalidParameter(format!(
+            "cell {:?} is in the region twice",
+            w[0]
         )));
     }
     for k in 0..counts.len_of(Axis(0)) {
@@ -233,9 +257,12 @@ mod tests {
         assert_eq!(live.as_slice().unwrap(), &[1.0, 0.8, 0.5, 1.0]);
 
         let near = [shutter(0.0, 1.0, 10.0), shutter(1.0, 2.0, 10.0)];
-        let three = Array3::from_shape_vec((2, 1, 1), vec![2.0, 3.0]).unwrap();
-        let live = live_fractions(three.view(), &[0.0, 0.9995, 1.9995], &near).unwrap();
-        assert_eq!(live[[1, 0, 0]], 0.8);
+        let two = Array3::from_shape_vec((2, 1, 1), vec![2.0, 3.0]).unwrap();
+        assert!(live_fractions(two.view(), &[0.0, 0.9995, 1.9995], &near).is_err());
+
+        let with_gap = [shutter(0.0, 0.9, 10.0), shutter(1.0, 2.0, 10.0)];
+        let live = live_fractions(two.view(), &[0.0, 0.9999995, 1.9999995], &with_gap).unwrap();
+        assert_eq!(live[[1, 0, 0]], 1.0);
     }
 
     #[test]
@@ -261,6 +288,7 @@ mod tests {
         assert!(region_live(counts.view(), live.view(), &[[1, 0]]).is_err());
         let dead = Array3::from_shape_vec((2, 1, 2), vec![0.0, 1.0, 0.6, 0.8]).unwrap();
         assert!(region_live(counts.view(), dead.view(), &[[0, 0]]).is_err());
+        assert!(region_live(counts.view(), live.view(), &[[0, 0], [0, 1], [0, 0]]).is_err());
     }
 
     /// Recorded counts of a pixel that keeps the first neutron of each shutter.
