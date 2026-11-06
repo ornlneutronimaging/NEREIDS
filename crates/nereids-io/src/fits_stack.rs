@@ -121,7 +121,7 @@ pub fn read_fits_image(path: &Path) -> Result<Array2<f64>, IoError> {
             && frac.bytes().all(|b| b == b'0'))
         .then(|| int.parse::<i128>().ok())
         .flatten()
-        .filter(|v| v.abs() <= EXACT as i128);
+        .filter(|v| (-(EXACT as i128)..=EXACT as i128).contains(v));
         v.ok_or_else(|| bad(format!("{key} = {text} is not a whole number up to 2^53")))
     };
     let (zero, scale) = (whole("BZERO", 0)?, whole("BSCALE", 1)?);
@@ -393,6 +393,13 @@ mod tests {
         near[6 * 80..8 * 80]
             .copy_from_slice((card("BSCALE  =   999999999999999.99") + &card("END")).as_bytes());
         std::fs::write(&path, near).unwrap();
+        assert!(read_fits_image(&path).is_err());
+
+        let mut least = fits(1, &[2], 0.0);
+        least[6 * 80..8 * 80].copy_from_slice(
+            (card("BSCALE  = -170141183460469231731687303715884105728") + &card("END")).as_bytes(),
+        );
+        std::fs::write(&path, least).unwrap();
         assert!(read_fits_image(&path).is_err());
 
         let mut cancel = fits(1, &[-1], 1e15);
