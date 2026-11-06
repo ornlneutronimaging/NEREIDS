@@ -61,7 +61,7 @@ hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"]
 rand = "0.10"
 rand_chacha = "0.10"
 rand_distr = "0.6"
-microlp = "0.6"
+microlp = "0.7"
 tracing = "0.1"
 log = "0.4"
 tracing-appender = "0.2"
