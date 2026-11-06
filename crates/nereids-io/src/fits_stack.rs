@@ -127,9 +127,9 @@ pub fn read_fits_image(path: &Path) -> Result<Array2<f64>, IoError> {
             _ => f64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])),
         };
         let v = zero + scale * raw;
-        // A whole count can carry the scaling's rounding error.
+        // A whole count can carry the scaling's rounding error, a few ulp of its terms.
         let whole = v.round();
-        if (v - whole).abs() <= 1e-9 * whole.abs().max(1.0) {
+        if (v - whole).abs() <= 4.0 * f64::EPSILON * (zero.abs() + (scale * raw).abs()) {
             whole
         } else {
             v
@@ -384,6 +384,12 @@ mod tests {
         scaled[5 * 80..6 * 80].copy_from_slice(card("BSCALE  =                 0.07").as_bytes());
         std::fs::write(&path, scaled).unwrap();
         assert_eq!(read_fits_image(&path).unwrap()[[0, 0]], 7.0);
+
+        let mut large = fits(1, &[1], 1e9);
+        large[6 * 80..8 * 80]
+            .copy_from_slice((card("BSCALE  =                  0.5") + &card("END")).as_bytes());
+        std::fs::write(&path, large).unwrap();
+        assert!(read_fits_image(&path).is_err());
 
         let mut half = fits(3, &[0, 1, 2, 3, 4, 5], 0.0);
         half[3 * 80 + 27..3 * 80 + 30].copy_from_slice(b"1.5");
