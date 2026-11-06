@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `nereids_io::fits_stack` loads one chunk of a raw Timepix-1 frame-mode run:
+  its FITS counts, time-bin edges and shutters. `nereids_io::live` gives each
+  pixel's live fraction in each bin, `1 − Σ_{j<k} C_j / S` in its shutter
+  (Watanabe et al. 2017), and a region's. On run 19383, each pixel's
+  occupancy `1 − C/T` in the facility's corrected TIFFs, which also counts the
+  bin's own `C`, equals `1 − L + C/S` within 9e-8.
 - `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission, a
   `fit_counts` temperature fit and a pulse calibration of the foil with a
   lattice with SAMMY at the VENUS bins.
