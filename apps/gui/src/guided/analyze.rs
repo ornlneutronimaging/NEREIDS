@@ -603,17 +603,12 @@ fn build_request(state: &AppState) -> Result<FitRequest, String> {
             RegionRequest::Pixel { y, x }
         }
     };
-    let (sample_live, open_live) = if state.input_mode == InputMode::Tpx1Raw {
-        match state
-            .tpx1_live
-            .as_ref()
-            .and_then(|live| live.of(sample, open))
-        {
-            Some([s, o]) => (Some(s), Some(o)),
-            None => return Err("load the raw Timepix-1 runs again for their live fractions".into()),
+    let (sample_live, open_live) = match state.loaded_live() {
+        Some([s, o]) => (Some(s), Some(o)),
+        None if state.input_mode == InputMode::Tpx1Raw => {
+            return Err("load the raw Timepix-1 runs again for their live fractions".into());
         }
-    } else {
-        (None, None)
+        None => (None, None),
     };
     let charge_ratio = if state.kl_c_ratio.is_finite() && state.kl_c_ratio > 0.0 {
         state.kl_c_ratio

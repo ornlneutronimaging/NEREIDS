@@ -97,12 +97,7 @@ fn has_required_data(state: &AppState) -> bool {
 
 /// Both raw Timepix-1 runs, their edges and their live fractions are loaded.
 pub(crate) fn tpx1_loaded(state: &AppState) -> bool {
-    match (&state.sample_data, &state.open_beam_data, &state.tpx1_live) {
-        (Some(sample), Some(open), Some(live)) => {
-            state.spectrum_values.is_some() && live.of(sample, open).is_some()
-        }
-        _ => false,
-    }
+    state.spectrum_values.is_some() && state.loaded_live().is_some()
 }
 
 // ── Timepix-1 raw tab ──────────────────────────────────────────
@@ -189,8 +184,18 @@ fn tpx1_raw_tab(ui: &mut egui::Ui, state: &mut AppState) {
 /// Pulses with proton charge, and their total charge.
 fn beam_pulses(path: &std::path::Path) -> Result<(f64, f64), String> {
     let log = nereids_io::runlog::read_run_log(path, "proton_charge").map_err(|e| e.to_string())?;
+    if let Some(q) = log.values.iter().find(|q| !q.is_finite()) {
+        return Err(format!(
+            "{}: proton charge {q} is not finite",
+            path.display()
+        ));
+    }
     let charged: Vec<f64> = log.values.iter().copied().filter(|&q| q > 0.0).collect();
-    Ok((charged.len() as f64, charged.iter().sum()))
+    let total: f64 = charged.iter().sum();
+    if !total.is_finite() {
+        return Err(format!("{}: the proton charges overflow", path.display()));
+    }
+    Ok((charged.len() as f64, total))
 }
 
 /// One raw run: its counts, edges and live fractions, and its total proton charge.
@@ -201,7 +206,11 @@ struct RawRun {
     charge: Option<f64>,
 }
 
-fn tpx1_run(folder: &std::path::Path, nexus: Option<&std::path::Path>) -> Result<RawRun, String> {
+/// One run, its triggers limited to the beam pulses of its NeXus file, and its total charge.
+fn tpx1_run(
+    folder: &std::path::Path,
+    nexus: Option<&std::path::Path>,
+) -> Result<(nereids_io::fits_stack::FitsRun, Option<f64>), String> {
     let mut run = nereids_io::fits_stack::load_fits_run(folder, None).map_err(|e| e.to_string())?;
     let charge = match nexus {
         Some(path) => {
@@ -212,14 +221,79 @@ fn tpx1_run(folder: &std::path::Path, nexus: Option<&std::path::Path>) -> Result
         }
         None => None,
     };
-    let live = nereids_io::live::live_fractions(run.counts.view(), &run.edges_us, &run.shutters)
-        .map_err(|e| e.to_string())?;
-    Ok(RawRun {
-        counts: run.counts,
-        edges: run.edges_us,
-        live,
-        charge,
-    })
+    Ok((run, charge))
+}
+
+/// Live fractions of a run whose excluded pixels' counts do not enter; the counts are kept.
+fn live_without(
+    run: &mut nereids_io::fits_stack::FitsRun,
+    excluded: &ndarray::Array2<bool>,
+) -> Result<ndarray::Array3<f64>, String> {
+    let pixels: Vec<(usize, usize)> = excluded
+        .indexed_iter()
+        .filter(|(_, e)| **e)
+        .map(|(p, _)| p)
+        .collect();
+    let kept: Vec<ndarray::Array1<f64>> = pixels
+        .iter()
+        .map(|&(y, x)| {
+            let spectrum = run.counts.slice(ndarray::s![.., y, x]).to_owned();
+            run.counts.slice_mut(ndarray::s![.., y, x]).fill(0.0);
+            spectrum
+        })
+        .collect();
+    let live = nereids_io::live::live_fractions(run.counts.view(), &run.edges_us, &run.shutters);
+    for (&(y, x), spectrum) in pixels.iter().zip(&kept) {
+        run.counts.slice_mut(ndarray::s![.., y, x]).assign(spectrum);
+    }
+    live.map_err(|e| e.to_string())
+}
+
+/// Both runs, with live fractions that leave out the pixels the Normalize step excludes.
+fn tpx1_pair(
+    sample: &std::path::Path,
+    open: &std::path::Path,
+    nexus: [Option<&std::path::Path>; 2],
+) -> Result<[RawRun; 2], String> {
+    let (mut s, sample_charge) = tpx1_run(sample, nexus[0])?;
+    let (mut o, open_charge) = tpx1_run(open, nexus[1])?;
+    let width = s
+        .edges_us
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .fold(f64::INFINITY, f64::min);
+    let same = s.edges_us.len() == o.edges_us.len()
+        && s.edges_us
+            .iter()
+            .zip(&o.edges_us)
+            .all(|(a, b)| (a - b).abs() <= 1e-3 * width);
+    if !same || s.counts.dim() != o.counts.dim() {
+        return Err("the sample and open-beam runs have different bins or images".into());
+    }
+    let excluded = nereids_io::pixels::detect_bad_pixels(
+        &s.counts,
+        Some(&o.counts),
+        Some(nereids_io::pixels::HOT_PIXEL_K_MAD),
+    )
+    .map_err(|e| e.to_string())?;
+    let (sample_live, open_live) = (
+        live_without(&mut s, &excluded)?,
+        live_without(&mut o, &excluded)?,
+    );
+    Ok([
+        RawRun {
+            counts: s.counts,
+            edges: s.edges_us,
+            live: sample_live,
+            charge: sample_charge,
+        },
+        RawRun {
+            counts: o.counts,
+            edges: o.edges_us,
+            live: open_live,
+            charge: open_charge,
+        },
+    ])
 }
 
 /// Load both raw Timepix-1 runs and compute their live fractions.
@@ -230,39 +304,33 @@ fn load_tpx1_runs(state: &mut AppState) {
     else {
         return;
     };
-    let loaded = tpx1_run(&sample_path, state.hdf5_path.as_deref()).and_then(|sample| {
-        let open = tpx1_run(&open_path, state.hdf5_ob_path.as_deref())?;
-        let width = sample
-            .edges
-            .windows(2)
-            .map(|w| w[1] - w[0])
-            .fold(f64::INFINITY, f64::min);
-        let same = sample.edges.len() == open.edges.len()
-            && sample
-                .edges
-                .iter()
-                .zip(&open.edges)
-                .all(|(a, b)| (a - b).abs() <= 1e-3 * width);
-        if !same || sample.counts.dim() != open.counts.dim() {
-            return Err("the sample and open-beam runs have different bins or images".into());
-        }
-        Ok((sample, open))
-    });
+    state.sample_data = None;
+    state.open_beam_data = None;
+    state.tpx1_live = None;
+    state.pixel_fit = None;
+    state.map_fit = None;
+    let loaded = tpx1_pair(
+        &sample_path,
+        &open_path,
+        [state.hdf5_path.as_deref(), state.hdf5_ob_path.as_deref()],
+    );
     match loaded {
-        Ok((
-            RawRun {
-                counts: sample,
-                edges,
-                live: sample_live,
-                charge: sample_charge,
-            },
-            RawRun {
-                counts: open,
-                live: open_live,
-                charge: open_charge,
-                ..
-            },
-        )) => {
+        Ok(
+            [
+                RawRun {
+                    counts: sample,
+                    edges,
+                    live: sample_live,
+                    charge: sample_charge,
+                },
+                RawRun {
+                    counts: open,
+                    live: open_live,
+                    charge: open_charge,
+                    ..
+                },
+            ],
+        ) => {
             state.preview_image = Some(sample.sum_axis(Axis(0)));
             state.log_provenance(
                 ProvenanceEventKind::DataLoaded,
@@ -304,6 +372,7 @@ fn load_tpx1_runs(state: &mut AppState) {
             });
             state.sample_data = Some(sample);
             state.open_beam_data = Some(open);
+            state.load_error = false;
         }
         Err(e) => {
             state.status_message = format!("Failed to load the raw runs: {e}");
@@ -322,6 +391,9 @@ pub(crate) fn on_tpx1_nexus_picked(state: &mut AppState, path: std::path::PathBu
     } else {
         state.hdf5_path = Some(path);
     }
+    state.invalidate_results();
+    state.pixel_fit = None;
+    state.map_fit = None;
     state.sample_data = None;
     state.open_beam_data = None;
     state.tpx1_live = None;
@@ -1338,5 +1410,13 @@ mod tests {
         state.sample_data = None;
         load_tpx1_runs(&mut state);
         assert!(state.load_error && state.status_message.contains("different bins"));
+
+        write_run(open.path(), &[[4, 2], [6, 0], [2, 2], [0, 4]], 40);
+        load_tpx1_runs(&mut state);
+        assert!(
+            !state.load_error && tpx1_loaded(&state),
+            "{}",
+            state.status_message
+        );
     }
 }

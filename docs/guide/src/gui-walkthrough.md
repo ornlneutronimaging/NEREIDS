@@ -48,7 +48,8 @@ file format and loads data when all fields are filled.
 The Timepix-1 Raw tab takes the raw FITS folders of a single-shutter sample
 run and open-beam run, and optionally each run's NeXus file, whose
 `proton_charge` log gives the pulses that carried beam. Load runs computes
-each pixel's live fractions, which both fits use. These runs are not rebinned,
+each pixel's live fractions, which both fits use; pixels the bad-pixel screen
+excludes do not enter them. These runs are not rebinned,
 and a project holding them is saved linked; after reopening it, press Load
 runs.
 

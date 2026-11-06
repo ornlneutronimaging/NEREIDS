@@ -354,7 +354,7 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
     }
 
     // Raw Timepix-1 live fractions are not stored; such a project reloads its runs.
-    let can_embed = state.sample_data.is_some() && state.input_mode != InputMode::Tpx1Raw;
+    let can_embed = state.sample_data.is_some() && state.loaded_live().is_none();
     let (raw_bytes, compressed_bytes) = if can_embed {
         nereids_io::project::estimate_embedded_size(
             state.sample_data.as_deref(),
@@ -524,7 +524,7 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
     }
 
     // Fall back to linked if embedded requested but sample data not available
-    let mode = if mode == SaveDataMode::Embedded && state.input_mode == InputMode::Tpx1Raw {
+    let mode = if mode == SaveDataMode::Embedded && state.loaded_live().is_some() {
         state.status_message =
             "Raw Timepix-1 runs reload with their live fractions — saving in linked mode.".into();
         SaveDataMode::Linked
@@ -1368,12 +1368,21 @@ mod tests {
     #[test]
     fn a_raw_timepix1_project_keeps_its_mode_and_run_paths_and_holds_no_stacks() {
         let dir = tempfile::tempdir().unwrap();
+        let counts = Arc::new(Array3::from_elem((2, 1, 1), 3.0));
+        let live = Arc::new(Array3::from_elem((2, 1, 1), 0.9));
         let mut state = AppState {
             input_mode: InputMode::Tpx1Raw,
             sample_path: Some(dir.path().join("sample")),
             open_beam_path: Some(dir.path().join("open")),
             hdf5_path: Some(dir.path().join("VENUS_1.nxs.h5")),
-            sample_data: Some(Arc::new(Array3::from_elem((2, 1, 1), 3.0))),
+            sample_data: Some(Arc::clone(&counts)),
+            open_beam_data: Some(Arc::clone(&counts)),
+            tpx1_live: Some(crate::state::Tpx1Live {
+                sample_counts: Arc::clone(&counts),
+                open_counts: Arc::clone(&counts),
+                sample: Arc::clone(&live),
+                open: live,
+            }),
             ..AppState::default()
         };
         let path = dir.path().join("raw.nrd.h5");

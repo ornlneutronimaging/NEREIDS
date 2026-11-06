@@ -952,6 +952,25 @@ impl AppState {
         self.analyze_tof_slice_index = 0;
     }
 
+    /// Switch the input mode; a change drops the loaded counts and what was derived from them.
+    pub fn set_input_mode(&mut self, mode: InputMode) {
+        if self.input_mode != mode {
+            self.input_mode = mode;
+            self.invalidate_results();
+            self.sample_data = None;
+            self.open_beam_data = None;
+            self.tpx1_live = None;
+            self.pixel_fit = None;
+            self.map_fit = None;
+        }
+    }
+
+    /// The `[sample, open]` live fractions of the loaded counts, if they have them.
+    pub fn loaded_live(&self) -> Option<[Arc<Array3<f64>>; 2]> {
+        let (sample, open) = (self.sample_data.as_ref()?, self.open_beam_data.as_ref()?);
+        self.tpx1_live.as_ref()?.of(sample, open)
+    }
+
     /// Compute the bounding box of all ROIs, or `None` if no ROIs exist.
     pub fn bounding_roi(&self) -> Option<RoiSelection> {
         if self.rois.is_empty() {
