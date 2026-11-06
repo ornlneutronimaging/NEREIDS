@@ -6,6 +6,8 @@
 //! - `daslogs` - DASlogs run-health summary (`hdf5` feature)
 //! - [`error`] - error types for I/O operations
 //! - [`export`] - export spatial mapping results to TIFF, HDF5 and Markdown
+//! - [`fits_stack`] - raw Timepix-1 frame-mode runs: FITS frames, frame times and shutters
+//! - [`live`] - live fractions of a Timepix-1 frame-mode run
 //! - `nexus` - NeXus/HDF5 reading for rustpix-processed data (`hdf5` feature)
 //! - [`pixels`] - data-quality pixel masks and per-pixel spectrum extraction
 //! - `project` - project file save/load for `.nrd.h5` archives (`hdf5` feature)
@@ -19,6 +21,8 @@
 pub mod daslogs;
 pub mod error;
 pub mod export;
+pub mod fits_stack;
+pub mod live;
 #[cfg(feature = "hdf5")]
 pub mod nexus;
 pub mod pixels;
