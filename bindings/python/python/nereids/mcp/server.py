@@ -704,6 +704,46 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
 
 
 
+def _beam_pulses(nexus_path: Path | None) -> float | None:
+    if nexus_path is None:
+        return None
+    charge = nereids.read_run_log(str(nexus_path), "proton_charge").values
+    return float(np.count_nonzero(charge > 0))
+
+
+def _load_tpx1_pair(
+    base: Path, data_config: dict[str, Any]
+) -> list[tuple[np.ndarray, np.ndarray, list[tuple[float, float, float]]]]:
+    """Raw Timepix-1 sample and open-beam runs: counts, edges and shutters."""
+    runs = []
+    for run in ("sample", "open_beam"):
+        folder = _resolve_path(base, data_config.get(f"{run}_path"))
+        if folder is None:
+            raise ValueError("tpx1_fits data requires sample_path and open_beam_path")
+        pulses = _beam_pulses(_resolve_path(base, data_config.get(f"{run}_nexus")))
+        runs.append(
+            nereids.load_fits_run(str(folder), data_config.get(f"{run}_chunk"), pulses)
+        )
+    (sample, edges, _), (open_beam, open_edges, _) = runs
+    _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
+    if edges.shape != open_edges.shape or not np.allclose(edges, open_edges):
+        raise ValueError("tpx1_fits sample and open_beam time-bin edges must match")
+    return runs
+
+
+def _tpx1_live(
+    counts: np.ndarray,
+    edges: np.ndarray,
+    shutters: list[tuple[float, float, float]],
+    excluded: np.ndarray | None = None,
+) -> np.ndarray:
+    """Live fractions of the kept pixels; an excluded pixel's counts do not enter."""
+    if excluded is not None:
+        counts = np.where(excluded[np.newaxis], 0.0, counts)
+    return nereids.live_fractions(np.ascontiguousarray(counts), list(edges), shutters)
+
+
+
 def _process_single_spectrum(
     base: Path,
     manifest: dict[str, Any],
@@ -713,20 +753,37 @@ def _process_single_spectrum(
     config = _workflow_config(manifest)
     data_config = _get_data_config(config)
     fit_config = _get_fit_config(config)
-    data_path = _resolve_path(base, data_config.get("path"))
-    if data_path is None:
-        raise ValueError("single_spectrum workflow requires data.path")
-    if data_path.suffix != ".npz":
-        raise ValueError("single_spectrum counts data must be a .npz file")
-    arrays = _npz_arrays(data_path)
-    sample_key = data_config.get("sample_key", "sample_counts")
-    open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
-    _require_npz_keys(
-        arrays, [sample_key, open_beam_key], context="single_spectrum counts data"
-    )
-    sample = _validate_array("sample_counts", arrays[sample_key])
-    open_beam = _validate_array("open_beam_counts", arrays[open_beam_key])
-    _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
+    kind = _normalise_kind(data_config.get("kind"), "counts_npz")
+    live: list[list[float] | None] = [None, None]
+    if kind == "tpx1_fits":
+        roi = data_config.get("roi") or config.get("roi")
+        runs = _load_tpx1_pair(base, data_config)
+        cubes = [np.ascontiguousarray(_apply_roi(counts, roi)) for counts, _, _ in runs]
+        cells = [(y, x) for y in range(cubes[0].shape[1]) for x in range(cubes[0].shape[2])]
+        live = [
+            nereids.region_live(cube, _tpx1_live(cube, edges, shutters), cells)
+            for cube, (_, edges, shutters) in zip(cubes, runs)
+        ]
+        cube, open_cube = cubes
+        tpx1_edges = np.ascontiguousarray(runs[0][1])
+        data_path = _resolve_path(base, data_config.get("sample_path"))
+        arrays = {}
+        sample, open_beam = cube, open_cube
+    else:
+        data_path = _resolve_path(base, data_config.get("path"))
+        if data_path is None:
+            raise ValueError("single_spectrum workflow requires data.path")
+        if data_path.suffix != ".npz":
+            raise ValueError("single_spectrum counts data must be a .npz file")
+        arrays = _npz_arrays(data_path)
+        sample_key = data_config.get("sample_key", "sample_counts")
+        open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
+        _require_npz_keys(
+            arrays, [sample_key, open_beam_key], context="single_spectrum counts data"
+        )
+        sample = _validate_array("sample_counts", arrays[sample_key])
+        open_beam = _validate_array("open_beam_counts", arrays[open_beam_key])
+        _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
     pixels = float(data_config.get("pixels", 1.0))
     if sample.ndim == 3:
         pixels = float(data_config.get("pixels", sample.shape[1] * sample.shape[2]))
@@ -735,12 +792,18 @@ def _process_single_spectrum(
     if sample.ndim != 1 or open_beam.ndim != 1:
         raise ValueError("single_spectrum counts arrays must be 1D or 3D")
     calibration = _calibration(config, data_config)
-    edges = _load_time_edges(base, data_config, arrays, sample.size)
+    edges = (
+        tpx1_edges
+        if kind == "tpx1_fits"
+        else _load_time_edges(base, data_config, arrays, sample.size)
+    )
     material, names, _ = _material(config, frontmatter, base, fit_config)
     charge_ratio = float(data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0)))
     region = nereids.Region(
         open_counts=open_beam,
         sample_counts=sample,
+        open_live=live[1],
+        sample_live=live[0],
         pixels=pixels,
         background=_background_values(fit_config.get("background")),
         gamma_transmission=_value_or_number(fit_config.get("gamma_transmission"), 1.0),
@@ -773,7 +836,7 @@ def _process_single_spectrum(
     summary.update(
         {
             "mode": "single_spectrum",
-            "input_kind": "counts",
+            "input_kind": kind,
             "data_path": str(data_path),
             "output_npz": str(result_npz),
             "time_range_us": [float(edges[0]), float(edges[-1])],
@@ -798,8 +861,20 @@ def _process_density_map(
     path = _resolve_path(base, data_config.get("path"))
     arrays = _npz_arrays(path) if path is not None and path.suffix == ".npz" else None
     crop: dict[str, Any] | None = None
+    sample_live = open_live = None
 
-    if kind in {"counts_npz", "counts"}:
+    if kind == "tpx1_fits":
+        roi = data_config.get("roi") or config.get("roi")
+        tpx1_runs = _load_tpx1_pair(base, data_config)
+        (sample, edges, _), (open_beam, _, _) = tpx1_runs
+        full_shape = sample.shape[1:]
+        sample, open_beam = _apply_roi(sample, roi), _apply_roi(open_beam, roi)
+        sample, crop = _limit_pixels(sample, max_pixels)
+        height, width = sample.shape[1], sample.shape[2]
+        sample = np.ascontiguousarray(sample)
+        open_beam = np.ascontiguousarray(open_beam[:, :height, :width])
+        edges = np.ascontiguousarray(edges)
+    elif kind in {"counts_npz", "counts"}:
         if arrays is None:
             raise ValueError("counts_npz data requires a .npz data.path")
         sample_key = data_config.get("sample_key", "sample_counts")
@@ -808,6 +883,7 @@ def _process_density_map(
             arrays, [sample_key, open_beam_key], context="density_map counts data"
         )
         sample = _validate_array("sample_counts", arrays[sample_key], ndim=3)
+        full_shape = sample.shape[1:]
         open_beam = _validate_array("open_beam_counts", arrays[open_beam_key], ndim=3)
         _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
         roi = data_config.get("roi") or config.get("roi")
@@ -824,6 +900,7 @@ def _process_density_map(
         sample_data = nereids.load_nexus_histogram(str(sample_path))
         open_data = nereids.load_nexus_histogram(str(open_beam_path))
         sample = _validate_array("sample_counts", sample_data.counts, ndim=3)
+        full_shape = sample.shape[1:]
         open_beam = _validate_array("open_beam_counts", open_data.counts, ndim=3)
         _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
         sample_edges = _validate_array(
@@ -860,7 +937,7 @@ def _process_density_map(
         if arrays is None or key not in arrays:
             return default
         original = np.asarray(arrays[key], dtype=bool)
-        if original.shape != arrays[sample_key].shape[1:]:
+        if original.shape != full_shape:
             raise ValueError("excluded/sample/empty masks must match the counts spatial shape")
         selected = _apply_roi(original[np.newaxis], roi)[0]
         return np.ascontiguousarray(selected[:height, :width])
@@ -868,6 +945,11 @@ def _process_density_map(
     excluded = mask(excluded_key, np.zeros((height, width), dtype=bool))
     empty = mask(empty_key, np.zeros((height, width), dtype=bool))
     behind = mask(sample_mask_key, ~empty)
+    if kind == "tpx1_fits":
+        sample_live, open_live = (
+            _tpx1_live(counts, run_edges, shutters, excluded)
+            for counts, (_, run_edges, shutters) in zip((sample, open_beam), tpx1_runs)
+        )
 
     charge_ratio = float(
         data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0) if arrays is not None else 1.0)
@@ -887,6 +969,8 @@ def _process_density_map(
         background=_background_values(fit_config.get("background")),
         binning=int(data_config.get("binning", 1)),
         empty_background=_background_values(fit_config.get("empty_background")),
+        open_live=open_live,
+        sample_live=sample_live,
         time_background=_time_background_values(fit_config.get("time_background")),
         gamma_transmission=_value_or_number(fit_config.get("gamma_transmission"), 1.0),
         room_background=_room_background(fit_config.get("room_background")),
@@ -930,7 +1014,7 @@ def _process_density_map(
     np.savez_compressed(result_npz, **arrays_to_save)
     return {
         "mode": "density_map",
-        "input_kind": "counts",
+        "input_kind": kind,
         "data_path": None if path is None else str(path),
         "output_npz": str(result_npz),
         "time_range_us": [float(edges[0]), float(edges[-1])],
@@ -971,7 +1055,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         )
 
     effective_kind = _normalise_kind(data_config.get("kind"), "counts_npz")
-    if effective_kind not in {"counts_npz", "counts", "nexus_histogram", "nexus"}:
+    if effective_kind not in {"counts_npz", "counts", "nexus_histogram", "nexus", "tpx1_fits"}:
         errors.append(
             f"unsupported data kind: {effective_kind}; the fit is counts-only"
         )
@@ -979,7 +1063,10 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
     has_path = data_config.get("path") not in (None, "")
     has_sample_path = data_config.get("sample_path") not in (None, "")
     has_open_beam_path = data_config.get("open_beam_path") not in (None, "")
-    if mode in {"single_spectrum", "fit_spectrum", "spectrum"} and not has_path:
+    if effective_kind == "tpx1_fits":
+        if not has_sample_path or not has_open_beam_path:
+            errors.append("tpx1_fits workflow requires sample_path and open_beam_path")
+    elif mode in {"single_spectrum", "fit_spectrum", "spectrum"} and not has_path:
         errors.append("single_spectrum workflow requires data.path")
     elif mode in {"density_map", "spatial_map"}:
         if effective_kind in {"nexus_histogram", "nexus"}:
@@ -991,7 +1078,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"{effective_kind} density_map workflow requires data.path")
 
     data_paths = []
-    for key in ("path", "sample_path", "open_beam_path"):
+    for key in ("path", "sample_path", "open_beam_path", "sample_nexus", "open_beam_nexus"):
         value = data_config.get(key)
         if value in (None, ""):
             continue

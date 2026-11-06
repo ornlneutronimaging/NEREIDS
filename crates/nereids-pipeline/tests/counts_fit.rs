@@ -24,7 +24,7 @@ use nereids_pipeline::counts_fit::{
     CountsFit, Material, Measurement, NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit,
     RoomBackground, Spread, Value, fit_counts,
 };
-use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map};
+use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map, region_live};
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{BOUND, Calibration, Pulse, fit_open_beam};
 use nereids_pipeline::pulse_calibration::{Provenance, PulseCalibration};
@@ -787,11 +787,10 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         .collect();
     let bins = setup.edges.len() - 1;
     let most = unit[4].0.iter().fold(0.0_f64, |m, &c| m.max(c));
-    let live: Vec<f64> = unit[4]
-        .0
-        .iter()
-        .map(|c| 1.0 / (1.0 + 0.25 * c / most))
-        .collect();
+    // Each patch column loses a different share, so one vector per run cannot fit them all.
+    let live = Array3::from_shape_fn((bins, 3, 12), |(k, _, x)| {
+        1.0 / (1.0 + (0.1 + 0.08 * (x / 2) as f64) * unit[4].0[k] / most)
+    });
     let (hot, broken) = ((0, 2), (1, 7));
     let cube = |run: usize| {
         Array3::from_shape_fn((bins, 3, 12), |(k, y, x)| {
@@ -800,7 +799,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             }
             let (open, sample) = &unit[if y == 2 { 4 } else { x / 2 }];
             let level = [1.0, 1.3, 0.8, 1.1][2 * (y % 2) + x % 2];
-            let count = (live[k] * level * [open, sample][run][k]).round();
+            let count = (live[[k, y, x]] * level * [open, sample][run][k]).round();
             match (y, x) {
                 pixel if pixel == hot => 100.0 * count,
                 pixel if pixel == broken => f64::NAN,
@@ -823,8 +822,8 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         room_background: None,
         open_counts: counts[0].view(),
         sample_counts: counts[1].view(),
-        open_live: Some(live.clone()),
-        sample_live: Some(live.clone()),
+        open_live: Some(live.view()),
+        sample_live: Some(live.view()),
         excluded: excluded.view(),
         sample: behind.view(),
         empty: empty.view(),
@@ -991,12 +990,19 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             })
             .collect()
     };
-    let region =
-        |pixels: &dyn Fn(usize, usize) -> bool, material: Option<Material>, background| Region {
+    let region = |pixels: &dyn Fn(usize, usize) -> bool, material: Option<Material>, background| {
+        let cells: Vec<[usize; 2]> = (0..3)
+            .flat_map(|y| (0..12).map(move |x| [y, x]))
+            .filter(|&[y, x]| !excluded[[y, x]] && pixels(y, x))
+            .collect();
+        let live_of = |run: usize| {
+            Some(region_live(counts[run].view(), live.view(), &cells).expect("region live"))
+        };
+        Region {
             open_counts: summed(0, pixels),
             sample_counts: summed(1, pixels),
-            open_live: map.open_live.clone(),
-            sample_live: map.sample_live.clone(),
+            open_live: live_of(0),
+            sample_live: live_of(1),
             background,
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
@@ -1004,7 +1010,8 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             in_scatter: Value::Known(0.0),
             timing_offset_us: Value::Known(0.0),
             material,
-        };
+        }
+    };
     let joint = fit_counts(
         &Measurement {
             time_edges_us: setup.edges.clone(),
@@ -1078,6 +1085,12 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         );
     }
 
+    let cells: Vec<[usize; 2]> = (0..2)
+        .flat_map(|y| (0..4).map(move |x| [y, x]))
+        .filter(|&[y, x]| !excluded[[y, x]])
+        .collect();
+    let area_live =
+        [0, 1].map(|run| region_live(counts[run].view(), live.view(), &cells).expect("live"));
     let area = |[open_counts, sample_counts]: [Vec<f64>; 2]| {
         let measurement = Measurement {
             time_edges_us: setup.edges.clone(),
@@ -1089,8 +1102,8 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             regions: vec![Region {
                 open_counts,
                 sample_counts,
-                open_live: Some(live.clone()),
-                sample_live: Some(live.clone()),
+                open_live: Some(area_live[0].clone()),
+                sample_live: Some(area_live[1].clone()),
                 background: map.background,
                 pixels: 1.0,
                 gamma_transmission: Value::Known(1.0),
@@ -2186,12 +2199,17 @@ fn maps_the_fit_does_not_describe_are_refused() {
     let mut carrying = base.clone();
     carrying.material.covariances = vec![(0, synthetic_covariance(&hafnium_like(20.0), 0.01))];
     refused(&carrying, "does not yet carry");
+    let short = Array3::from_elem((2, 1, 7), 1.0);
     let mut short_live = base.clone();
-    short_live.sample_live = Some(vec![1.0; 2]);
+    short_live.sample_live = Some(short.view());
     assert!(matches!(
         fit_map(&short_live, &calibration(&setup)),
-        Err(PipelineError::ShapeMismatch(message)) if message.starts_with("2 sample live")
+        Err(PipelineError::ShapeMismatch(message)) if message.starts_with("sample live fractions of shape")
     ));
+    let dead = Array3::zeros((577, 1, 7));
+    let mut dead_live = base.clone();
+    dead_live.open_live = Some(dead.view());
+    refused(&dead_live, "count 0 and live fraction 0");
     let mut measured = base.clone();
     measured.background[0] = Value::Measured {
         value: 0.0,

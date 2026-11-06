@@ -20,9 +20,7 @@ use crate::counts_fit::{
     starts_and_widths_us,
 };
 use crate::error::PipelineError;
-use crate::open_beam::{
-    BOUND, Calibration, PULSE_NUMBERS, Pulse, open_beam_with_intervals, validate_live, whole,
-};
+use crate::open_beam::{BOUND, Calibration, PULSE_NUMBERS, Pulse, open_beam_with_intervals, whole};
 
 const MOST_STEPS: usize = 20;
 
@@ -52,11 +50,13 @@ pub struct MapMeasurement<'a> {
     /// Raw counts of the sample run, in (time bin, row, column).
     pub sample_counts: ArrayView3<'a, f64>,
     /// The fraction of the open-beam run's neutrons arriving in each bin that
-    /// every pixel records, in (0, 1]; `None` records every one.
-    pub open_live: Option<Vec<f64>>,
+    /// each pixel records, in (time bin, row, column), in (0, 1]; `None`
+    /// records every one.
+    pub open_live: Option<ArrayView3<'a, f64>>,
     /// The fraction of the sample run's neutrons arriving in each bin that
-    /// every pixel records, in (0, 1]; `None` records every one.
-    pub sample_live: Option<Vec<f64>>,
+    /// each pixel records, in (time bin, row, column), in (0, 1]; `None`
+    /// records every one.
+    pub sample_live: Option<ArrayView3<'a, f64>>,
     /// Pixels left out of both runs, in (row, column).
     pub excluded: ArrayView2<'a, bool>,
     /// Pixels behind the sample, in (row, column).
@@ -96,7 +96,8 @@ impl MapMeasurement<'_> {
     /// # Errors
     /// [`PipelineError::ShapeMismatch`] unless both runs' counts have one time
     /// bin per pair of edges and the same rows and columns as the three
-    /// masks; [`PipelineError::InvalidParameter`] if `binning` is 0.
+    /// masks, and each live fraction array has their shape;
+    /// [`PipelineError::InvalidParameter`] if `binning` is 0.
     pub fn patches(&self) -> Result<Array2<Patch>, PipelineError> {
         let bins = self.time_edges_us.len().saturating_sub(1);
         let (time_bins, height, width) = self.open_counts.dim();
@@ -107,6 +108,15 @@ impl MapMeasurement<'_> {
                 self.open_counts.dim(),
                 self.sample_counts.dim()
             )));
+        }
+        for (run, live) in [("open-beam", self.open_live), ("sample", self.sample_live)] {
+            if let Some(live) = live.filter(|live| live.dim() != self.open_counts.dim()) {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "{run} live fractions of shape {:?} for counts of shape {:?}",
+                    live.dim(),
+                    self.open_counts.dim()
+                )));
+            }
         }
         for (name, mask) in [
             ("excluded", self.excluded),
@@ -148,6 +158,97 @@ impl MapMeasurement<'_> {
             .filter(|&pixel| !self.excluded[pixel])
             .collect()
     }
+
+    /// Each run's live fractions of a set of pixels, by [`region_live`].
+    fn region_lives(
+        &self,
+        pixels: &[(usize, usize)],
+    ) -> Result<[Option<Vec<f64>>; 2], PipelineError> {
+        let cells: Vec<[usize; 2]> = pixels.iter().map(|&(y, x)| [y, x]).collect();
+        let one = |counts, live: Option<ArrayView3<'_, f64>>| {
+            live.map(|live| region_live(counts, live, &cells))
+                .transpose()
+        };
+        Ok([
+            one(self.open_counts, self.open_live)?,
+            one(self.sample_counts, self.sample_live)?,
+        ])
+    }
+}
+
+/// A region's live fraction in each bin, its counts over their arrivals: `Σ C / Σ (C / L)`.
+///
+/// A bin with no counts in the region takes the mean `L` of its pixels.
+///
+/// # Arguments
+/// * `counts` — Raw counts in (time bin, row, column), finite and 0 or more.
+/// * `live` — Live fractions of `counts` in (0, 1], the same shape.
+/// * `cells` — The region's pixels as `[row, column]`, at least one, each once.
+///
+/// # Errors
+/// [`PipelineError::ShapeMismatch`] if the shapes differ or a cell is outside
+/// them; [`PipelineError::InvalidParameter`] if `cells` or the bins are empty,
+/// a cell repeats, a region count is not finite and 0 or more or its live
+/// fraction not in (0, 1], or the counts overflow the sums.
+pub fn region_live(
+    counts: ArrayView3<'_, f64>,
+    live: ArrayView3<'_, f64>,
+    cells: &[[usize; 2]],
+) -> Result<Vec<f64>, PipelineError> {
+    if counts.shape() != live.shape() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "counts {:?} and live fractions {:?}",
+            counts.shape(),
+            live.shape()
+        )));
+    }
+    if cells.is_empty() || counts.is_empty() {
+        return Err(PipelineError::InvalidParameter(
+            "a region needs a pixel and a bin".into(),
+        ));
+    }
+    let (rows, columns) = (counts.shape()[1], counts.shape()[2]);
+    if let Some(cell) = cells.iter().find(|[r, c]| *r >= rows || *c >= columns) {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "cell {cell:?} is outside the {rows} × {columns} image"
+        )));
+    }
+    let mut sorted = cells.to_vec();
+    sorted.sort_unstable();
+    if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
+        return Err(PipelineError::InvalidParameter(format!(
+            "cell {:?} is in the region twice",
+            w[0]
+        )));
+    }
+    (0..counts.shape()[0])
+        .map(|k| {
+            let (mut recorded, mut arrived, mut sum) = (0.0, 0.0, 0.0);
+            for &[r, c] in cells {
+                let (n, l) = (counts[[k, r, c]], live[[k, r, c]]);
+                if !(n.is_finite() && n >= 0.0 && l > 0.0 && l <= 1.0) {
+                    return Err(PipelineError::InvalidParameter(format!(
+                        "bin {k}, pixel ({r}, {c}): count {n} and live fraction {l}"
+                    )));
+                }
+                recorded += n;
+                arrived += n / l;
+                sum += l;
+            }
+            let l = if recorded > 0.0 {
+                recorded / arrived
+            } else {
+                sum / cells.len() as f64
+            };
+            if l > 0.0 && l <= 1.0 {
+                Ok(l)
+            } else {
+                Err(PipelineError::InvalidParameter(format!(
+                    "bin {k}: the region's live fraction {l} is out of range; its counts overflow"
+                )))
+            }
+        })
+        .collect()
 }
 
 /// What the pixels of a patch that are not excluded lie behind.
@@ -484,11 +585,12 @@ pub fn fit_map<'a>(
     })?;
     let bins = starts_and_widths_us(&map.time_edges_us);
     let frames = open_frames(map.room_background.as_ref());
-    let empty_pixels = map
+    let empty_pixels: Vec<(usize, usize)> = map
         .empty
         .indexed_iter()
         .filter(|&(pixel, &e)| e && !map.excluded[pixel])
-        .count();
+        .map(|(pixel, _)| pixel)
+        .collect();
     let mut intervals: Option<Vec<Option<usize>>> = None;
     for passes in 1..=MOST_PASSES {
         let result = fit_map_from(map, calibration, open, intervals.as_deref())?;
@@ -502,18 +604,19 @@ pub fn fit_map<'a>(
             result
                 .fits
                 .indexed_iter()
-                .filter_map(|(patch, fit)| Some((fit.as_ref()?, map.pixels(patch).len())))
-                .chain(result.empty.as_ref().map(|fit| (fit, empty_pixels)))
+                .filter_map(|(patch, fit)| Some((fit.as_ref()?, map.pixels(patch))))
+                .chain(result.empty.as_ref().map(|fit| (fit, empty_pixels.clone())))
         };
         let mut spread = 0.0;
         for (fit, pixels) in regions() {
+            let [live, _] = map.region_lives(&pixels)?;
             for (k, &mu) in fit.predicted[0]
                 .iter()
                 .enumerate()
                 .filter(|(_, mu)| **mu > 0.0)
             {
-                let live = map.open_live.as_ref().map_or(1.0, |live| live[k]);
-                spread += (live * pixels as f64 * (now[k] - used[k])).powi(2) / mu;
+                let live = live.as_ref().map_or(1.0, |live| live[k]);
+                spread += (live * pixels.len() as f64 * (now[k] - used[k])).powi(2) / mu;
             }
         }
         if !result.converged || spread <= BOUND {
@@ -533,7 +636,7 @@ pub fn fit_map<'a>(
                     .filter(|&(_, &kind)| kind == Patch::Sample)
                     .map(|(patch, _)| result.fits[patch].as_ref().map(|f| f.beam.intervals()))
                     .chain(
-                        (empty_pixels > 0)
+                        (!empty_pixels.is_empty())
                             .then(|| result.empty.as_ref().map(|f| f.beam.intervals())),
                     )
                     .collect()
@@ -610,11 +713,12 @@ fn fit_map_from<'a>(
     let region =
         |pixels: &[(usize, usize)], background, gamma_transmission, material: Option<Material>| {
             let [open_counts, sample_counts] = summed(map, pixels)?;
+            let [open_live, sample_live] = map.region_lives(pixels)?;
             Ok::<_, PipelineError>(Region {
                 open_counts,
                 sample_counts,
-                open_live: map.open_live.clone(),
-                sample_live: map.sample_live.clone(),
+                open_live,
+                sample_live,
                 background,
                 pixels: pixels.len() as f64,
                 gamma_transmission,
@@ -772,8 +876,6 @@ fn fit_map_from<'a>(
         open_frames(map.room_background.as_ref()),
     );
     let bins = map.open_counts.dim().0;
-    validate_live("open-beam", map.open_live.as_deref(), bins)?;
-    validate_live("sample", map.sample_live.as_deref(), bins)?;
     let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
     let fitted_temperature = !matches!(material.temperature_k, Value::Known(_));
     let labels: Vec<String> = fitted_patches

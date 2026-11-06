@@ -58,3 +58,37 @@ def _synthetic_u238_entry(initial_density=0.001):
             "resonances": [[6.674, 0.5, 0.0015, 0.023]],
         },
     }
+
+
+def _write_tpx1_run(folder, frames, triggers, starts_s=None):
+    """Write a raw Timepix-1 run: 16-bit FITS frames and one shutter's sidecars."""
+    import numpy as np
+
+    folder.mkdir(parents=True, exist_ok=True)
+    frames = np.asarray(frames, dtype=">i2")
+    height, width = frames.shape[1:]
+    for k, frame in enumerate(frames):
+        cards = [
+            "SIMPLE  =                    T",
+            "BITPIX  =                   16",
+            "NAXIS   =                    2",
+            f"NAXIS1  = {width:>20}",
+            f"NAXIS2  = {height:>20}",
+            "END",
+        ]
+        header = "".join(f"{card:<80}" for card in cards).encode()
+        header += b" " * (-len(header) % 2880)
+        data = frame.tobytes()
+        data += b"\0" * (-len(data) % 2880)
+        (folder / f"run_0_114_{k:05d}.fits").write_bytes(header + data)
+    if starts_s is None:
+        starts_s = [1e-6 * (k + 1) for k in range(len(frames))]
+    width_s = starts_s[-1] - starts_s[-2]
+    (folder / "run_0_114_Spectra.txt").write_text(
+        "".join(f"{t}\t0\r\n" for t in starts_s)
+    )
+    length = starts_s[-1] + 2 * width_s - starts_s[0]
+    (folder / "run_0_114_ShutterTimes.txt").write_text(
+        f"0\t{starts_s[0]}\t{length}\r\n1\t0\t0\r\n"
+    )
+    (folder / "run_0_114_ShutterCount.txt").write_text(f"0\t{triggers}\r\n1\t0\r\n")

@@ -1871,6 +1871,145 @@ fn load_tiff_folder<'py>(
     }
 }
 
+fn fits_error(e: nereids_io::error::IoError) -> PyErr {
+    match &e {
+        nereids_io::error::IoError::NoMatchingFiles { .. } => {
+            pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string())
+        }
+        err if is_genuine_not_found(err) => {
+            pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string())
+        }
+        nereids_io::error::IoError::FileNotFound(..) => {
+            pyo3::exceptions::PyIOError::new_err(e.to_string())
+        }
+        _ => pyo3::exceptions::PyValueError::new_err(e.to_string()),
+    }
+}
+
+/// Load one chunk of a single-shutter raw Timepix-1 frame-mode run folder.
+///
+/// A last frame whose bin ends at the shutter's close is left out; in the
+/// VENUS runs of this kind it holds several times its neighbours' counts.
+///
+/// Args:
+///     folder: The run folder of ``<prefix>_<chunk>_<frame>.fits`` frames and
+///         their ``_Spectra.txt``, ``_ShutterTimes.txt`` and
+///         ``_ShutterCount.txt`` sidecars.
+///     chunk: The chunk to load; None when the folder holds one chunk.
+///     beam_pulses: The run's pulses that carried beam; each shutter's
+///         triggers are limited to it. None keeps the triggers.
+///
+/// Returns:
+///     ``(counts, edges_us, shutters)``: raw counts in (time bin, row,
+///     column), time-bin edges in µs, and ``(start_us, end_us, triggers)``
+///     of each shutter.
+///
+/// Raises:
+///     FileNotFoundError: If the folder or its frames do not exist.
+///     ValueError: For a folder of several chunks with no chunk named, a run
+///         of several shutters, a malformed frame or sidecar, or an invalid
+///         ``beam_pulses``.
+///     IOError: For other I/O failures.
+#[pyfunction]
+#[pyo3(signature = (folder, chunk=None, beam_pulses=None))]
+#[allow(clippy::type_complexity)]
+fn load_fits_run<'py>(
+    py: Python<'py>,
+    folder: &str,
+    chunk: Option<&str>,
+    beam_pulses: Option<f64>,
+) -> PyResult<(
+    Bound<'py, PyArray3<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Vec<(f64, f64, f64)>,
+)> {
+    let mut run = py
+        .detach(|| nereids_io::fits_stack::load_fits_run(std::path::Path::new(folder), chunk))
+        .map_err(fits_error)?;
+    if let Some(pulses) = beam_pulses {
+        run.limit_to_beam_pulses(pulses).map_err(fits_error)?;
+    }
+    let shutters = run
+        .shutters
+        .iter()
+        .map(|s| (s.start_us, s.end_us, s.triggers))
+        .collect();
+    Ok((
+        PyArray3::from_owned_array(py, run.counts),
+        PyArray1::from_vec(py, run.edges_us),
+        shutters,
+    ))
+}
+
+/// Live fractions of a Timepix-1 frame-mode run, per pixel and bin.
+///
+/// ``L = 1 − (counts before the bin in its shutter) / triggers`` (Watanabe
+/// et al., Nucl. Instrum. Methods A 861 (2017) 55, Eqs. 1–3).
+///
+/// Args:
+///     counts: Raw counts in (time bin, row, column).
+///     edges_us: Time-bin edges in µs, one more than the bins.
+///     shutters: ``(start_us, end_us, triggers)`` of each shutter, as
+///         ``load_fits_run`` returns them.
+///
+/// Returns:
+///     Live fractions in (0, 1], the shape of ``counts``.
+///
+/// Raises:
+///     ValueError: If the shapes disagree, a bin lies outside the shutters or
+///         spans an opening, or a pixel's counts reach its shutter's triggers.
+#[pyfunction]
+fn live_fractions<'py>(
+    py: Python<'py>,
+    counts: PyReadonlyArray3<'py, f64>,
+    edges_us: Vec<f64>,
+    shutters: Vec<(f64, f64, f64)>,
+) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let shutters: Vec<nereids_io::fits_stack::Shutter> = shutters
+        .into_iter()
+        .map(
+            |(start_us, end_us, triggers)| nereids_io::fits_stack::Shutter {
+                start_us,
+                end_us,
+                triggers,
+            },
+        )
+        .collect();
+    let counts = counts.as_array();
+    let live = py
+        .detach(|| nereids_io::live::live_fractions(counts, &edges_us, &shutters))
+        .map_err(fits_error)?;
+    Ok(PyArray3::from_owned_array(py, live))
+}
+
+/// A region's live fraction in each bin, its counts over their arrivals.
+///
+/// ``Σ C / Σ (C / L)`` over the region's pixels; a bin with no counts takes
+/// the pixels' mean ``L``.
+///
+/// Args:
+///     counts: Raw counts in (time bin, row, column).
+///     live: Their live fractions, the same shape.
+///     cells: The region's pixels as ``(row, column)``, each once.
+///
+/// Returns:
+///     One live fraction per bin, for ``Region``'s ``open_live`` or
+///     ``sample_live``.
+///
+/// Raises:
+///     ValueError: If the shapes differ, a cell is outside them or repeats,
+///         or a count or live fraction is invalid.
+#[pyfunction]
+fn region_live(
+    counts: PyReadonlyArray3<'_, f64>,
+    live: PyReadonlyArray3<'_, f64>,
+    cells: Vec<(usize, usize)>,
+) -> PyResult<Vec<f64>> {
+    let cells: Vec<[usize; 2]> = cells.into_iter().map(|(r, c)| [r, c]).collect();
+    nereids_pipeline::counts_map::region_live(counts.as_array(), live.as_array(), &cells)
+        .map_err(counts_error)
+}
+
 /// Read a VENUS ``*_Spectra.txt`` TOF sidecar into bin edges (µs).
 ///
 /// The sidecar's first CSV column is each frame's start time in SECONDS
@@ -4231,8 +4370,8 @@ struct MapData {
     room_background: Option<RoomBackground>,
     open_counts: ndarray::Array3<f64>,
     sample_counts: ndarray::Array3<f64>,
-    open_live: Option<Vec<f64>>,
-    sample_live: Option<Vec<f64>>,
+    open_live: Option<ndarray::Array3<f64>>,
+    sample_live: Option<ndarray::Array3<f64>>,
     excluded: ndarray::Array2<bool>,
     sample: ndarray::Array2<bool>,
     empty: ndarray::Array2<bool>,
@@ -4255,8 +4394,8 @@ impl MapData {
             room_background: self.room_background,
             open_counts: self.open_counts.view(),
             sample_counts: self.sample_counts.view(),
-            open_live: self.open_live.clone(),
-            sample_live: self.sample_live.clone(),
+            open_live: self.open_live.as_ref().map(|live| live.view()),
+            sample_live: self.sample_live.as_ref().map(|live| live.view()),
             excluded: self.excluded.view(),
             sample: self.sample.view(),
             empty: self.empty.view(),
@@ -4281,8 +4420,8 @@ struct PyMapMeasurement {
 
 #[pymethods]
 impl PyMapMeasurement {
-    /// open_counts and sample_counts have shape (time bin, row, column);
-    /// excluded, sample and empty have shape (row, column).
+    /// open_counts, sample_counts, open_live and sample_live have shape (time
+    /// bin, row, column); excluded, sample and empty have shape (row, column).
     #[new]
     #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None, time_background=None, gamma_transmission=None, room_background=None, capture_gammas=None, in_scatter=None))]
     fn new(
@@ -4298,8 +4437,8 @@ impl PyMapMeasurement {
         background: Vec<PyValue>,
         binning: usize,
         empty_background: Option<Vec<PyValue>>,
-        open_live: Option<Vec<f64>>,
-        sample_live: Option<Vec<f64>>,
+        open_live: Option<PyReadonlyArray3<f64>>,
+        sample_live: Option<PyReadonlyArray3<f64>>,
         time_background: Option<Vec<PyValue>>,
         gamma_transmission: Option<PyValue>,
         room_background: Option<PyRoomBackground>,
@@ -4323,8 +4462,8 @@ impl PyMapMeasurement {
                 room_background: room_background.map(|room| room.inner),
                 open_counts: open_counts.as_array().to_owned(),
                 sample_counts: sample_counts.as_array().to_owned(),
-                open_live,
-                sample_live,
+                open_live: open_live.map(|live| live.as_array().to_owned()),
+                sample_live: sample_live.map(|live| live.as_array().to_owned()),
                 excluded: excluded.as_array().to_owned(),
                 sample: sample.as_array().to_owned(),
                 empty: empty.as_array().to_owned(),
@@ -4851,6 +4990,9 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
+    m.add_function(wrap_pyfunction!(load_fits_run, m)?)?;
+    m.add_function(wrap_pyfunction!(live_fractions, m)?)?;
+    m.add_function(wrap_pyfunction!(region_live, m)?)?;
     m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;
     m.add_function(wrap_pyfunction!(probe_nexus, m)?)?;
     m.add_function(wrap_pyfunction!(run_health, m)?)?;

@@ -622,6 +622,37 @@ def load_tiff_folder(
     return_info: Literal[True],
 ) -> tuple[NDArray[np.float64], dict[str, Any]]: ...
 
+def load_fits_run(
+    folder: str,
+    chunk: str | None = None,
+    beam_pulses: float | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], list[tuple[float, float, float]]]:
+    """Load one chunk of a single-shutter raw Timepix-1 frame-mode run folder.
+
+    Returns raw counts in (time bin, row, column), time-bin edges in µs, and
+    ``(start_us, end_us, triggers)`` of each shutter. ``beam_pulses`` limits
+    each shutter's triggers to the pulses that carried beam. A last frame
+    ending at the shutter's close is left out; runs of several shutters raise
+    ``ValueError``.
+    """
+    ...
+
+def live_fractions(
+    counts: NDArray[np.float64],
+    edges_us: list[float],
+    shutters: list[tuple[float, float, float]],
+) -> NDArray[np.float64]:
+    """Live fractions per pixel and bin, from the counts before each bin in its shutter."""
+    ...
+
+def region_live(
+    counts: NDArray[np.float64],
+    live: NDArray[np.float64],
+    cells: list[tuple[int, int]],
+) -> list[float]:
+    """A region's live fraction in each bin, ``Σ C / Σ (C / L)`` over its pixels."""
+    ...
+
 def read_tof_sidecar(
     path: str,
     n_frames: int | None = None,
@@ -1411,8 +1442,8 @@ class Patch:
 class MapMeasurement:
     """The counts of every pixel of both runs, the masks, and the material.
 
-    open_counts and sample_counts have shape (time bin, row, column);
-    excluded, sample and empty have shape (row, column).
+    open_counts, sample_counts, open_live and sample_live have shape (time
+    bin, row, column); excluded, sample and empty have shape (row, column).
     time_background is [C, A, tau] per pixel, shared by every patch, or None
     for none; gamma_transmission is that of every sample patch, or None for
     known 1.

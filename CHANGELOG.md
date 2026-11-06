@@ -9,12 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `nereids_io::fits_stack` loads one chunk of a raw Timepix-1 frame-mode run:
-  its FITS counts, time-bin edges and shutters. `nereids_io::live` gives each
+- `nereids_io::fits_stack` loads one chunk of a single-shutter raw Timepix-1
+  frame-mode run: its FITS counts, time-bin edges and shutter; given the
+  pulses that carried beam, it limits the triggers to them. A last frame whose
+  bin ends at the shutter's close is left out: in the VENUS runs of this kind
+  it holds about 6× its neighbours' counts. Runs of several shutters are
+  refused, since the fit's contiguous bins cannot yet skip the closed time. `nereids_io::live` gives each
   pixel's live fraction in each bin, `1 − Σ_{j<k} C_j / S` in its shutter
-  (Watanabe et al. 2017), and a region's. On run 19383, each pixel's
-  occupancy `1 − C/T` in the facility's corrected TIFFs, which also counts the
-  bin's own `C`, equals `1 − L + C/S` within 9e-8.
+  (Watanabe et al. 2017), and `counts_map::region_live` a region's. On run
+  19383, each pixel's occupancy `1 − C/T` in the facility's corrected TIFFs,
+  which also counts the bin's own `C`, equals `1 − L + C/S` within 9e-8.
+  Python has `load_fits_run`, `live_fractions` and `region_live`, and MCP a
+  `tpx1_fits` data kind that takes the pulses from each run's NeXus
+  `proton_charge` log when given.
 - `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission, a
   `fit_counts` temperature fit and a pulse calibration of the foil with a
   lattice with SAMMY at the VENUS bins.
@@ -99,6 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed (breaking)
 
+- `MapMeasurement`'s `open_live` and `sample_live` hold each pixel's live
+  fractions, in (time bin, row, column), and each patch fits with its own
+  region's; one vector per run cannot describe a detector whose pixels lose
+  different shares.
 - Fitting uses raw open-beam and sample counts on time-of-flight bin edges.
   `fit_counts(Measurement, Calibration)` and `fit_map(MapMeasurement,
   Calibration)` replace the typed-spectrum and spatial fitting APIs.

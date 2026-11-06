@@ -14,7 +14,7 @@ import pytest
 
 import nereids
 
-from _fixtures import _make_single_resonance
+from _fixtures import _make_single_resonance, _write_tpx1_run
 
 _CACHE_FOLLOWS_HOME = pytest.mark.skipif(
     os.name == "nt", reason="the ENDF cache on Windows ignores HOME and XDG_CACHE_HOME"
@@ -2732,3 +2732,29 @@ class TestResolutionWidthConvention:
         assert nereids.width_from_fwhm(delta_g) == pytest.approx(
             delta_g / (2.0 * math.sqrt(math.log(2.0))), rel=1e-15
         )
+
+
+class TestTimepix1Runs:
+    """Raw Timepix-1 runs and their live fractions."""
+
+    def test_a_run_loads_and_gives_first_hit_live_fractions(self, tmp_path):
+        frames = [[[2, 0], [1, 4]], [[3, 1], [0, 2]], [[5, 0], [2, 1]]]
+        _write_tpx1_run(tmp_path, frames, triggers=20)
+        counts, edges, shutters = nereids.load_fits_run(str(tmp_path))
+        assert counts.shape == (3, 2, 2)
+        assert np.array_equal(counts, np.asarray(frames, dtype=float))
+        np.testing.assert_allclose(edges, [1.0, 2.0, 3.0, 4.0])
+        assert [s[2] for s in shutters] == [20.0]
+
+        live = nereids.live_fractions(counts, list(edges), shutters)
+        np.testing.assert_allclose(live[:, 0, 0], [1.0, 1 - 2 / 20, 1 - 5 / 20])
+        region = nereids.region_live(counts, live, [(0, 0), (1, 1)])
+        expected = (3 + 2) / (3 / live[1, 0, 0] + 2 / live[1, 1, 1])
+        assert region[1] == pytest.approx(expected)
+        with pytest.raises(ValueError, match="twice"):
+            nereids.region_live(counts, live, [(0, 0), (0, 0)])
+
+        _, _, paused = nereids.load_fits_run(str(tmp_path), beam_pulses=8.0)
+        assert [s[2] for s in paused] == [8.0]
+        with pytest.raises(ValueError):
+            nereids.live_fractions(counts, list(edges), paused)
