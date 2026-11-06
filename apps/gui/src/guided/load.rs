@@ -35,13 +35,12 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         .position(|&m| m == state.input_mode)
         .unwrap_or(0);
     if design::underline_tabs(ui, &INPUT_MODE_LABELS, &mut tab_idx) {
-        state.input_mode = INPUT_MODES[tab_idx];
-        state.invalidate_results();
-        state.sample_data = None;
-        state.open_beam_data = None;
-        state.tpx1_live = None;
+        state.set_input_mode(INPUT_MODES[tab_idx]);
         if state.input_mode == InputMode::Tpx1Raw {
             state.hdf5_path = None;
+            // Raw runs are histogrammed already, so there is no Bin step.
+            state.data_type = Some(crate::state::DataType::PreNormalized);
+            state.rebuild_pipeline();
         }
         state.hdf5_ob_path = None;
         state.load_error = false;
@@ -356,9 +355,14 @@ fn load_tpx1_runs(state: &mut AppState) {
                         s / o
                     )
                 }
-                _ => "Raw runs and live fractions loaded; give both NeXus files for the \
-                      charge ratio"
-                    .into(),
+                _ => {
+                    state.proton_charge_sample = 0.0;
+                    state.proton_charge_ob = 0.0;
+                    state.kl_c_ratio = 1.0;
+                    "Raw runs and live fractions loaded; charge ratio reset to 1: give both \
+                     NeXus files or set it in Analyze"
+                        .into()
+                }
             };
             state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
             state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
@@ -566,6 +570,7 @@ fn show_loaded_info(ui: &mut egui::Ui, state: &mut AppState) {
     if ui.small_button("\u{21bb} Reload").clicked() {
         state.sample_data = None;
         state.open_beam_data = None;
+        state.tpx1_live = None;
         state.load_error = false;
         state.nexus_probe_error = None;
         state.invalidate_results();
@@ -1158,6 +1163,12 @@ fn load_all_data(state: &mut AppState) {
 
 /// Sample TIFF stack picked.
 pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathBuf) {
+    if state.input_mode == InputMode::Tpx1Raw {
+        state.hdf5_path = None;
+    }
+    state.cancel_pending_tasks();
+    state.pixel_fit = None;
+    state.map_fit = None;
     state.sample_path = Some(path);
     state.sample_data = None;
     state.tpx1_live = None;
@@ -1170,6 +1181,12 @@ pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathB
 
 /// Open-beam TIFF stack picked.
 pub(crate) fn on_tiff_open_beam_picked(state: &mut AppState, path: std::path::PathBuf) {
+    if state.input_mode == InputMode::Tpx1Raw {
+        state.hdf5_ob_path = None;
+    }
+    state.cancel_pending_tasks();
+    state.pixel_fit = None;
+    state.map_fit = None;
     state.open_beam_path = Some(path);
     state.open_beam_data = None;
     state.tpx1_live = None;
@@ -1383,7 +1400,7 @@ mod tests {
     fn raw_runs_load_with_their_live_fractions_and_refuse_rebinning() {
         let (sample, open) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         write_run(sample.path(), &[[2, 1], [3, 0], [1, 1], [0, 2]], 20);
-        write_run(open.path(), &[[4, 2], [6, 0], [2, 2], [0, 4]], 40);
+        write_run(open.path(), &[[4, 2], [6, 0], [2, 2], [0, 4]], 50);
         let mut state = AppState {
             input_mode: InputMode::Tpx1Raw,
             sample_path: Some(sample.path().to_path_buf()),
@@ -1396,7 +1413,7 @@ mod tests {
         let live = &tpx1.sample;
         assert_eq!(live.shape(), &[4, 1, 2]);
         assert_eq!(live[[2, 0, 0]], 1.0 - 5.0 / 20.0);
-        assert_eq!(tpx1.open[[2, 0, 0]], 1.0 - 10.0 / 40.0);
+        assert_eq!(tpx1.open[[2, 0, 0]], 1.0 - 10.0 / 50.0);
 
         state.rebin_factor = 2;
         crate::guided::rebin::apply_rebin(&mut state);
@@ -1405,13 +1422,13 @@ mod tests {
         assert!(!tpx1_loaded(&state));
         load_tpx1_runs(&mut state);
 
-        write_run(open.path(), &[[4, 2], [6, 0], [2, 2]], 40);
+        write_run(open.path(), &[[4, 2], [6, 0], [2, 2]], 50);
         std::fs::remove_file(open.path().join("run_0_114_00003.fits")).unwrap();
         state.sample_data = None;
         load_tpx1_runs(&mut state);
         assert!(state.load_error && state.status_message.contains("different bins"));
 
-        write_run(open.path(), &[[4, 2], [6, 0], [2, 2], [0, 4]], 40);
+        write_run(open.path(), &[[4, 2], [6, 0], [2, 2], [0, 4]], 50);
         load_tpx1_runs(&mut state);
         assert!(
             !state.load_error && tpx1_loaded(&state),

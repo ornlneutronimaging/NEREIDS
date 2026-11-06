@@ -354,7 +354,9 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
     }
 
     // Raw Timepix-1 live fractions are not stored; such a project reloads its runs.
-    let can_embed = state.sample_data.is_some() && state.loaded_live().is_none();
+    let can_embed = state.sample_data.is_some()
+        && state.loaded_live().is_none()
+        && state.input_mode != InputMode::Tpx1Raw;
     let (raw_bytes, compressed_bytes) = if can_embed {
         nereids_io::project::estimate_embedded_size(
             state.sample_data.as_deref(),
@@ -524,7 +526,9 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
     }
 
     // Fall back to linked if embedded requested but sample data not available
-    let mode = if mode == SaveDataMode::Embedded && state.loaded_live().is_some() {
+    let mode = if mode == SaveDataMode::Embedded
+        && (state.loaded_live().is_some() || state.input_mode == InputMode::Tpx1Raw)
+    {
         state.status_message =
             "Raw Timepix-1 runs reload with their live fractions — saving in linked mode.".into();
         SaveDataMode::Linked
@@ -1375,6 +1379,7 @@ mod tests {
             sample_path: Some(dir.path().join("sample")),
             open_beam_path: Some(dir.path().join("open")),
             hdf5_path: Some(dir.path().join("VENUS_1.nxs.h5")),
+            hdf5_ob_path: Some(dir.path().join("VENUS_2.nxs.h5")),
             sample_data: Some(Arc::clone(&counts)),
             open_beam_data: Some(Arc::clone(&counts)),
             tpx1_live: Some(crate::state::Tpx1Live {
@@ -1393,7 +1398,9 @@ mod tests {
         state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
         assert_eq!(restored.input_mode, InputMode::Tpx1Raw);
         assert_eq!(restored.sample_path, state.sample_path);
+        assert_eq!(restored.open_beam_path, state.open_beam_path);
         assert_eq!(restored.hdf5_path, state.hdf5_path);
+        assert_eq!(restored.hdf5_ob_path, state.hdf5_ob_path);
         assert!(restored.sample_data.is_none());
     }
 
