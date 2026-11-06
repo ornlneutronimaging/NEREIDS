@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which also counts the bin's own `C`, equals `1 − L + C/S` within 9e-8.
   Python has `load_fits_run`, `live_fractions` and `region_live`, and MCP a
   `tpx1_fits` data kind that takes the pulses from each run's NeXus
-  `proton_charge` log when given.
+  `proton_charge` log when given. The GUI's Load step has a Timepix-1 Raw tab
+  whose runs carry their live fractions into the pixel and map fits; it does
+  not rebin them, and a project holding them is saved linked and needs Load
+  runs after reopening.
 - `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission, a
   `fit_counts` temperature fit and a pulse calibration of the foil with a
   lattice with SAMMY at the VENUS bins.

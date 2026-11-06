@@ -11,12 +11,18 @@ use crate::theme::ThemeColors;
 use crate::widgets::design;
 use ndarray::Axis;
 
-const INPUT_MODE_LABELS: [&str; 3] = ["TIFF Pair + Spectrum", "HDF5 Histogram", "HDF5 Event"];
+const INPUT_MODE_LABELS: [&str; 4] = [
+    "TIFF Pair + Spectrum",
+    "HDF5 Histogram",
+    "HDF5 Event",
+    "Timepix-1 Raw",
+];
 
-const INPUT_MODES: [InputMode; 3] = [
+const INPUT_MODES: [InputMode; 4] = [
     InputMode::TiffPair,
     InputMode::Hdf5Histogram,
     InputMode::Hdf5Event,
+    InputMode::Tpx1Raw,
 ];
 
 /// Draw the Load step content.
@@ -29,10 +35,13 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         .position(|&m| m == state.input_mode)
         .unwrap_or(0);
     if design::underline_tabs(ui, &INPUT_MODE_LABELS, &mut tab_idx) {
-        state.input_mode = INPUT_MODES[tab_idx];
-        state.invalidate_results();
-        state.sample_data = None;
-        state.open_beam_data = None;
+        state.set_input_mode(INPUT_MODES[tab_idx]);
+        if state.input_mode == InputMode::Tpx1Raw {
+            state.hdf5_path = None;
+            // Raw runs are histogrammed already, so there is no Bin step.
+            state.data_type = Some(crate::state::DataType::PreNormalized);
+            state.rebuild_pipeline();
+        }
         state.hdf5_ob_path = None;
         state.load_error = false;
     }
@@ -43,6 +52,7 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
         InputMode::TiffPair => tiff_pair_tab(ui, state),
         InputMode::Hdf5Histogram => hdf5_histogram_tab(ui, state),
         InputMode::Hdf5Event => hdf5_event_tab(ui, state),
+        InputMode::Tpx1Raw => tpx1_raw_tab(ui, state),
     }
 
     // ── Navigation ─────────────────────────────────────────────
@@ -80,7 +90,318 @@ fn has_required_data(state: &AppState) -> bool {
             // histogramming happens in the Bin step.
             state.hdf5_path.is_some() && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events)
         }
+        InputMode::Tpx1Raw => tpx1_loaded(state),
     }
+}
+
+/// Both raw Timepix-1 runs, their edges and their live fractions are loaded.
+pub(crate) fn tpx1_loaded(state: &AppState) -> bool {
+    state.spectrum_values.is_some() && state.loaded_live().is_some()
+}
+
+// ── Timepix-1 raw tab ──────────────────────────────────────────
+
+/// Raw Timepix-1 tab: the two run folders and, optionally, each run's NeXus file.
+fn tpx1_raw_tab(ui: &mut egui::Ui, state: &mut AppState) {
+    design::card(ui, |ui| {
+        ui.label(
+            egui::RichText::new(
+                "Load the raw FITS folders of a single-shutter sample run and open-beam run. \
+                 A run's NeXus file gives the pulses that carried beam, so a run paused with \
+                 the beam off is corrected right.",
+            )
+            .size(10.0)
+            .color(ThemeColors::from_ctx(ui.ctx()).fg3),
+        );
+        ui.add_space(8.0);
+        for (intent, label, path) in [
+            (
+                DialogIntent::TiffSample,
+                "Sample run folder",
+                &state.sample_path,
+            ),
+            (
+                DialogIntent::TiffOpenBeam,
+                "Open-beam run folder",
+                &state.open_beam_path,
+            ),
+            (
+                DialogIntent::Tpx1SampleNexus,
+                "Sample NeXus (optional)",
+                &state.hdf5_path,
+            ),
+            (
+                DialogIntent::Tpx1OpenNexus,
+                "Open-beam NeXus (optional)",
+                &state.hdf5_ob_path,
+            ),
+        ] {
+            let display = path
+                .as_ref()
+                .map_or(format!("Click to select {label}..."), |p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                });
+            let folder = matches!(
+                intent,
+                DialogIntent::TiffSample | DialogIntent::TiffOpenBeam
+            );
+            let hint = if folder {
+                "folder of FITS frames"
+            } else {
+                "NeXus .nxs.h5 file"
+            };
+            if design::drop_zone(ui, path.is_some(), &display, hint).clicked() {
+                if folder {
+                    state.file_dialogs.pick_folder(intent, Default::default());
+                } else {
+                    state.file_dialogs.pick_file(
+                        intent,
+                        DialogOptions {
+                            filters: vec![("NeXus", &["h5", "hdf5", "nxs"])],
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            ui.add_space(6.0);
+        }
+        let ready = state.sample_path.is_some() && state.open_beam_path.is_some();
+        if ui
+            .add_enabled(ready && !tpx1_loaded(state), egui::Button::new("Load runs"))
+            .clicked()
+        {
+            load_tpx1_runs(state);
+        }
+    });
+    load_status_ui(ui, state);
+    show_loaded_info(ui, state);
+}
+
+/// Pulses with proton charge, and their total charge.
+fn beam_pulses(path: &std::path::Path) -> Result<(f64, f64), String> {
+    let log = nereids_io::runlog::read_run_log(path, "proton_charge").map_err(|e| e.to_string())?;
+    if let Some(q) = log.values.iter().find(|q| !q.is_finite()) {
+        return Err(format!(
+            "{}: proton charge {q} is not finite",
+            path.display()
+        ));
+    }
+    let charged: Vec<f64> = log.values.iter().copied().filter(|&q| q > 0.0).collect();
+    let total: f64 = charged.iter().sum();
+    if !total.is_finite() {
+        return Err(format!("{}: the proton charges overflow", path.display()));
+    }
+    Ok((charged.len() as f64, total))
+}
+
+/// One raw run: its counts, edges and live fractions, and its total proton charge.
+struct RawRun {
+    counts: ndarray::Array3<f64>,
+    edges: Vec<f64>,
+    live: ndarray::Array3<f64>,
+    charge: Option<f64>,
+}
+
+/// One run, its triggers limited to the beam pulses of its NeXus file, and its total charge.
+fn tpx1_run(
+    folder: &std::path::Path,
+    nexus: Option<&std::path::Path>,
+) -> Result<(nereids_io::fits_stack::FitsRun, Option<f64>), String> {
+    let mut run = nereids_io::fits_stack::load_fits_run(folder, None).map_err(|e| e.to_string())?;
+    let charge = match nexus {
+        Some(path) => {
+            let (pulses, charge) = beam_pulses(path)?;
+            run.limit_to_beam_pulses(pulses)
+                .map_err(|e| e.to_string())?;
+            Some(charge)
+        }
+        None => None,
+    };
+    Ok((run, charge))
+}
+
+/// Live fractions of a run whose excluded pixels' counts do not enter; the counts are kept.
+fn live_without(
+    run: &mut nereids_io::fits_stack::FitsRun,
+    excluded: &ndarray::Array2<bool>,
+) -> Result<ndarray::Array3<f64>, String> {
+    let pixels: Vec<(usize, usize)> = excluded
+        .indexed_iter()
+        .filter(|(_, e)| **e)
+        .map(|(p, _)| p)
+        .collect();
+    let kept: Vec<ndarray::Array1<f64>> = pixels
+        .iter()
+        .map(|&(y, x)| {
+            let spectrum = run.counts.slice(ndarray::s![.., y, x]).to_owned();
+            run.counts.slice_mut(ndarray::s![.., y, x]).fill(0.0);
+            spectrum
+        })
+        .collect();
+    let live = nereids_io::live::live_fractions(run.counts.view(), &run.edges_us, &run.shutters);
+    for (&(y, x), spectrum) in pixels.iter().zip(&kept) {
+        run.counts.slice_mut(ndarray::s![.., y, x]).assign(spectrum);
+    }
+    live.map_err(|e| e.to_string())
+}
+
+/// Both runs, with live fractions that leave out the pixels the Normalize step excludes.
+fn tpx1_pair(
+    sample: &std::path::Path,
+    open: &std::path::Path,
+    nexus: [Option<&std::path::Path>; 2],
+) -> Result<[RawRun; 2], String> {
+    let (mut s, sample_charge) = tpx1_run(sample, nexus[0])?;
+    let (mut o, open_charge) = tpx1_run(open, nexus[1])?;
+    let width = s
+        .edges_us
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .fold(f64::INFINITY, f64::min);
+    let same = s.edges_us.len() == o.edges_us.len()
+        && s.edges_us
+            .iter()
+            .zip(&o.edges_us)
+            .all(|(a, b)| (a - b).abs() <= 1e-3 * width);
+    if !same || s.counts.dim() != o.counts.dim() {
+        return Err("the sample and open-beam runs have different bins or images".into());
+    }
+    let excluded = nereids_io::pixels::detect_bad_pixels(
+        &s.counts,
+        Some(&o.counts),
+        Some(nereids_io::pixels::HOT_PIXEL_K_MAD),
+    )
+    .map_err(|e| e.to_string())?;
+    let (sample_live, open_live) = (
+        live_without(&mut s, &excluded)?,
+        live_without(&mut o, &excluded)?,
+    );
+    Ok([
+        RawRun {
+            counts: s.counts,
+            edges: s.edges_us,
+            live: sample_live,
+            charge: sample_charge,
+        },
+        RawRun {
+            counts: o.counts,
+            edges: o.edges_us,
+            live: open_live,
+            charge: open_charge,
+        },
+    ])
+}
+
+/// Load both raw Timepix-1 runs and compute their live fractions.
+fn load_tpx1_runs(state: &mut AppState) {
+    state.invalidate_results();
+    let (Some(sample_path), Some(open_path)) =
+        (state.sample_path.clone(), state.open_beam_path.clone())
+    else {
+        return;
+    };
+    state.sample_data = None;
+    state.open_beam_data = None;
+    state.tpx1_live = None;
+    state.pixel_fit = None;
+    state.map_fit = None;
+    let loaded = tpx1_pair(
+        &sample_path,
+        &open_path,
+        [state.hdf5_path.as_deref(), state.hdf5_ob_path.as_deref()],
+    );
+    match loaded {
+        Ok(
+            [
+                RawRun {
+                    counts: sample,
+                    edges,
+                    live: sample_live,
+                    charge: sample_charge,
+                },
+                RawRun {
+                    counts: open,
+                    live: open_live,
+                    charge: open_charge,
+                    ..
+                },
+            ],
+        ) => {
+            state.preview_image = Some(sample.sum_axis(Axis(0)));
+            state.log_provenance(
+                ProvenanceEventKind::DataLoaded,
+                format!(
+                    "Loaded raw Timepix-1 runs: {} bins from {} and {}; beam pulses from {}",
+                    sample.shape()[0],
+                    sample_path.display(),
+                    open_path.display(),
+                    if state.hdf5_path.is_some() && state.hdf5_ob_path.is_some() {
+                        "both NeXus files"
+                    } else {
+                        "the triggers where no NeXus file is given"
+                    },
+                ),
+            );
+            state.status_message = match (sample_charge, open_charge) {
+                (Some(s), Some(o)) if o > 0.0 => {
+                    state.proton_charge_sample = s;
+                    state.proton_charge_ob = o;
+                    state.kl_c_ratio = s / o;
+                    format!(
+                        "Raw runs and live fractions loaded; charge ratio {:.4}",
+                        s / o
+                    )
+                }
+                // The fitted normalization absorbs the ratio, so the one in Analyze is kept.
+                _ => {
+                    state.proton_charge_sample = 0.0;
+                    state.proton_charge_ob = 0.0;
+                    "Raw runs and live fractions loaded; the charge ratio is the one in Analyze"
+                        .into()
+                }
+            };
+            state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
+            state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
+            state.spectrum_values = Some(Arc::new(edges));
+            let (sample, open) = (Arc::new(sample), Arc::new(open));
+            state.tpx1_live = Some(crate::state::Tpx1Live {
+                sample_counts: Arc::clone(&sample),
+                open_counts: Arc::clone(&open),
+                sample: Arc::new(sample_live),
+                open: Arc::new(open_live),
+            });
+            state.sample_data = Some(sample);
+            state.open_beam_data = Some(open);
+            state.load_error = false;
+        }
+        Err(e) => {
+            state.status_message = format!("Failed to load the raw runs: {e}");
+            state.load_error = true;
+        }
+    }
+}
+
+/// Sample-run NeXus file picked (raw Timepix-1 tab).
+pub(crate) fn on_tpx1_nexus_picked(state: &mut AppState, path: std::path::PathBuf, open: bool) {
+    if state.input_mode != InputMode::Tpx1Raw {
+        return;
+    }
+    if open {
+        state.hdf5_ob_path = Some(path);
+    } else {
+        state.hdf5_path = Some(path);
+    }
+    state.invalidate_results();
+    state.pixel_fit = None;
+    state.map_fit = None;
+    state.sample_data = None;
+    state.open_beam_data = None;
+    state.tpx1_live = None;
+    state.energies = None;
+    state.load_error = false;
 }
 
 // ── TIFF Pair tab ──────────────────────────────────────────────
@@ -248,6 +569,7 @@ fn show_loaded_info(ui: &mut egui::Ui, state: &mut AppState) {
     if ui.small_button("\u{21bb} Reload").clicked() {
         state.sample_data = None;
         state.open_beam_data = None;
+        state.tpx1_live = None;
         state.load_error = false;
         state.nexus_probe_error = None;
         state.invalidate_results();
@@ -500,6 +822,7 @@ fn load_status_ui(ui: &mut egui::Ui, state: &mut AppState) {
                 state.load_error = false;
                 state.sample_data = None;
                 state.open_beam_data = None;
+                state.tpx1_live = None;
                 state.spectrum_values = None;
             }
         });
@@ -839,8 +1162,15 @@ fn load_all_data(state: &mut AppState) {
 
 /// Sample TIFF stack picked.
 pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathBuf) {
+    if state.input_mode == InputMode::Tpx1Raw {
+        state.hdf5_path = None;
+    }
+    state.cancel_pending_tasks();
+    state.pixel_fit = None;
+    state.map_fit = None;
     state.sample_path = Some(path);
     state.sample_data = None;
+    state.tpx1_live = None;
     state.dead_pixels = None;
     state.file_dead_pixels = None;
     state.detected_dead_pixels = None;
@@ -850,8 +1180,15 @@ pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathB
 
 /// Open-beam TIFF stack picked.
 pub(crate) fn on_tiff_open_beam_picked(state: &mut AppState, path: std::path::PathBuf) {
+    if state.input_mode == InputMode::Tpx1Raw {
+        state.hdf5_ob_path = None;
+    }
+    state.cancel_pending_tasks();
+    state.pixel_fit = None;
+    state.map_fit = None;
     state.open_beam_path = Some(path);
     state.open_beam_data = None;
+    state.tpx1_live = None;
     state.dead_pixels = None;
     state.file_dead_pixels = None;
     state.detected_dead_pixels = None;
@@ -1014,5 +1351,88 @@ pub(crate) fn on_hdf5_ob_picked(
             // Clear data on failure
             state.open_beam_data = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-shutter raw run of 16-bit FITS frames with its sidecars.
+    fn write_run(dir: &std::path::Path, frames: &[[i16; 2]], triggers: u32) {
+        for (k, frame) in frames.iter().enumerate() {
+            let cards = [
+                "SIMPLE  =                    T".to_string(),
+                "BITPIX  =                   16".into(),
+                "NAXIS   =                    2".into(),
+                "NAXIS1  =                    2".into(),
+                "NAXIS2  =                    1".into(),
+                "END".into(),
+            ];
+            let mut bytes: Vec<u8> = cards
+                .iter()
+                .flat_map(|c| format!("{c:<80}").into_bytes())
+                .collect();
+            bytes.resize(2880, b' ');
+            bytes.extend(frame.iter().flat_map(|v| v.to_be_bytes()));
+            bytes.resize(5760, 0);
+            std::fs::write(dir.join(format!("run_0_114_{k:05}.fits")), bytes).unwrap();
+        }
+        let starts: String = (0..frames.len())
+            .map(|k| format!("{}e-06\t0\r\n", k + 1))
+            .collect();
+        std::fs::write(dir.join("run_0_114_Spectra.txt"), starts).unwrap();
+        let length = frames.len() + 1;
+        std::fs::write(
+            dir.join("run_0_114_ShutterTimes.txt"),
+            format!("0\t1e-06\t{length}e-06\r\n1\t0\t0\r\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("run_0_114_ShutterCount.txt"),
+            format!("0\t{triggers}\r\n1\t0\r\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn raw_runs_load_with_their_live_fractions_and_refuse_rebinning() {
+        let (sample, open) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_run(sample.path(), &[[2, 1], [3, 0], [1, 1], [0, 2]], 20);
+        write_run(open.path(), &[[4, 2], [6, 0], [2, 2], [0, 4]], 50);
+        let mut state = AppState {
+            input_mode: InputMode::Tpx1Raw,
+            sample_path: Some(sample.path().to_path_buf()),
+            open_beam_path: Some(open.path().to_path_buf()),
+            ..Default::default()
+        };
+        load_tpx1_runs(&mut state);
+        assert!(tpx1_loaded(&state), "{}", state.status_message);
+        let tpx1 = state.tpx1_live.as_ref().unwrap();
+        let live = &tpx1.sample;
+        assert_eq!(live.shape(), &[4, 1, 2]);
+        assert_eq!(live[[2, 0, 0]], 1.0 - 5.0 / 20.0);
+        assert_eq!(tpx1.open[[2, 0, 0]], 1.0 - 10.0 / 50.0);
+
+        state.rebin_factor = 2;
+        crate::guided::rebin::apply_rebin(&mut state);
+        assert_eq!(state.sample_data.as_ref().unwrap().shape()[0], 4);
+        state.sample_data = Some(Arc::new((**state.sample_data.as_ref().unwrap()).clone()));
+        assert!(!tpx1_loaded(&state));
+        load_tpx1_runs(&mut state);
+
+        write_run(open.path(), &[[4, 2], [6, 0], [2, 2]], 50);
+        std::fs::remove_file(open.path().join("run_0_114_00003.fits")).unwrap();
+        state.sample_data = None;
+        load_tpx1_runs(&mut state);
+        assert!(state.load_error && state.status_message.contains("different bins"));
+
+        write_run(open.path(), &[[4, 2], [6, 0], [2, 2], [0, 4]], 50);
+        load_tpx1_runs(&mut state);
+        assert!(
+            !state.load_error && tpx1_loaded(&state),
+            "{}",
+            state.status_message
+        );
     }
 }

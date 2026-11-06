@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::state::AppState;
+use crate::state::{AppState, InputMode};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
 use nereids_io::spectrum::SpectrumValueKind;
@@ -102,7 +102,11 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
             }
 
             // Apply button
-            let can_apply = state.rebin_factor > 1 && state.sample_data.is_some() && has_edges;
+            let can_apply = state.rebin_factor > 1
+                && state.sample_data.is_some()
+                && has_edges
+                && state.input_mode != InputMode::Tpx1Raw
+                && state.loaded_live().is_none();
             ui.add_enabled_ui(can_apply, |ui| {
                 if ui.button("Apply Rebinning").clicked() {
                     apply_rebin(state);
@@ -142,6 +146,12 @@ pub(crate) fn apply_rebin(state: &mut AppState) {
 
     if state.spectrum_values.is_some() && state.spectrum_kind != SpectrumValueKind::BinEdges {
         state.status_message = "Rebinning needs a spectrum of bin edges".to_string();
+        return;
+    }
+    if state.input_mode == InputMode::Tpx1Raw || state.loaded_live().is_some() {
+        state.status_message =
+            "Raw Timepix-1 live fractions belong to the native bins; they are not rebinned"
+                .to_string();
         return;
     }
 

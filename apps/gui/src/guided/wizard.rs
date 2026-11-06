@@ -126,7 +126,7 @@ fn wizard_q2(ui: &mut egui::Ui, state: &mut AppState) {
         selected_events,
     ) {
         state.data_type = Some(DataType::Events);
-        state.input_mode = InputMode::Hdf5Event;
+        state.set_input_mode(InputMode::Hdf5Event);
         state.wizard_step = 2;
     }
 
@@ -142,7 +142,7 @@ fn wizard_q2(ui: &mut egui::Ui, state: &mut AppState) {
     ) {
         state.data_type = Some(DataType::PreNormalized);
         // Default to TiffPair; user can switch to Hdf5Histogram in Load step
-        state.input_mode = InputMode::TiffPair;
+        state.set_input_mode(InputMode::TiffPair);
         state.wizard_step = 2;
     }
 

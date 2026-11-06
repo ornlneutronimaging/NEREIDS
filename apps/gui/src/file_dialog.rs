@@ -75,6 +75,10 @@ pub enum DialogIntent {
         mode: InputMode,
         event_params: nereids_io::nexus::EventBinningParams,
     },
+    /// Sample run's NeXus file for its beam pulses (Load step, Timepix-1 raw tab).
+    Tpx1SampleNexus,
+    /// Open-beam run's NeXus file for its beam pulses (Load step, Timepix-1 raw tab).
+    Tpx1OpenNexus,
 }
 
 /// Backend-neutral dialog options (mirror of the rfd builder calls in use).
@@ -773,10 +777,17 @@ pub fn dispatch_results(state: &mut AppState) {
         DialogIntent::TiffSample => crate::guided::load::on_tiff_sample_picked(state, path),
         DialogIntent::TiffOpenBeam => crate::guided::load::on_tiff_open_beam_picked(state, path),
         DialogIntent::SpectrumFile => crate::guided::load::on_spectrum_picked(state, path),
+        // A HDF5 pick opened in another tab must not become a raw run's NeXus file.
+        DialogIntent::Hdf5Sample | DialogIntent::Hdf5OpenBeam { .. }
+            if state.input_mode == InputMode::Tpx1Raw => {}
         DialogIntent::Hdf5Sample => crate::guided::load::on_hdf5_sample_picked(state, path),
         DialogIntent::Hdf5OpenBeam { mode, event_params } => {
             crate::guided::load::on_hdf5_ob_picked(state, path, mode, &event_params);
         }
+        DialogIntent::Tpx1SampleNexus => {
+            crate::guided::load::on_tpx1_nexus_picked(state, path, false)
+        }
+        DialogIntent::Tpx1OpenNexus => crate::guided::load::on_tpx1_nexus_picked(state, path, true),
     }
 }
 

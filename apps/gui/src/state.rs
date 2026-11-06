@@ -281,6 +281,34 @@ pub enum InputMode {
     Hdf5Histogram,
     /// HDF5/NeXus file with raw neutron events (histogrammed on load).
     Hdf5Event,
+    /// Raw Timepix-1 frame-mode FITS run folders, each with an optional NeXus
+    /// file for its beam pulses.
+    Tpx1Raw,
+}
+
+/// Each pixel's live fractions of both raw Timepix-1 runs, in (time bin, row, column).
+#[derive(Debug, Clone)]
+pub struct Tpx1Live {
+    /// The sample counts the fractions belong to.
+    pub sample_counts: Arc<Array3<f64>>,
+    /// The open-beam counts the fractions belong to.
+    pub open_counts: Arc<Array3<f64>>,
+    /// The sample run's live fractions.
+    pub sample: Arc<Array3<f64>>,
+    /// The open-beam run's live fractions.
+    pub open: Arc<Array3<f64>>,
+}
+
+impl Tpx1Live {
+    /// The `[sample, open]` fractions, if `sample` and `open` are the counts these belong to.
+    pub fn of(
+        &self,
+        sample: &Arc<Array3<f64>>,
+        open: &Arc<Array3<f64>>,
+    ) -> Option<[Arc<Array3<f64>>; 2]> {
+        (Arc::ptr_eq(&self.sample_counts, sample) && Arc::ptr_eq(&self.open_counts, open))
+            .then(|| [Arc::clone(&self.sample), Arc::clone(&self.open)])
+    }
 }
 
 /// Data source for the normalize-preview spectrum plot.
@@ -386,6 +414,8 @@ pub struct AppState {
     pub open_beam_path: Option<PathBuf>,
     pub sample_data: Option<Arc<Array3<f64>>>,
     pub open_beam_data: Option<Arc<Array3<f64>>>,
+    /// Live fractions of raw Timepix-1 runs, with the counts they belong to.
+    pub tpx1_live: Option<Tpx1Live>,
     /// Effective pixel mask applied by the analysis:
     /// `file_dead_pixels ∪ latest detection`.  Recomputed FROM SCRATCH on
     /// every normalization via [`AppState::set_detected_dead_pixels`] —
@@ -922,6 +952,25 @@ impl AppState {
         self.analyze_tof_slice_index = 0;
     }
 
+    /// Switch the input mode; a change drops the loaded counts and what was derived from them.
+    pub fn set_input_mode(&mut self, mode: InputMode) {
+        if self.input_mode != mode {
+            self.input_mode = mode;
+            self.invalidate_results();
+            self.sample_data = None;
+            self.open_beam_data = None;
+            self.tpx1_live = None;
+            self.pixel_fit = None;
+            self.map_fit = None;
+        }
+    }
+
+    /// The `[sample, open]` live fractions of the loaded counts, if they have them.
+    pub fn loaded_live(&self) -> Option<[Arc<Array3<f64>>; 2]> {
+        let (sample, open) = (self.sample_data.as_ref()?, self.open_beam_data.as_ref()?);
+        self.tpx1_live.as_ref()?.of(sample, open)
+    }
+
     /// Compute the bounding box of all ROIs, or `None` if no ROIs exist.
     pub fn bounding_roi(&self) -> Option<RoiSelection> {
         if self.rois.is_empty() {
@@ -1016,6 +1065,7 @@ impl Default for AppState {
             open_beam_path: None,
             sample_data: None,
             open_beam_data: None,
+            tpx1_live: None,
             dead_pixels: None,
             file_dead_pixels: None,
             detected_dead_pixels: None,

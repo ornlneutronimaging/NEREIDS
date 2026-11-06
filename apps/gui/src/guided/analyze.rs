@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use crate::counts::{self, FitOutcome, FitRequest, RegionRequest};
-use crate::state::{AppState, SpectrumAxis};
+use crate::state::{AppState, InputMode, SpectrumAxis};
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{
     RoiEditorResult, apply_colormap, data_range, show_image_with_roi_editor,
@@ -603,6 +603,13 @@ fn build_request(state: &AppState) -> Result<FitRequest, String> {
             RegionRequest::Pixel { y, x }
         }
     };
+    let (sample_live, open_live) = match state.loaded_live() {
+        Some([s, o]) => (Some(s), Some(o)),
+        None if state.input_mode == InputMode::Tpx1Raw => {
+            return Err("load the raw Timepix-1 runs again for their live fractions".into());
+        }
+        None => (None, None),
+    };
     let charge_ratio = if state.kl_c_ratio.is_finite() && state.kl_c_ratio > 0.0 {
         state.kl_c_ratio
     } else if state.proton_charge_ob > 0.0 {
@@ -624,6 +631,8 @@ fn build_request(state: &AppState) -> Result<FitRequest, String> {
         energy_span_ev: (e_min, e_max),
         sample_counts: Arc::clone(sample),
         open_counts: Arc::clone(open),
+        sample_live,
+        open_live,
         excluded: Arc::new(excluded),
         region,
         binning: state.map_binning.max(1),
