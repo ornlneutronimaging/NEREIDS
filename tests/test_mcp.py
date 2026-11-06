@@ -518,7 +518,7 @@ class TestCountsManifest:
     def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)
         manifest = _write_json_frontmatter_manifest(
-            tmp_path, self._analysis(time_background=[10.0, 50.0, 25.0])
+            tmp_path, self._analysis(time_background=[10.0, 50.0, 25.0, -5.0])
         )
         captured = []
 
@@ -529,7 +529,7 @@ class TestCountsManifest:
         monkeypatch.setattr(nereids, "fit_counts", fit)
         result = process_resonance_dataset(str(manifest))
         assert result["success"], result
-        assert captured == [10.0, 50.0, 25.0]
+        assert captured == [10.0, 50.0, 25.0, -5.0]
 
     def test_room_background_reaches_the_counts_fit(self, tmp_path, monkeypatch):
         room = {"rate": 0.5, "frames": [3.0e4, 2.5e4]}
@@ -593,7 +593,7 @@ class TestCountsManifest:
         monkeypatch.setattr(nereids, "fit_map", fit)
         assert validate_resonance_dataset(str(manifest))["valid"]
         process_resonance_dataset(str(manifest))
-        assert captured == [10.0, 50.0, 25.0, 0.6]
+        assert captured == [10.0, 50.0, 25.0, 0.0, 0.6]
 
     def test_unknown_fit_settings_are_rejected(self, tmp_path):
         self._counts_npz(tmp_path)

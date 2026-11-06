@@ -321,8 +321,9 @@ fn error_bar(fit: &CountsFit, i: usize) -> f64 {
         .sqrt()
 }
 
-fn time_background(edges: &[f64], [c, a, tau]: [f64; 3]) -> Vec<f64> {
-    let rate = |t: f64| c + a * (-(t - edges[0]) / tau).exp();
+fn time_background(edges: &[f64], [c, a, tau, d]: [f64; 4]) -> Vec<f64> {
+    let span = edges[edges.len() - 1] - edges[0];
+    let rate = |t: f64| c + d * (t - edges[0]) / span + a * (-(t - edges[0]) / tau).exp();
     let steps = 64;
     edges
         .windows(2)
@@ -339,12 +340,13 @@ fn time_background(edges: &[f64], [c, a, tau]: [f64; 3]) -> Vec<f64> {
 #[test]
 fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_transmission() {
     let setup = standard();
-    let numbers = [2000.0, 30000.0, 10.0];
+    let numbers = [2000.0, 30000.0, 10.0, -300.0];
+    let span = setup.edges[setup.edges.len() - 1] - setup.edges[0];
     let (a, pixels, gammas) = (0.93, [4.0, 9.0], [0.8, 0.6]);
     let lines: Vec<(ResonanceData, f64)> = [(72, 180, 16.0), (74, 182, 20.0), (76, 186, 25.0)]
         .map(|(z, n, e)| (synthetic_isotope(z, n, e, 0.01, 0.06), SATURATED))
         .to_vec();
-    let simulated = |numbers: [f64; 3], dip: f64| -> Vec<[(Vec<f64>, Vec<f64>); 2]> {
+    let simulated = |numbers: [f64; 4], dip: f64| -> Vec<[(Vec<f64>, Vec<f64>); 2]> {
         let per_pixel = time_background(&setup.edges, numbers);
         (0..2)
             .map(|r| {
@@ -369,7 +371,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
     };
     let runs = simulated(numbers, 0.0);
     let measurement = |runs: &[[(Vec<f64>, Vec<f64>); 2]],
-                       numbers: [Value; 3],
+                       numbers: [Value; 4],
                        gamma: Value,
                        sample: fn(f64) -> Value| Measurement {
         time_edges_us: setup.edges.clone(),
@@ -434,7 +436,14 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
     for (runs, dip, within) in [(&runs, false, BOUND.sqrt()), (&dipped, true, 1.0)] {
         let free = measurement(
             runs,
-            std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i])),
+            std::array::from_fn(|i| match i {
+                2 => Value::Within {
+                    start: 0.7 * numbers[2],
+                    lower: 1.0,
+                    upper: 0.5 * span,
+                },
+                _ => Value::Fitted([0.5, 2.0, 0.7, 0.5][i] * numbers[i]),
+            }),
             Value::Fitted(0.5),
             |x| Value::Fitted(1.1 * x),
         );
@@ -465,15 +474,22 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         }
     }
 
-    let no_tail = simulated([numbers[0], 0.0, numbers[2]], 0.0);
+    let no_tail = simulated([numbers[0], 0.0, numbers[2], numbers[3]], 0.0);
     let fits = [
-        [numbers[0], 0.0, numbers[2]],
-        [numbers[0], 10.0 * numbers[1], 40.0],
+        [numbers[0], 0.0, numbers[2], numbers[3]],
+        [numbers[0], 10.0 * numbers[1], 40.0, numbers[3]],
     ]
     .map(|start| {
         let m = measurement(
             &no_tail,
-            start.map(Value::Fitted),
+            std::array::from_fn(|i| match i {
+                2 => Value::Within {
+                    start: start[2],
+                    lower: 1.0,
+                    upper: 0.5 * span,
+                },
+                _ => Value::Fitted(start[i]),
+            }),
             Value::Known(gammas[0]),
             |x| Value::Fitted(1.1 * x),
         );
@@ -503,10 +519,11 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
     let mut empty = known.clone();
     empty.regions[1].pixels = 0.0;
     let refused = [
-        ([-1.0, 0.0, 1.0], 1.0),
-        ([0.0, -1.0, 1.0], 1.0),
-        ([0.0, 0.0, 0.0], 1.0),
-        ([f64::NAN, 0.0, 1.0], 1.0),
+        ([-1.0, 0.0, 1.0, 0.0], 1.0),
+        ([0.0, -1.0, 1.0, 0.0], 1.0),
+        ([0.0, 0.0, 0.0, 0.0], 1.0),
+        ([f64::NAN, 0.0, 1.0, 0.0], 1.0),
+        ([0.0, 0.0, 1.0, f64::NAN], 1.0),
         (numbers, 1.5),
     ]
     .map(|(bad, gamma)| {
@@ -523,6 +540,16 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
             Err(PipelineError::InvalidParameter(_))
         ));
     }
+    let slow = measurement(
+        &runs,
+        numbers.map(Value::Fitted),
+        Value::Known(gammas[0]),
+        Value::Known,
+    );
+    assert!(matches!(
+        fit_counts(&slow, &calibration(&setup)),
+        Err(PipelineError::InvalidParameter(message)) if message.contains("trade")
+    ));
 }
 
 #[test]
@@ -1166,7 +1193,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         ..standard()
     };
     let isotope = hafnium_like(20.0);
-    let (a, gamma, numbers) = (TERMS[0], 0.7, [1.25e4, 5.0e4, 10.0]);
+    let (a, gamma, numbers) = (TERMS[0], 0.7, [1.25e4, 5.0e4, 10.0, -1.5e3]);
     let per_pixel = time_background(&setup.edges, numbers);
     let (open, transmitted) = expected(&setup, &beam(2.5e5), &[(isotope.clone(), THIN)]);
     let bins = setup.edges.len() - 1;
@@ -1193,7 +1220,15 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         thickness_variance: Value::Known(0.0),
         lattice: None,
     };
-    let start = std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i]));
+    let span = setup.edges[setup.edges.len() - 1] - setup.edges[0];
+    let start = std::array::from_fn(|i| match i {
+        2 => Value::Within {
+            start: 0.7 * numbers[2],
+            lower: 1.0,
+            upper: 0.5 * span,
+        },
+        _ => Value::Fitted([0.5, 2.0, 0.7, 0.5][i] * numbers[i]),
+    });
     let map = MapMeasurement {
         time_edges_us: setup.edges.clone(),
         charge_ratio: CHARGE_RATIO,
@@ -1223,7 +1258,8 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
             "normalization",
             "time background C",
             "time background A",
-            "time background τ"
+            "time background τ",
+            "time background D"
         ]
     );
     let shared = result.shared_covariance.as_ref().expect("covariance");
@@ -1352,7 +1388,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
     let isotope = hafnium_like(20.0);
     let (a, gamma, c, rate) = (TERMS[0], 0.6, 1.25e4, 1.0 / 3.0);
     let frames = [3.0e4, 2.5e4];
-    let per_pixel = time_background(&setup.edges, [c, 0.0, 1.0]);
+    let per_pixel = time_background(&setup.edges, [c, 0.0, 1.0, 0.0]);
     let room = |run: usize| -> Vec<f64> {
         setup
             .edges
@@ -1386,7 +1422,12 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         thickness_variance: Value::Known(0.0),
         lattice: None,
     };
-    let time = [Value::Fitted(0.7 * c), Value::Known(0.0), Value::Known(1.0)];
+    let time = [
+        Value::Fitted(0.7 * c),
+        Value::Known(0.0),
+        Value::Known(1.0),
+        Value::Known(0.0),
+    ];
     let room_background = Some(RoomBackground {
         rate: Value::Fitted(0.5 * rate),
         frames,
@@ -2035,7 +2076,7 @@ fn a_region_recording_early_meets_a_decaying_time_background_on_its_own_clock() 
     let [c, a, tau] = [0.0, 1.0e6, 10.0];
     let sample = [(hafnium_like(20.0), 5.0e-3)];
     let region = |setup: &Setup, late_us: f64| {
-        let background = time_background(&setup.edges, [c, a * (late_us / tau).exp(), tau]);
+        let background = time_background(&setup.edges, [c, a * (late_us / tau).exp(), tau, 0.0]);
         let plus = |counts: &[f64], scale: f64| -> Vec<f64> {
             let counts = counts.iter().zip(&background);
             counts.map(|(n, g)| (n + scale * g).round()).collect()
@@ -2052,7 +2093,7 @@ fn a_region_recording_early_meets_a_decaying_time_background_on_its_own_clock() 
         },
     );
     let mut m = measurement(&setup, (Vec::new(), Vec::new()), &sample);
-    m.time_background = [c, a, tau].map(Value::Known);
+    m.time_background = [c, a, tau, 0.0].map(Value::Known);
     m.regions = vec![region(&setup, 0.0), region(&early, early_us)];
     m.regions[1].timing_offset_us = Value::Known(early_us);
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");

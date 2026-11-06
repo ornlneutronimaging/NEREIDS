@@ -3129,7 +3129,6 @@ fn counts_error(error: PipelineError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(error.to_string())
 }
 
-/// A [C, A, tau] triple of PyValues.
 /// [b0, b1, b2] or [b0, b1, b2, d, f]; d and f are known 0 when absent.
 fn background_values(values: Vec<PyValue>) -> PyResult<[Value; 5]> {
     match values.as_slice() {
@@ -3147,13 +3146,15 @@ fn background_values(values: Vec<PyValue>) -> PyResult<[Value; 5]> {
     }
 }
 
-fn value_trio(values: Vec<PyValue>) -> PyResult<[Value; 3]> {
-    let [a, b, c] = values.as_slice() else {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "expected exactly three values",
-        ));
-    };
-    Ok([a.inner, b.inner, c.inner])
+/// A time background's [C, A, tau] or [C, A, tau, D]; D is known 0 when absent.
+fn time_terms(values: Vec<PyValue>) -> PyResult<[Value; 4]> {
+    match values.as_slice() {
+        [c, a, tau] => Ok([c.inner, a.inner, tau.inner, Value::Known(0.0)]),
+        [c, a, tau, d] => Ok([c.inner, a.inner, tau.inner, d.inner]),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "expected [C, A, tau] or [C, A, tau, D]",
+        )),
+    }
 }
 
 /// A covariance matrix as a 2D numpy array.
@@ -3760,7 +3761,7 @@ impl PyMeasurement {
         spread: Option<PySpread>,
     ) -> PyResult<Self> {
         let time_background = match time_background {
-            Some(values) => value_trio(values)?,
+            Some(values) => time_terms(values)?,
             None => NO_TIME_BACKGROUND,
         };
         Ok(Self {
@@ -3796,7 +3797,7 @@ impl PyMeasurement {
         }
     }
 
-    /// The time background's [C, A, tau].
+    /// The time background's [C, A, tau, D].
     #[getter]
     fn time_background(&self) -> Vec<PyValue> {
         self.inner
@@ -4227,9 +4228,9 @@ impl PyCountsFit {
         self.inner.detector_tail.map(|[f, decay]| (f, decay))
     }
 
-    /// The time background's [C, A, tau].
+    /// The time background's [C, A, tau, D].
     #[getter]
-    fn time_background(&self) -> [f64; 3] {
+    fn time_background(&self) -> [f64; 4] {
         self.inner.time_background
     }
 
@@ -4368,7 +4369,7 @@ struct MapData {
     time_edges_us: Vec<f64>,
     charge_ratio: f64,
     normalization: Value,
-    time_background: [Value; 3],
+    time_background: [Value; 4],
     room_background: Option<RoomBackground>,
     open_counts: ndarray::Array3<f64>,
     sample_counts: ndarray::Array3<f64>,
@@ -4452,7 +4453,7 @@ impl PyMapMeasurement {
             None => [Value::Known(0.0); 5],
         };
         let time_background = match time_background {
-            Some(values) => value_trio(values)?,
+            Some(values) => time_terms(values)?,
             None => NO_TIME_BACKGROUND,
         };
         Ok(Self {
@@ -4506,7 +4507,7 @@ impl PyMapMeasurement {
         self.inner.binning
     }
 
-    /// The time background's [C, A, tau] per pixel.
+    /// The time background's [C, A, tau, D] per pixel.
     #[getter]
     fn time_background(&self) -> Vec<PyValue> {
         self.inner
@@ -4579,7 +4580,7 @@ struct PyCountsMap {
     overdispersion: [ndarray::Array2<f64>; 2],
     identified: ndarray::Array2<bool>,
     normalization: f64,
-    time_background: [f64; 3],
+    time_background: [f64; 4],
     room_background: f64,
     t0_us: f64,
     flight_path_m: f64,
@@ -4730,9 +4731,9 @@ impl PyCountsMap {
         self.normalization
     }
 
-    /// The time background's [C, A, tau].
+    /// The time background's [C, A, tau, D].
     #[getter]
-    fn time_background(&self) -> [f64; 3] {
+    fn time_background(&self) -> [f64; 4] {
         self.time_background
     }
 

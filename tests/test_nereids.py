@@ -903,8 +903,8 @@ class TestCountsApi:
 
     def test_no_time_background(self):
         background = nereids.NO_TIME_BACKGROUND
-        assert len(background) == 3
-        assert [value.value for value in background] == [0.0, 0.0, 1.0]
+        assert len(background) == 4
+        assert [value.value for value in background] == [0.0, 0.0, 1.0, 0.0]
 
     def test_measurement_round_trip(self, u238_data):
         material = nereids.Material(
