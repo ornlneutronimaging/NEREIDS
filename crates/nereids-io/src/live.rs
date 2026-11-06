@@ -3,7 +3,7 @@
 //! A pixel records one count per shutter, so a neutron in bin `k` is recorded
 //! only if the pixel had no count earlier in that shutter:
 //! `L_k = 1 − Σ_{j<k} C_j / S`, with `C_j` the pixel's counts in bin `j` of the
-//! shutter and `S` its triggers.
+//! shutter and `S` its triggers that carried beam.
 //!
 //! # References
 //! A. S. Tremsin et al., JINST 9 (2014) C05026;
@@ -154,88 +154,6 @@ pub fn live_fraction_sigma(live: f64, triggers: f64) -> f64 {
     (live * (1.0 - live) / triggers).sqrt()
 }
 
-/// A region's live fraction in each bin: its counts over their arrivals, `Σ C / Σ (C / L)`.
-///
-/// A bin with no counts in the region takes the mean `L` of its pixels.
-///
-/// # Arguments
-/// * `counts` — Raw counts in (time bin, row, column), finite and 0 or more.
-/// * `live` — Live fractions in (0, 1] of `counts`, the same shape.
-/// * `cells` — The region's pixels as `[row, column]`, at least one, each once.
-///
-/// # Errors
-/// [`IoError::ShapeMismatch`] if the shapes differ or a cell is outside them;
-/// [`IoError::InvalidParameter`] if `cells` or the bins are empty, a cell
-/// repeats, a region
-/// count is not finite and 0 or more or its live fraction not in (0, 1], or
-/// the counts overflow the sums.
-pub fn region_live(
-    counts: ArrayView3<f64>,
-    live: ArrayView3<f64>,
-    cells: &[[usize; 2]],
-) -> Result<Vec<f64>, IoError> {
-    if counts.shape() != live.shape() {
-        return Err(IoError::ShapeMismatch(format!(
-            "counts {:?} and live fractions {:?}",
-            counts.shape(),
-            live.shape()
-        )));
-    }
-    if cells.is_empty() || counts.is_empty() {
-        return Err(IoError::InvalidParameter(
-            "a region needs a pixel and a bin".into(),
-        ));
-    }
-    let (rows, columns) = (counts.shape()[1], counts.shape()[2]);
-    if let Some(cell) = cells.iter().find(|[r, c]| *r >= rows || *c >= columns) {
-        return Err(IoError::ShapeMismatch(format!(
-            "cell {cell:?} is outside the {rows} × {columns} image"
-        )));
-    }
-    let mut sorted = cells.to_vec();
-    sorted.sort_unstable();
-    if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
-        return Err(IoError::InvalidParameter(format!(
-            "cell {:?} is in the region twice",
-            w[0]
-        )));
-    }
-    for k in 0..counts.len_of(Axis(0)) {
-        for &[r, c] in cells {
-            let (n, l) = (counts[[k, r, c]], live[[k, r, c]]);
-            if !(n.is_finite() && n >= 0.0 && l > 0.0 && l <= 1.0) {
-                return Err(IoError::InvalidParameter(format!(
-                    "bin {k}, cell {:?}: count {n} and live fraction {l}",
-                    [r, c]
-                )));
-            }
-        }
-    }
-    (0..counts.len_of(Axis(0)))
-        .map(|k| {
-            let (mut recorded, mut arrived, mut sum) = (0.0, 0.0, 0.0);
-            for &[r, c] in cells {
-                let (n, l) = (counts[[k, r, c]], live[[k, r, c]]);
-                recorded += n;
-                arrived += n / l;
-                sum += l;
-            }
-            let l = if recorded > 0.0 {
-                recorded / arrived
-            } else {
-                sum / cells.len() as f64
-            };
-            if l > 0.0 && l <= 1.0 {
-                Ok(l)
-            } else {
-                Err(IoError::InvalidParameter(format!(
-                    "bin {k}: the region's live fraction {l} is out of range; its counts overflow"
-                )))
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,19 +194,6 @@ mod tests {
         assert!(live_fractions(last.view(), &edges, &[shutter(0.0, 2.0, 10.0)]).is_err());
         let overlap = [shutter(0.0, 2.0, 10.0), shutter(1.0, 3.0, 100.0)];
         assert!(live_fractions(counts.view(), &edges, &overlap).is_err());
-    }
-
-    #[test]
-    fn a_region_weights_each_pixel_by_its_arrivals() {
-        let counts = Array3::from_shape_vec((2, 1, 2), vec![6.0, 2.0, 0.0, 0.0]).unwrap();
-        let live = Array3::from_shape_vec((2, 1, 2), vec![0.5, 1.0, 0.6, 0.8]).unwrap();
-        let region = region_live(counts.view(), live.view(), &[[0, 0], [0, 1]]).unwrap();
-        assert!((region[0] - 8.0 / 14.0).abs() < 1e-15);
-        assert!((region[1] - 0.7).abs() < 1e-15);
-        assert!(region_live(counts.view(), live.view(), &[[1, 0]]).is_err());
-        let dead = Array3::from_shape_vec((2, 1, 2), vec![0.0, 1.0, 0.6, 0.8]).unwrap();
-        assert!(region_live(counts.view(), dead.view(), &[[0, 0]]).is_err());
-        assert!(region_live(counts.view(), live.view(), &[[0, 0], [0, 1], [0, 0]]).is_err());
     }
 
     /// Recorded counts of a pixel that keeps the first neutron of each shutter.

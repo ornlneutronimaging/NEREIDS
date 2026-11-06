@@ -16,6 +16,7 @@ fastmcp = pytest.importorskip("fastmcp")
 
 import nereids
 from nereids.mcp.server import (
+    _load_tpx1_pair,
     _registry,
     compute_cross_sections,
     compute_transmission,
@@ -28,7 +29,7 @@ from nereids.mcp.server import (
     validate_resonance_dataset,
 )
 
-from _fixtures import _synthetic_u238_entry
+from _fixtures import _synthetic_u238_entry, _write_tpx1_run
 
 
 def _load_endf_or_skip(**kwargs):
@@ -441,6 +442,78 @@ class TestCountsManifest:
         f, decay = calls["calibration"].pulse.detector_tail
         assert (f.kind, f.value, decay.kind, decay.value) == ("known", 0.1, "fitted", 2.0)
         assert result["results"]["detector_tail"] == [0.1, 1.5]
+
+    @staticmethod
+    def _tpx1_runs(tmp_path):
+        frames = np.arange(48, dtype=float).reshape(6, 2, 4) % 5
+        _write_tpx1_run(tmp_path / "sample", frames, triggers=40)
+        _write_tpx1_run(tmp_path / "open", 2 * frames, triggers=60)
+        return {
+            "kind": "tpx1_fits",
+            "sample_path": "sample",
+            "open_beam_path": "open",
+            "binning": 1,
+        }
+
+    def test_tpx1_single_spectrum_carries_each_runs_region_live(self, tmp_path, monkeypatch):
+        analysis = self._analysis()
+        analysis["data"] = self._tpx1_runs(tmp_path)
+        manifest = _write_json_frontmatter_manifest(tmp_path, analysis)
+        assert validate_resonance_dataset(str(manifest))["valid"] is True
+        captured = {}
+
+        def fit(measurement, calibration):
+            captured["region"] = measurement.regions[0]
+            return self._fake_fit()
+
+        monkeypatch.setattr(nereids, "fit_counts", fit)
+        result = process_resonance_dataset(str(manifest))
+        assert result["success"], result
+        cells = [(y, x) for y in range(2) for x in range(4)]
+        for run, folder in (("sample", "sample"), ("open", "open")):
+            counts, edges, shutters = nereids.load_fits_run(str(tmp_path / folder))
+            live = nereids.live_fractions(counts, list(edges), shutters)
+            expected = nereids.region_live(counts, live, cells)
+            got = getattr(captured["region"], f"{run}_live")
+            np.testing.assert_allclose(got, expected)
+            assert min(got) < 1.0
+
+    def test_tpx1_run_pulses_are_refused_for_chunks_of_part_of_a_run(self, tmp_path):
+        data = self._tpx1_runs(tmp_path)
+        (tmp_path / "sample" / "run_0_115_ShutterCount.txt").write_text("0\t25\r\n1\t0\r\n")
+        with pytest.raises(ValueError, match="cannot be split"):
+            _load_tpx1_pair(tmp_path, {**data, "sample_nexus": "missing.nxs.h5"})
+
+    def test_tpx1_density_map_carries_each_kept_pixels_live(self, tmp_path, monkeypatch):
+        analysis = self._analysis(mode="density_map")
+        analysis["data"] = self._tpx1_runs(tmp_path)
+        hot = np.arange(48, dtype=float).reshape(6, 2, 4) % 5
+        hot[:, 0, 0] = 30.0
+        _write_tpx1_run(tmp_path / "sample", hot, triggers=40)
+        excluded = np.zeros((2, 4), dtype=bool)
+        excluded[0, 0] = True
+        np.savez(tmp_path / "masks.npz", excluded=excluded)
+        analysis["data"]["path"] = "masks.npz"
+        manifest = _write_json_frontmatter_manifest(tmp_path, analysis)
+        captured = {}
+
+        def build(**kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("captured")
+
+        monkeypatch.setattr(nereids, "MapMeasurement", build)
+        process_resonance_dataset(str(manifest))
+        counts, edges, shutters = nereids.load_fits_run(str(tmp_path / "sample"))
+        counts[:, 0, 0] = 0.0
+        np.testing.assert_allclose(
+            captured["sample_live"], nereids.live_fractions(counts, list(edges), shutters)
+        )
+        counts, edges, shutters = nereids.load_fits_run(str(tmp_path / "open"))
+        counts[:, 0, 0] = 0.0
+        np.testing.assert_allclose(
+            captured["open_live"], nereids.live_fractions(counts, list(edges), shutters)
+        )
+        assert captured["excluded"][0, 0]
 
     def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)

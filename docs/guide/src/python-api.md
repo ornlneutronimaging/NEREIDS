@@ -399,6 +399,26 @@ CountsMap.densities holds one (patch row, patch column) map per isotope in
 atoms/barn; density_sd holds the matching standard deviations. Patches of kind
 "mixed" and "outside" are not fitted.
 
+## Raw Timepix-1 Runs
+
+A Timepix-1 pixel records one count per shutter, so the counts fit needs each
+run's live fractions. `load_fits_run(folder, chunk=None, beam_pulses=None)`
+reads one chunk of a single-shutter run: its raw FITS counts, time-bin edges
+in µs and shutter, without a last frame that ends at the shutter's close.
+`live_fractions(counts, edges_us, shutters)` gives each pixel's live fraction
+in each bin (Watanabe et al. 2017, Eqs. 1–3), for `MapMeasurement`'s
+`open_live` and `sample_live`. `region_live(counts, live, cells)` gives a
+region's, for `Region`. Pass the pulses that carried beam, as the NeXus
+`proton_charge` log shows, so that a run paused with the beam off is not
+undercorrected; a run-wide count fits a chunk that covers the whole run.
+
+```python
+pulses = float((nereids.read_run_log("VENUS_19383.nxs.h5", "proton_charge").values > 0).sum())
+counts, edges_us, shutters = nereids.load_fits_run(raw_folder, beam_pulses=pulses)
+live = nereids.live_fractions(counts, list(edges_us), shutters)
+open_live = nereids.region_live(counts, live, [(y, x) for y in range(10) for x in range(10)])
+```
+
 ## Pixel Masks
 
 Pixel masks exist **only to exclude pipeline-corrupting pixels** (dead or

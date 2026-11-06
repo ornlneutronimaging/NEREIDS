@@ -37,6 +37,27 @@ pub struct FitsRun {
     pub shutters: Vec<Shutter>,
 }
 
+impl FitsRun {
+    /// Limits each shutter's triggers to the pulses that carried beam.
+    ///
+    /// The camera triggers on every pulse, with or without protons, so a run
+    /// paused with the beam off has more triggers than neutron pulses.
+    ///
+    /// # Errors
+    /// [`IoError::InvalidParameter`] unless `pulses` is a whole number above 0.
+    pub fn limit_to_beam_pulses(&mut self, pulses: f64) -> Result<(), IoError> {
+        if !(pulses > 0.0 && pulses.is_finite() && pulses.fract() == 0.0) {
+            return Err(IoError::InvalidParameter(format!(
+                "beam pulses must be a whole number above 0, got {pulses}"
+            )));
+        }
+        for shutter in &mut self.shutters {
+            shutter.triggers = shutter.triggers.min(pulses);
+        }
+        Ok(())
+    }
+}
+
 /// Read the primary image of a FITS file as counts in (row, column).
 ///
 /// # Errors
@@ -252,7 +273,10 @@ fn read_shutters(times: &Path, count: &Path) -> Result<Vec<Shutter>, IoError> {
     Ok(shutters)
 }
 
-/// Load one chunk of a raw frame-mode run folder.
+/// Load one chunk of a single-shutter raw frame-mode run folder.
+///
+/// A last frame whose bin ends at the shutter's close is left out: in the
+/// VENUS runs of this kind it holds several times its neighbours' counts.
 ///
 /// # Arguments
 /// * `dir` — The run folder.
@@ -261,7 +285,8 @@ fn read_shutters(times: &Path, count: &Path) -> Result<Vec<Shutter>, IoError> {
 /// # Errors
 /// [`IoError::NoMatchingFiles`] if no frames are found;
 /// [`IoError::InvalidParameter`] if `chunk` is `None` and the folder holds
-/// several chunks, the chunk's frames have two prefixes or are not numbered
+/// several chunks, the run has more than one shutter, the chunk's frames
+/// have two prefixes or are not numbered
 /// 0 to n − 1, a sidecar is missing or disagrees with the frames, or a frame
 /// is unreadable;
 /// [`IoError::DimensionMismatch`] if frame sizes differ.
@@ -310,11 +335,36 @@ pub fn load_fits_run(dir: &Path, chunk: Option<&str>) -> Result<FitsRun, IoError
         )));
     }
 
+    let mut edges_us = read_tof_sidecar(
+        &sidecar(dir, &prefix, &chunk, "Spectra.txt")?,
+        Some(frames.len()),
+    )?;
+    let shutters = read_shutters(
+        &sidecar(dir, &prefix, &chunk, "ShutterTimes.txt")?,
+        &sidecar(dir, &prefix, &chunk, "ShutterCount.txt")?,
+    )?;
+    if let [_, _, ..] = shutters.as_slice() {
+        return Err(IoError::InvalidParameter(format!(
+            "{} shutters: the fit's contiguous bins cannot yet skip the closed time between \
+             shutters",
+            shutters.len()
+        )));
+    }
+    // A last frame ending at the shutter's close holds several times its neighbours' counts.
+    let bins = frames.len();
+    let width = edges_us[bins] - edges_us[bins - 1];
+    let kept = if bins > 1 && edges_us[bins] >= shutters[0].end_us - 1e-6 * width {
+        edges_us.pop();
+        bins - 1
+    } else {
+        bins
+    };
+
     let first = read_fits_image(&frames[0].3)?;
     let (height, width) = first.dim();
-    let mut counts = Array3::zeros((frames.len(), height, width));
+    let mut counts = Array3::zeros((kept, height, width));
     counts.index_axis_mut(ndarray::Axis(0), 0).assign(&first);
-    for (k, (_, _, _, path)) in frames.iter().enumerate().skip(1) {
+    for (k, (_, _, _, path)) in frames.iter().enumerate().take(kept).skip(1) {
         let image = read_fits_image(path)?;
         if image.dim() != (height, width) {
             return Err(IoError::DimensionMismatch {
@@ -326,14 +376,6 @@ pub fn load_fits_run(dir: &Path, chunk: Option<&str>) -> Result<FitsRun, IoError
         counts.index_axis_mut(ndarray::Axis(0), k).assign(&image);
     }
 
-    let edges_us = read_tof_sidecar(
-        &sidecar(dir, &prefix, &chunk, "Spectra.txt")?,
-        Some(frames.len()),
-    )?;
-    let shutters = read_shutters(
-        &sidecar(dir, &prefix, &chunk, "ShutterTimes.txt")?,
-        &sidecar(dir, &prefix, &chunk, "ShutterCount.txt")?,
-    )?;
     Ok(FitsRun {
         counts,
         edges_us,
@@ -438,9 +480,9 @@ mod tests {
         .unwrap();
         let spectra = "1e-06\t5\r\n2e-06\t6\r\n3e-06\t7\r\n4.5e-06\t1\r\n";
         std::fs::write(dir.join(format!("run_0_{chunk}_Spectra.txt")), spectra).unwrap();
-        let times = "0\t1e-06\t2.5e-06\r\n1\t5e-07\t2e-06\r\n2\t0\t0\r\n";
+        let times = "0\t1e-06\t6e-06\r\n1\t0\t0\r\n";
         std::fs::write(dir.join(format!("run_0_{chunk}_ShutterTimes.txt")), times).unwrap();
-        let count = "0\t100\r\n1\t90\r\n2\t0\r\n";
+        let count = "0\t100\r\n1\t0\r\n";
         std::fs::write(dir.join(format!("run_0_{chunk}_ShutterCount.txt")), count).unwrap();
     }
 
@@ -452,14 +494,41 @@ mod tests {
         assert_eq!(run.counts.shape(), &[4, 1, 2]);
         assert_eq!(run.counts[[3, 0, 1]], 8.0);
         assert_eq!(run.edges_us.len(), 5);
-        assert_eq!(run.shutters.len(), 2);
         let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
         for (&edge, expected) in run.edges_us.iter().zip([1.0, 2.0, 3.0, 4.5, 6.0]) {
             assert!(close(edge, expected));
         }
-        let [s0, s1] = [run.shutters[0], run.shutters[1]];
-        assert!(close(s0.start_us, 1.0) && close(s0.end_us, 3.5) && s0.triggers == 100.0);
-        assert!(close(s1.start_us, 4.0) && close(s1.end_us, 6.0) && s1.triggers == 90.0);
+        let [s] = run.shutters[..] else {
+            panic!("one shutter")
+        };
+        assert!(close(s.start_us, 1.0) && close(s.end_us, 7.0) && s.triggers == 100.0);
+
+        let mut paused = run.clone();
+        paused.limit_to_beam_pulses(95.0).unwrap();
+        assert_eq!(paused.shutters[0].triggers, 95.0);
+        assert!(paused.limit_to_beam_pulses(0.5).is_err());
+    }
+
+    #[test]
+    fn a_last_frame_ending_at_the_close_is_left_out_and_two_shutters_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write_run(dir.path(), "114", &[[1, 2], [3, 4], [5, 6], [7, 8]]);
+        let times = dir.path().join("run_0_114_ShutterTimes.txt");
+        std::fs::write(&times, "0\t1e-06\t5e-06\r\n1\t0\t0\r\n").unwrap();
+        std::fs::write(
+            dir.path().join("run_0_114_00003.fits"),
+            fits(2, &[-1, 8], 0.0),
+        )
+        .unwrap();
+        let run = load_fits_run(dir.path(), None).unwrap();
+        assert_eq!(run.counts.shape(), &[3, 1, 2]);
+        assert_eq!(run.edges_us.len(), 4);
+        assert!((run.edges_us[3] - 4.5).abs() < 1e-9);
+
+        std::fs::write(&times, "0\t1e-06\t2.5e-06\r\n1\t5e-07\t2e-06\r\n").unwrap();
+        let count = dir.path().join("run_0_114_ShutterCount.txt");
+        std::fs::write(&count, "0\t100\r\n1\t90\r\n").unwrap();
+        assert!(load_fits_run(dir.path(), None).is_err());
     }
 
     #[test]
@@ -492,7 +561,7 @@ mod tests {
         write_run(dir.path(), "114", &[[1, 2], [3, 4], [5, 6], [7, 8]]);
         let count = dir.path().join("run_0_114_ShutterCount.txt");
         let times = dir.path().join("run_0_114_ShutterTimes.txt");
-        std::fs::write(&count, "0\t100.5\r\n1\t90\r\n2\t0\r\n").unwrap();
+        std::fs::write(&count, "0\t100.5\r\n1\t0\r\n").unwrap();
         assert!(load_fits_run(dir.path(), None).is_err());
         std::fs::write(&count, "0\t100\r\n2\t90\r\n").unwrap();
         std::fs::write(&times, "0\t1e-06\t2.5e-06\r\n2\t5e-07\t2e-06\r\n").unwrap();
