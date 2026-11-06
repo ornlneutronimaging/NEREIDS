@@ -1580,7 +1580,7 @@ class CountsMap:
     @property
     def n_fitted(self) -> int: ...
 
-NO_TIME_BACKGROUND: tuple[Value, Value, Value]
+NO_TIME_BACKGROUND: tuple[Value, Value, Value, Value]
 """No time background: Value.known(0.0), Value.known(0.0), Value.known(1.0)."""
 
 def fit_counts(measurement: Measurement, calibration: Calibration) -> CountsFit:

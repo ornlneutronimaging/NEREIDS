@@ -4961,20 +4961,10 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPatch>()?;
     m.add_class::<PyMapMeasurement>()?;
     m.add_class::<PyCountsMap>()?;
-    m.add(
-        "NO_TIME_BACKGROUND",
-        (
-            PyValue {
-                inner: NO_TIME_BACKGROUND[0],
-            },
-            PyValue {
-                inner: NO_TIME_BACKGROUND[1],
-            },
-            PyValue {
-                inner: NO_TIME_BACKGROUND[2],
-            },
-        ),
-    )?;
+    m.add("NO_TIME_BACKGROUND", {
+        let [c, a, tau, d] = NO_TIME_BACKGROUND.map(|inner| PyValue { inner });
+        (c, a, tau, d)
+    })?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy, m)?)?;
