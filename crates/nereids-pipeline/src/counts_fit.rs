@@ -308,7 +308,7 @@ pub struct CountsFit {
     /// each region's gamma transmission, region by region; each region's
     /// capture gammas' `ε`, region by region; each region's in-scatter's `Ω`,
     /// region by region; each region's timing offset `δt`, region by region;
-    /// the time background's `C`, `A` and `τ`; the room
+    /// the time background's `C`, `A`, `τ` and `D`; the room
     /// background's `ρ`; the spread's `h`; `t0`; the
     /// flight path; `α₀`, `α₁`,
     /// `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`: the inverse of the information at the fit, each run's expected information over its

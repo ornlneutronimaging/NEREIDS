@@ -329,7 +329,7 @@ pub struct CountsMap<'a> {
     /// `None` without one.
     pub detector_tail: Option<[f64; 2]>,
     /// The fitted shared quantities, among the normalization, the time
-    /// background's `C`, `A` and `τ`, the room background's `ρ`, `t0`, flight
+    /// background's `C`, `A`, `τ` and `D`, the room background's `ρ`, `t0`, flight
     /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`, in that
     /// order.
     pub shared: Vec<&'static str>,
