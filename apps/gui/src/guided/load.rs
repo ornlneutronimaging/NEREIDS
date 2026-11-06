@@ -355,12 +355,11 @@ fn load_tpx1_runs(state: &mut AppState) {
                         s / o
                     )
                 }
+                // The fitted normalization absorbs the ratio, so the one in Analyze is kept.
                 _ => {
                     state.proton_charge_sample = 0.0;
                     state.proton_charge_ob = 0.0;
-                    state.kl_c_ratio = 1.0;
-                    "Raw runs and live fractions loaded; charge ratio reset to 1: give both \
-                     NeXus files or set it in Analyze"
+                    "Raw runs and live fractions loaded; the charge ratio is the one in Analyze"
                         .into()
                 }
             };
