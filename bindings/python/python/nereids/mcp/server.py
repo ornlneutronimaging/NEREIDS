@@ -721,7 +721,16 @@ def _load_tpx1_pair(
         folder = _resolve_path(base, data_config.get(f"{run}_path"))
         if folder is None:
             raise ValueError("tpx1_fits data requires sample_path and open_beam_path")
-        pulses = _beam_pulses(_resolve_path(base, data_config.get(f"{run}_nexus")))
+        nexus = _resolve_path(base, data_config.get(f"{run}_nexus"))
+        triggers = {
+            p.read_text().split()[1] for p in folder.glob("*_ShutterCount.txt")
+        }
+        if nexus is not None and len(triggers) > 1:
+            raise ValueError(
+                f"{run} chunks record different triggers, so the run's beam pulses "
+                "cannot be split between them"
+            )
+        pulses = _beam_pulses(nexus)
         runs.append(
             nereids.load_fits_run(str(folder), data_config.get(f"{run}_chunk"), pulses)
         )

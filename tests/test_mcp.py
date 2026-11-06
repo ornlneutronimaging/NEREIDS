@@ -16,6 +16,7 @@ fastmcp = pytest.importorskip("fastmcp")
 
 import nereids
 from nereids.mcp.server import (
+    _load_tpx1_pair,
     _registry,
     compute_cross_sections,
     compute_transmission,
@@ -476,6 +477,12 @@ class TestCountsManifest:
             got = getattr(captured["region"], f"{run}_live")
             np.testing.assert_allclose(got, expected)
             assert min(got) < 1.0
+
+    def test_tpx1_run_pulses_are_refused_for_chunks_of_part_of_a_run(self, tmp_path):
+        data = self._tpx1_runs(tmp_path)
+        (tmp_path / "sample" / "run_0_115_ShutterCount.txt").write_text("0\t25\r\n1\t0\r\n")
+        with pytest.raises(ValueError, match="cannot be split"):
+            _load_tpx1_pair(tmp_path, {**data, "sample_nexus": "missing.nxs.h5"})
 
     def test_tpx1_density_map_carries_each_kept_pixels_live(self, tmp_path, monkeypatch):
         analysis = self._analysis(mode="density_map")
