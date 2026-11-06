@@ -109,15 +109,22 @@ pub fn read_fits_image(path: &Path) -> Result<Array2<f64>, IoError> {
     };
     // Counts are whole, so whole scaling gives them exactly.
     const EXACT: f64 = (1u64 << 53) as f64;
-    let whole = |key: &str, default: f64| -> Result<i128, IoError> {
-        let v = number(key)?.unwrap_or(default);
-        if v.fract() == 0.0 && v.abs() <= EXACT {
-            Ok(v as i128)
-        } else {
-            Err(bad(format!("{key} = {v} is not a whole number up to 2^53")))
-        }
+    // Read from the text, since a decimal near a whole number rounds to it in f64.
+    let whole = |key: &str, default: i128| -> Result<i128, IoError> {
+        let Some((_, text)) = keys.iter().find(|(k, _)| k == key) else {
+            return Ok(default);
+        };
+        let (int, frac) = text.split_once('.').unwrap_or((text, ""));
+        let digits = int.trim_start_matches(['+', '-']);
+        let v = (!digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && frac.bytes().all(|b| b == b'0'))
+        .then(|| int.parse::<i128>().ok())
+        .flatten()
+        .filter(|v| v.abs() <= EXACT as i128);
+        v.ok_or_else(|| bad(format!("{key} = {text} is not a whole number up to 2^53")))
     };
-    let (zero, scale) = (whole("BZERO", 0.0)?, whole("BSCALE", 1.0)?);
+    let (zero, scale) = (whole("BZERO", 0)?, whole("BSCALE", 1)?);
     let data = width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(size))
@@ -380,6 +387,12 @@ mod tests {
         let mut scaled = fits(1, &[100], 0.0);
         scaled[5 * 80..6 * 80].copy_from_slice(card("BSCALE  =                 0.07").as_bytes());
         std::fs::write(&path, scaled).unwrap();
+        assert!(read_fits_image(&path).is_err());
+
+        let mut near = fits(1, &[-1], 1e15);
+        near[6 * 80..8 * 80]
+            .copy_from_slice((card("BSCALE  =   999999999999999.99") + &card("END")).as_bytes());
+        std::fs::write(&path, near).unwrap();
         assert!(read_fits_image(&path).is_err());
 
         let mut cancel = fits(1, &[-1], 1e15);
