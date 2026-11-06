@@ -102,7 +102,10 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
             }
 
             // Apply button
-            let can_apply = state.rebin_factor > 1 && state.sample_data.is_some() && has_edges;
+            let can_apply = state.rebin_factor > 1
+                && state.sample_data.is_some()
+                && has_edges
+                && !crate::guided::load::tpx1_loaded(state);
             ui.add_enabled_ui(can_apply, |ui| {
                 if ui.button("Apply Rebinning").clicked() {
                     apply_rebin(state);
@@ -142,6 +145,12 @@ pub(crate) fn apply_rebin(state: &mut AppState) {
 
     if state.spectrum_values.is_some() && state.spectrum_kind != SpectrumValueKind::BinEdges {
         state.status_message = "Rebinning needs a spectrum of bin edges".to_string();
+        return;
+    }
+    if crate::guided::load::tpx1_loaded(state) {
+        state.status_message =
+            "Raw Timepix-1 live fractions belong to the native bins; they are not rebinned"
+                .to_string();
         return;
     }
 

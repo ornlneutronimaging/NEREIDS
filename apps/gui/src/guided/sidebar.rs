@@ -475,6 +475,7 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
                     InputMode::TiffPair => "TIFF pair",
                     InputMode::Hdf5Histogram => "HDF5 histogram",
                     InputMode::Hdf5Event => "HDF5 event",
+                    InputMode::Tpx1Raw => "Timepix-1 raw",
                 };
                 format!("{mode} \u{2014} {}×{}×{}", shape[0], shape[1], shape[2])
             } else if state.input_mode == InputMode::Hdf5Event && state.hdf5_path.is_some() {
@@ -538,6 +539,7 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
                 state.hdf5_path.is_some()
                     && state.nexus_metadata.as_ref().is_some_and(|m| m.has_events)
             }
+            InputMode::Tpx1Raw => crate::guided::load::tpx1_loaded(state),
         },
         GuidedStep::Configure => {
             let has_enabled = state.isotope_entries.iter().any(|e| e.enabled);

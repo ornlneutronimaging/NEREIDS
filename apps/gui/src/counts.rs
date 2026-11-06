@@ -74,6 +74,10 @@ pub struct FitRequest {
     pub energy_span_ev: (f64, f64),
     pub sample_counts: Arc<Array3<f64>>,
     pub open_counts: Arc<Array3<f64>>,
+    /// Each pixel's live fractions of the sample run, the shape of `sample_counts`.
+    pub sample_live: Option<Arc<Array3<f64>>>,
+    /// Each pixel's live fractions of the open-beam run, the shape of `open_counts`.
+    pub open_live: Option<Arc<Array3<f64>>>,
     pub excluded: Arc<Array2<bool>>,
     pub region: RegionRequest,
     pub binning: usize,
@@ -214,11 +218,21 @@ pub fn run_pixel_fit(request: &FitRequest) -> Result<PixelFitSummary, String> {
         return Err("the excluded-pixel mask does not match the image".into());
     }
     assert_live(&request.excluded, request.region)?;
+    let (y0, y1, x0, x1) = bounds(request.region);
+    let cells: Vec<[usize; 2]> = (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| [y, x]))
+        .collect();
+    let live = |counts: &Array3<f64>, live: &Option<Arc<Array3<f64>>>| {
+        live.as_ref()
+            .map(|live| counts_map::region_live(counts.view(), live.view(), &cells))
+            .transpose()
+            .map_err(|e| e.to_string())
+    };
     let region = Region {
         open_counts,
         sample_counts,
-        open_live: None,
-        sample_live: None,
+        open_live: live(&request.open_counts, &request.open_live)?,
+        sample_live: live(&request.sample_counts, &request.sample_live)?,
         background: background(request),
         pixels,
         gamma_transmission: Value::Known(1.0),
@@ -272,8 +286,8 @@ pub fn run_map_fit(request: &FitRequest) -> Result<MapFitSummary, String> {
         room_background: None,
         open_counts: request.open_counts.view(),
         sample_counts: request.sample_counts.view(),
-        open_live: None,
-        sample_live: None,
+        open_live: request.open_live.as_ref().map(|live| live.view()),
+        sample_live: request.sample_live.as_ref().map(|live| live.view()),
         excluded: excluded.view(),
         sample: sample.view(),
         empty: empty.view(),

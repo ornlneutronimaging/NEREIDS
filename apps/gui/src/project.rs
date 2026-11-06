@@ -195,6 +195,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             InputMode::TiffPair => "tiff_pair",
             InputMode::Hdf5Histogram => "hdf5_histogram",
             InputMode::Hdf5Event => "hdf5_event",
+            InputMode::Tpx1Raw => "tpx1_raw",
         }
         .into(),
         analysis_mode: "full_spatial".into(),
@@ -352,7 +353,8 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
         return;
     }
 
-    let can_embed = state.sample_data.is_some();
+    // Raw Timepix-1 live fractions are not stored; such a project reloads its runs.
+    let can_embed = state.sample_data.is_some() && state.input_mode != InputMode::Tpx1Raw;
     let (raw_bytes, compressed_bytes) = if can_embed {
         nereids_io::project::estimate_embedded_size(
             state.sample_data.as_deref(),
@@ -522,7 +524,11 @@ fn execute_save(state: &mut AppState, path: &Path, mode: SaveDataMode) {
     }
 
     // Fall back to linked if embedded requested but sample data not available
-    let mode = if mode == SaveDataMode::Embedded && state.sample_data.is_none() {
+    let mode = if mode == SaveDataMode::Embedded && state.input_mode == InputMode::Tpx1Raw {
+        state.status_message =
+            "Raw Timepix-1 runs reload with their live fractions — saving in linked mode.".into();
+        SaveDataMode::Linked
+    } else if mode == SaveDataMode::Embedded && state.sample_data.is_none() {
         state.status_message = "Sample data required for embed — saving in linked mode.".into();
         SaveDataMode::Linked
     } else {
@@ -691,6 +697,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.preview_image = None;
     state.sample_data = None;
     state.open_beam_data = None;
+    state.tpx1_live = None;
     state.spectrum_values = None;
     state.dead_pixels = None;
     state.file_dead_pixels = None;
@@ -727,6 +734,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         match snap.input_mode.as_str() {
             "hdf5_histogram" => InputMode::Hdf5Histogram,
             "hdf5_event" => InputMode::Hdf5Event,
+            "tpx1_raw" => InputMode::Tpx1Raw,
             _ => InputMode::TiffPair,
         }
     };
@@ -1063,7 +1071,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         (Some(persisted), Some(sample)) => {
             let ob = state.open_beam_data.as_deref();
             let stacks = match state.input_mode {
-                InputMode::TiffPair => ob.map(|o| (sample.as_ref(), Some(o))),
+                InputMode::TiffPair | InputMode::Tpx1Raw => ob.map(|o| (sample.as_ref(), Some(o))),
                 InputMode::Hdf5Histogram | InputMode::Hdf5Event => Some((sample.as_ref(), ob)),
             };
             stacks.and_then(|(s, o)| {
@@ -1355,6 +1363,29 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("drift"))
         );
+    }
+
+    #[test]
+    fn a_raw_timepix1_project_keeps_its_mode_and_run_paths_and_holds_no_stacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState {
+            input_mode: InputMode::Tpx1Raw,
+            sample_path: Some(dir.path().join("sample")),
+            open_beam_path: Some(dir.path().join("open")),
+            hdf5_path: Some(dir.path().join("VENUS_1.nxs.h5")),
+            sample_data: Some(Arc::new(Array3::from_elem((2, 1, 1), 3.0))),
+            ..AppState::default()
+        };
+        let path = dir.path().join("raw.nrd.h5");
+        execute_save(&mut state, &path, SaveDataMode::Embedded);
+        let saved = state.pending_save.take().unwrap().recv().unwrap().unwrap();
+        assert_eq!(saved.1, SaveDataMode::Linked);
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+        assert_eq!(restored.input_mode, InputMode::Tpx1Raw);
+        assert_eq!(restored.sample_path, state.sample_path);
+        assert_eq!(restored.hdf5_path, state.hdf5_path);
+        assert!(restored.sample_data.is_none());
     }
 
     /// Acceptance (a): save→restore→refit WITH raw stacks
