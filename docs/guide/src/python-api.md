@@ -410,7 +410,7 @@ in each bin (Watanabe et al. 2017, Eqs. 1–3), for `MapMeasurement`'s
 `open_live` and `sample_live`. `region_live(counts, live, cells)` gives a
 region's, for `Region`. Pass the pulses that carried beam, as the NeXus
 `proton_charge` log shows, so that a run paused with the beam off is not
-undercorrected.
+undercorrected; a run-wide count fits a chunk that covers the whole run.
 
 ```python
 pulses = float((nereids.read_run_log("VENUS_19383.nxs.h5", "proton_charge").values > 0).sum())

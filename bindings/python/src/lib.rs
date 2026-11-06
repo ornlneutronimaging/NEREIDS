@@ -1896,8 +1896,10 @@ fn fits_error(e: nereids_io::error::IoError) -> PyErr {
 ///         their ``_Spectra.txt``, ``_ShutterTimes.txt`` and
 ///         ``_ShutterCount.txt`` sidecars.
 ///     chunk: The chunk to load; None when the folder holds one chunk.
-///     beam_pulses: The run's pulses that carried beam; each shutter's
-///         triggers are limited to it. None keeps the triggers.
+///     beam_pulses: The pulses that carried beam while the chunk was
+///         acquired; each shutter's triggers are limited to it. A run-wide
+///         count fits a chunk that covers the whole run. None keeps the
+///         triggers.
 ///
 /// Returns:
 ///     ``(counts, edges_us, shutters)``: raw counts in (time bin, row,

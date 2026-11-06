@@ -2751,6 +2751,10 @@ class TestTimepix1Runs:
         region = nereids.region_live(counts, live, [(0, 0), (1, 1)])
         expected = (3 + 2) / (3 / live[1, 0, 0] + 2 / live[1, 1, 1])
         assert region[1] == pytest.approx(expected)
+        zero_counts = np.array([[[4.0, 8.0]], [[0.0, 0.0]]])
+        reduced_live = np.array([[[1.0, 1.0]], [[0.8, 0.6]]])
+        region = nereids.region_live(zero_counts, reduced_live, [(0, 0), (0, 1)])
+        assert region[1] == pytest.approx(0.7)
         with pytest.raises(ValueError, match="twice"):
             nereids.region_live(counts, live, [(0, 0), (0, 0)])
 

@@ -705,6 +705,7 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
 
 
 def _beam_pulses(nexus_path: Path | None) -> float | None:
+    """Pulses with proton charge in a run; right for a chunk that covers the whole run."""
     if nexus_path is None:
         return None
     charge = nereids.read_run_log(str(nexus_path), "proton_charge").values
@@ -726,7 +727,9 @@ def _load_tpx1_pair(
         )
     (sample, edges, _), (open_beam, open_edges, _) = runs
     _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
-    if edges.shape != open_edges.shape or not np.allclose(edges, open_edges):
+    if edges.shape != open_edges.shape or not np.allclose(
+        edges, open_edges, rtol=0.0, atol=1e-3 * float(np.diff(edges).min())
+    ):
         raise ValueError("tpx1_fits sample and open_beam time-bin edges must match")
     return runs
 
@@ -737,7 +740,7 @@ def _tpx1_live(
     shutters: list[tuple[float, float, float]],
     excluded: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Live fractions of the kept pixels; an excluded pixel's counts do not enter."""
+    """Live fractions of the kept pixels; an unused pixel's counts do not enter."""
     if excluded is not None:
         counts = np.where(excluded[np.newaxis], 0.0, counts)
     return nereids.live_fractions(np.ascontiguousarray(counts), list(edges), shutters)
@@ -946,8 +949,9 @@ def _process_density_map(
     empty = mask(empty_key, np.zeros((height, width), dtype=bool))
     behind = mask(sample_mask_key, ~empty)
     if kind == "tpx1_fits":
+        unused = excluded | ~(behind | empty)
         sample_live, open_live = (
-            _tpx1_live(counts, run_edges, shutters, excluded)
+            _tpx1_live(counts, run_edges, shutters, unused)
             for counts, (_, run_edges, shutters) in zip((sample, open_beam), tpx1_runs)
         )
 

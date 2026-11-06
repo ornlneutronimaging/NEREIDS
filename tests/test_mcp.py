@@ -501,7 +501,11 @@ class TestCountsManifest:
         np.testing.assert_allclose(
             captured["sample_live"], nereids.live_fractions(counts, list(edges), shutters)
         )
-        assert captured["open_live"].shape == counts.shape
+        counts, edges, shutters = nereids.load_fits_run(str(tmp_path / "open"))
+        counts[:, 0, 0] = 0.0
+        np.testing.assert_allclose(
+            captured["open_live"], nereids.live_fractions(counts, list(edges), shutters)
+        )
         assert captured["excluded"][0, 0]
 
     def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
