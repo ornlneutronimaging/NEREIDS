@@ -42,8 +42,8 @@ pub struct FitsRun {
 /// # Errors
 /// [`IoError::FileNotFound`] if the file cannot be read;
 /// [`IoError::InvalidParameter`] if the primary image is not 2-D with an
-/// integer `BITPIX` of 8, 16 or 32, the file is short, or a scaled value is
-/// not a whole number 0 or more.
+/// integer `BITPIX` of 8, 16 or 32, `BZERO` or `BSCALE` is not whole, the
+/// file is short, or a count is not within 0 to 2^53.
 pub fn read_fits_image(path: &Path) -> Result<Array2<f64>, IoError> {
     let name = path.to_string_lossy();
     let bytes =
@@ -107,44 +107,41 @@ pub fn read_fits_image(path: &Path) -> Result<Array2<f64>, IoError> {
         32.0 => 4,
         b => return Err(bad(format!("BITPIX {b} is not raw integer counts"))),
     };
-    let zero = number("BZERO")?.unwrap_or(0.0);
-    let scale = number("BSCALE")?.unwrap_or(1.0);
-    if !(zero.is_finite() && scale.is_finite()) {
-        return Err(bad(format!(
-            "BZERO {zero} and BSCALE {scale} must be finite"
-        )));
-    }
+    // Counts are whole, so whole scaling gives them exactly.
+    const EXACT: f64 = (1u64 << 53) as f64;
+    let whole = |key: &str, default: f64| -> Result<i128, IoError> {
+        let v = number(key)?.unwrap_or(default);
+        if v.fract() == 0.0 && v.abs() <= EXACT {
+            Ok(v as i128)
+        } else {
+            Err(bad(format!("{key} = {v} is not a whole number up to 2^53")))
+        }
+    };
+    let (zero, scale) = (whole("BZERO", 0.0)?, whole("BSCALE", 1.0)?);
     let data = width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(size))
         .and_then(|n| bytes.get(header..header.checked_add(n)?))
         .ok_or_else(|| bad(format!("shorter than its {width} × {height} image")))?;
 
-    let values = data.chunks_exact(size).map(|b| {
+    let mut values = Vec::with_capacity(width * height);
+    for (i, b) in data.chunks_exact(size).enumerate() {
         let raw = match size {
-            1 => f64::from(b[0]),
-            2 => f64::from(i16::from_be_bytes([b[0], b[1]])),
-            _ => f64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+            1 => i128::from(b[0]),
+            2 => i128::from(i16::from_be_bytes([b[0], b[1]])),
+            _ => i128::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])),
         };
         let v = zero + scale * raw;
-        // A whole count can carry the scaling's rounding error, a few ulp of its terms.
-        let whole = v.round();
-        if (v - whole).abs() <= 4.0 * f64::EPSILON * (zero.abs() + (scale * raw).abs()) {
-            whole
-        } else {
-            v
+        if !(0..=EXACT as i128).contains(&v) {
+            return Err(bad(format!(
+                "count {v} at row {}, column {} is not within 0 to 2^53",
+                i / width,
+                i % width
+            )));
         }
-    });
-    let image = Array2::from_shape_vec((height, width), values.collect())
-        .map_err(|e| bad(e.to_string()))?;
-    if let Some(((row, column), v)) = image
-        .indexed_iter()
-        .find(|(_, v)| !v.is_finite() || **v < 0.0 || v.fract() != 0.0)
-    {
-        return Err(bad(format!(
-            "count {v} at row {row}, column {column} is not a whole number 0 or more"
-        )));
+        values.push(v as f64);
     }
+    let image = Array2::from_shape_vec((height, width), values).map_err(|e| bad(e.to_string()))?;
     Ok(image)
 }
 
@@ -383,6 +380,18 @@ mod tests {
         let mut scaled = fits(1, &[100], 0.0);
         scaled[5 * 80..6 * 80].copy_from_slice(card("BSCALE  =                 0.07").as_bytes());
         std::fs::write(&path, scaled).unwrap();
+        assert!(read_fits_image(&path).is_err());
+
+        let mut cancel = fits(1, &[-1], 1e15);
+        cancel[6 * 80..8 * 80]
+            .copy_from_slice((card("BSCALE  =    999999999999999.5") + &card("END")).as_bytes());
+        std::fs::write(&path, cancel).unwrap();
+        assert!(read_fits_image(&path).is_err());
+
+        let mut doubled = fits(1, &[3], 1.0);
+        doubled[6 * 80..8 * 80]
+            .copy_from_slice((card("BSCALE  =                    2") + &card("END")).as_bytes());
+        std::fs::write(&path, doubled).unwrap();
         assert_eq!(read_fits_image(&path).unwrap()[[0, 0]], 7.0);
 
         let mut large = fits(1, &[1], 1e9);
