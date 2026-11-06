@@ -451,11 +451,11 @@ def _background_values(spec: Any) -> list:
 
 
 def _time_background_values(spec: Any) -> list | None:
-    """The additive time background's [C, A, tau], or none."""
+    """The additive time background's [C, A, tau] or [C, A, tau, D], or none."""
     if spec is None:
         return None
-    if not isinstance(spec, (list, tuple)) or len(spec) != 3:
-        raise ValueError("time_background must be [C, A, tau]")
+    if not isinstance(spec, (list, tuple)) or len(spec) not in (3, 4):
+        raise ValueError("time_background must be [C, A, tau] or [C, A, tau, D]")
     return [_as_value(value, "known") for value in spec]
 
 

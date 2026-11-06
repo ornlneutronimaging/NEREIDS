@@ -180,8 +180,10 @@ single_spectrum fits one region. It supports:
   edges come from time_edges_us (or time_edges_key) and must increase in
   the counts' order. Energy centers cannot reconstruct detector bin edges.
 
-For a single spectrum, `fit.time_background` supplies `[C, A, tau]`, each a
-number or Value specification, and `fit.gamma_transmission` supplies the
+For a single spectrum, `fit.time_background` supplies `[C, A, tau]` or
+`[C, A, tau, D]`, each a number or Value specification, D the rise over the
+time edges' span; a fitted D needs tau known or within an upper bound of half
+the span, and `fit.gamma_transmission` supplies the
 sample's gamma transmission. The additive time term enters after the pulse.
 It is distinct from the beam-borne `fit.background` scattering terms,
 `[b0, b1, b2]`, `[b0, b1, b2, d, f]` or an object with `b0`, `b1`, `b2` and

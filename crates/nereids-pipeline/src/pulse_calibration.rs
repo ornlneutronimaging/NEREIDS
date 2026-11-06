@@ -1052,7 +1052,7 @@ mod tests {
             fwhm_squared_us2: 0.12,
             r_high: None,
             detector_tail: None,
-            time_background: [0.0, 0.0, 1.0],
+            time_background: [0.0, 0.0, 1.0, 0.0],
             room_background: 0.0,
             spread_share: 0.0,
             covariance: Some(covariance),

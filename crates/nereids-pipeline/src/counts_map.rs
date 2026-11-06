@@ -37,11 +37,11 @@ pub struct MapMeasurement<'a> {
     pub charge_ratio: f64,
     /// `a`, the normalization of the sample run, the same in every pixel.
     pub normalization: Value,
-    /// `[C, A, τ]` of the time background per pixel, as
+    /// `[C, A, τ, D]` of the time background per pixel, as
     /// [`Measurement::time_background`], the same in every pixel;
     /// [`NO_TIME_BACKGROUND`](crate::counts_fit::NO_TIME_BACKGROUND) gives
     /// none.
-    pub time_background: [Value; 3],
+    pub time_background: [Value; 4],
     /// Counts that follow each run's duration, as
     /// [`Measurement::room_background`], the same in every pixel.
     pub room_background: Option<RoomBackground>,
@@ -305,8 +305,8 @@ pub struct CountsMap<'a> {
     pub identified: Array2<bool>,
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
-    /// The time background's `[C, A, τ]`, each the known or the fitted one.
-    pub time_background: [f64; 3],
+    /// The time background's `[C, A, τ, D]`, each the known or the fitted one.
+    pub time_background: [f64; 4],
     /// The room background's `ρ`: the known one, the fitted one, or 0 without
     /// one.
     pub room_background: f64,
@@ -329,7 +329,7 @@ pub struct CountsMap<'a> {
     /// `None` without one.
     pub detector_tail: Option<[f64; 2]>,
     /// The fitted shared quantities, among the normalization, the time
-    /// background's `C`, `A` and `τ`, the room background's `ρ`, `t0`, flight
+    /// background's `C`, `A`, `τ` and `D`, the room background's `ρ`, `t0`, flight
     /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`, in that
     /// order.
     pub shared: Vec<&'static str>,
@@ -598,8 +598,8 @@ pub fn fit_map<'a>(
             time: result.time_background,
             room: result.room_background,
         };
-        let used = open.open_counts_per_pixel(&bins, frames);
-        let now = fitted.open_counts_per_pixel(&bins, frames);
+        let used = open.open_counts_per_pixel(&bins, 0.0, frames);
+        let now = fitted.open_counts_per_pixel(&bins, 0.0, frames);
         let regions = || {
             result
                 .fits
@@ -873,6 +873,7 @@ fn fit_map_from<'a>(
     let origin_us = values[t0];
     let open_per_pixel = open.open_counts_per_pixel(
         &starts_and_widths_us(&map.time_edges_us),
+        0.0,
         open_frames(map.room_background.as_ref()),
     );
     let bins = map.open_counts.dim().0;
@@ -1495,6 +1496,7 @@ fn fit_map_from<'a>(
                     "time background C",
                     "time background A",
                     "time background τ",
+                    "time background D",
                     "room background ρ",
                     "t0",
                     "flight path",

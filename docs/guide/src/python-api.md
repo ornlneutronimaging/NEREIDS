@@ -141,7 +141,9 @@ time_background=None, room_background=None, spread=None) holds one open-beam/sam
 pair. time_edges_us are the shared time-bin edges in microseconds (length =
 bins + 1), charge_ratio is the sample run's proton charge over the open-beam
 run's, and normalization is the sample run's normalization a. time_background
-is [C, A, tau] or NO_TIME_BACKGROUND. room_background is
+is [C, A, tau], [C, A, tau, D] or NO_TIME_BACKGROUND: the counts per µs per
+pixel C + D·(t − t₁)/W + A·exp(−(t − t₁)/τ), W the edges' span; a fitted D
+needs tau known or within an upper bound of at most W/2. room_background is
 RoomBackground(rate, frames) or None: rate counts per microsecond per pixel
 per frame in both runs, not scaled by the charge ratio, the normalization or
 the gamma transmission, and frames the (open-beam, sample) frames. spread is
@@ -198,7 +200,7 @@ normalization, background, binning=1, empty_background=None, open_live=None,
 sample_live=None, time_background=None, gamma_transmission=None,
 room_background=None) holds the
 (time bin, row, column) counts and the (row, column) masks; its patches()
-method returns each patch's kind. time_background is [C, A, tau] per pixel,
+method returns each patch's kind. time_background is [C, A, tau] or [C, A, tau, D] per pixel,
 shared by every patch, or NO_TIME_BACKGROUND by default; gamma_transmission
 is that of every sample patch, known 1 by default, and the empty pixels take 1.
 

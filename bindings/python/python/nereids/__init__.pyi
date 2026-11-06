@@ -1256,8 +1256,9 @@ class Measurement:
 
     time_edges_us are the time-bin edges in microseconds and charge_ratio is
     the sample run proton charge over the open-beam run.  normalization is the
-    sample run normalization a.  time_background is [C, A, tau] or
-    NO_TIME_BACKGROUND; room_background is a RoomBackground or None; spread
+    sample run normalization a.  time_background is [C, A, tau], [C, A, tau, D]
+    (D the rise over the edges' span; a fitted D needs tau known or within an
+    upper bound of half the span) or NO_TIME_BACKGROUND; room_background is a RoomBackground or None; spread
     is a Spread or None.
     """
 
@@ -1444,7 +1445,7 @@ class MapMeasurement:
 
     open_counts, sample_counts, open_live and sample_live have shape (time
     bin, row, column); excluded, sample and empty have shape (row, column).
-    time_background is [C, A, tau] per pixel, shared by every patch, or None
+    time_background is [C, A, tau] or [C, A, tau, D] per pixel, shared by every patch, or None
     for none; gamma_transmission is that of every sample patch, or None for
     known 1.
     """
@@ -1579,7 +1580,7 @@ class CountsMap:
     @property
     def n_fitted(self) -> int: ...
 
-NO_TIME_BACKGROUND: tuple[Value, Value, Value]
+NO_TIME_BACKGROUND: tuple[Value, Value, Value, Value]
 """No time background: Value.known(0.0), Value.known(0.0), Value.known(1.0)."""
 
 def fit_counts(measurement: Measurement, calibration: Calibration) -> CountsFit:

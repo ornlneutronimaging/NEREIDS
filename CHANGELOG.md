@@ -109,6 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed (breaking)
 
+- The time background is `[C, A, τ, D]`, `C + D·(t − t₁)/W + A·exp(−(t − t₁)/τ)`
+  with `D` its rise over the edges' span `W`: earlier pulses' slow neutrons
+  change by about 10% across a VENUS window when the choppers are stopped, as
+  on the room-temperature Ta runs 19383 and 19385. A fitted `D` needs `τ` known
+  or within an upper bound of half the span. Python and MCP take
+  `[C, A, tau]` or `[C, A, tau, D]`.
 - `MapMeasurement`'s `open_live` and `sample_live` hold each pixel's live
   fractions, in (time bin, row, column), and each patch fits with its own
   region's; one vector per run cannot describe a detector whose pixels lose

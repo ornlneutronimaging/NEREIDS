@@ -131,12 +131,15 @@ pub struct Measurement {
     /// `a`, the normalization of the sample run, positive, the same in every
     /// region.
     pub normalization: Value,
-    /// `[C, A, τ]` of the time background `C + A·exp(−(t − t₁)/τ)`, the counts
-    /// per µs and per pixel at the open-beam run's proton charge that reach the
-    /// detector without passing through the moderator pulse, at time `t` of the
-    /// time edges' clock, `t₁` the first edge: `C` and `A` 0 or more, `τ` in µs
-    /// positive.  [`NO_TIME_BACKGROUND`] gives none.
-    pub time_background: [Value; 3],
+    /// `[C, A, τ, D]` of the time background
+    /// `C + D·(t − t₁)/W + A·exp(−(t − t₁)/τ)`, the counts per µs and per pixel
+    /// at the open-beam run's proton charge that reach the detector without
+    /// passing through the moderator pulse, at time `t` of the time edges'
+    /// clock, `t₁` the first edge and `W` the edges' span: `C` and `A` 0 or
+    /// more, `τ` in µs positive, `D` the rise over the span, any real number.
+    /// A `D` not known needs `τ` known or within an upper bound of at most
+    /// `W/2`. [`NO_TIME_BACKGROUND`] gives none.
+    pub time_background: [Value; 4],
     /// Counts that follow each run's duration, not its proton charge; `None`
     /// for none.
     pub room_background: Option<RoomBackground>,
@@ -148,8 +151,12 @@ pub struct Measurement {
 }
 
 /// A [`Measurement::time_background`] of no counts.
-pub const NO_TIME_BACKGROUND: [Value; 3] =
-    [Value::Known(0.0), Value::Known(0.0), Value::Known(1.0)];
+pub const NO_TIME_BACKGROUND: [Value; 4] = [
+    Value::Known(0.0),
+    Value::Known(0.0),
+    Value::Known(1.0),
+    Value::Known(0.0),
+];
 
 /// Counts that arrive at the same rate at every time of every frame, in
 /// both runs alike, whatever the proton charge and whatever is in front of
@@ -286,9 +293,9 @@ pub struct CountsFit {
     /// The detector tail's `[f, τ_D]`, each the known or the fitted one;
     /// `None` without one.
     pub detector_tail: Option<[f64; 2]>,
-    /// The time background's `[C, A, τ]`, each the known or the fitted one; a
-    /// fitted `τ` is undetermined when `A` ends at 0.
-    pub time_background: [f64; 3],
+    /// The time background's `[C, A, τ, D]`, each the known or the fitted one;
+    /// a fitted `τ` is undetermined when `A` ends at 0.
+    pub time_background: [f64; 4],
     /// The room background's `ρ`: the known one, the fitted one, or 0 without
     /// one.
     pub room_background: f64,
@@ -301,7 +308,7 @@ pub struct CountsFit {
     /// each region's gamma transmission, region by region; each region's
     /// capture gammas' `ε`, region by region; each region's in-scatter's `Ω`,
     /// region by region; each region's timing offset `δt`, region by region;
-    /// the time background's `C`, `A` and `τ`; the room
+    /// the time background's `C`, `A`, `τ` and `D`; the room
     /// background's `ρ`; the spread's `h`; `t0`; the
     /// flight path; `α₀`, `α₁`,
     /// `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`: the inverse of the information at the fit, each run's expected information over its
@@ -437,7 +444,7 @@ pub struct RegionFit {
 ///                    + p_r ρ F^S w_k]
 /// T_ri   = (1 + v_r D_ri)^(−1/v_r), D_ri = Σ_m n_rm σ_m(E_i; T_r), or 1 without a material
 /// b_r(E) = b0_r + b1_r/√E + b2_r·√E + d_r·exp(−f_r/√E)
-/// G_k    = ∫ over bin k of (C + A·exp(−(t − t₁)/τ)) dt
+/// G_k    = ∫ over bin k of (C + D·(t − t₁)/W + A·exp(−(t − t₁)/τ)) dt
 /// ```
 ///
 /// with `φ_r` the region's beam per µs, `P_ki` the chance of a neutron at
@@ -451,8 +458,9 @@ pub struct RegionFit {
 /// background's change over the pulse's delay.  The time
 /// background `G` is counts that follow the proton charge but reach the
 /// detector without passing through the moderator pulse, such as the prompt
-/// gammas of each proton pulse and their tail, at the time `t` of the edges'
-/// clock, `t₁` the first edge: it is not folded with the pulse, and the sample
+/// gammas of each proton pulse and their tail and earlier pulses' slow
+/// neutrons, at the time `t` of the edges' clock, `t₁` the first edge, `W` the
+/// edges' span and `D` its rise over it: it is not folded with the pulse, and the sample
 /// run scales it with `c_q·a`, which correct the charge ratio and an
 /// efficiency change alike in every pixel, and the fraction `γ_r` that reaches
 /// the region's pixels, `p_r` the region's pixels.  It turns
@@ -699,8 +707,8 @@ fn fit_settled(
         let fitted_offsets: Vec<f64> = fit.regions.iter().map(|r| r.timing_offset_us).collect();
         let mut spread = 0.0;
         for (q, (r, region)) in fit.regions.iter().zip(&measurement.regions).enumerate() {
-            let used = open.open_counts_per_pixel(&late(&bins, offsets[q]), frames);
-            let now = fitted.open_counts_per_pixel(&late(&bins, fitted_offsets[q]), frames);
+            let used = open.open_counts_per_pixel(&bins, offsets[q], frames);
+            let now = fitted.open_counts_per_pixel(&bins, fitted_offsets[q], frames);
             for (k, &mu) in r.predicted[0]
                 .iter()
                 .enumerate()
@@ -730,19 +738,24 @@ fn fit_settled(
     unreachable!("the passes end at most_passes")
 }
 
-/// The time background's `[C, A, τ]` and the room background's `ρ`, which
+/// The time background's `[C, A, τ, D]` and the room background's `ρ`, which
 /// together give the counts per pixel of a run that bypass the pulse.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Bypass {
-    pub(crate) time: [f64; 3],
+    pub(crate) time: [f64; 4],
     pub(crate) room: f64,
 }
 
 impl Bypass {
     /// The counts per pixel these numbers put in each bin of the open-beam run
-    /// of `frames` frames.
-    pub(crate) fn open_counts_per_pixel(&self, bins: &[(f64, f64)], frames: f64) -> Vec<f64> {
-        let (time, _) = time_counts_per_pixel(bins, self.time);
+    /// of `frames` frames, `bins` recorded `late_us` late.
+    pub(crate) fn open_counts_per_pixel(
+        &self,
+        bins: &[(f64, f64)],
+        late_us: f64,
+        frames: f64,
+    ) -> Vec<f64> {
+        let (time, _) = time_counts_per_pixel(&late(bins, late_us), self.time, span_us(bins));
         time.iter()
             .zip(bins)
             .map(|(g, (_, width))| g + self.room * frames * width)
@@ -775,6 +788,7 @@ pub(crate) fn starting_bypass(measurement: &Measurement) -> Result<Bypass, Pipel
             start(Role::TimeBackground(0))?,
             start(Role::TimeBackground(1))?,
             start(Role::TimeBackground(2))?,
+            start(Role::TimeBackground(3))?,
         ],
         room: start(Role::RoomBackground)?,
     })
@@ -834,6 +848,24 @@ pub(crate) fn checked<'a>(
     if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
         return invalid(format!(
             "the charge ratio must be finite and positive, got {charge_ratio}"
+        ));
+    }
+    // An exponential far slower than the span is nearly a line, which C and D already give.
+    let [_, _, tau, d] = &measurement.time_background;
+    let span_us = time_edges_us
+        .last()
+        .zip(time_edges_us.first())
+        .map_or(0.0, |(l, f)| l - f);
+    let short = match tau {
+        Value::Known(_) => true,
+        Value::Within { upper, .. } => *upper <= 0.5 * span_us,
+        _ => false,
+    };
+    if !matches!(d, Value::Known(_)) && !short {
+        return invalid(format!(
+            "a fitted time background D needs τ known or within an upper bound of at most half \
+             the edges' span, {:.6e} µs, or a slow exponential and D trade",
+            0.5 * span_us
         ));
     }
     if let Some(room) = &measurement.room_background
@@ -1353,7 +1385,8 @@ pub(crate) fn fit_counts_answer(
             .enumerate()
             .map(|(r, region)| {
                 let per_pixel = numbers.open_counts_per_pixel(
-                    &late(&starts_and_widths_us(time_edges_us), offsets[r]),
+                    &starts_and_widths_us(time_edges_us),
+                    offsets[r],
                     open_frames(measurement.room_background.as_ref()),
                 );
                 let known: Vec<f64> = per_pixel.iter().map(|g| region.pixels * g).collect();
@@ -1791,7 +1824,7 @@ pub(crate) fn fit_counts_answer(
             .pulse
             .detector_tail
             .map(|_| [params[layout.pulse + 7], params[layout.pulse + 8]]),
-        time_background: [0, 1, 2].map(|i| params[layout.time_background + i]),
+        time_background: [0, 1, 2, 3].map(|i| params[layout.time_background + i]),
         room_background: params[layout.room_background],
         spread_share: params[layout.spread],
         covariance,
@@ -2039,11 +2072,12 @@ struct Profile {
 
 pub(crate) const BACKGROUND_TERMS: [&str; 5] = ["b0", "b1", "b2", "d", "f"];
 
-pub(crate) const SHARED: [Role; 16] = [
+pub(crate) const SHARED: [Role; 17] = [
     Role::Normalization,
     Role::TimeBackground(0),
     Role::TimeBackground(1),
     Role::TimeBackground(2),
+    Role::TimeBackground(3),
     Role::RoomBackground,
     Role::T0,
     Role::FlightPath,
@@ -2174,7 +2208,7 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
         .chain(captures)
         .chain(scatters)
         .chain(offsets)
-        .chain((0..3).map(Role::TimeBackground))
+        .chain((0..4).map(Role::TimeBackground))
         .chain([
             Role::RoomBackground,
             Role::SpreadShare,
@@ -2265,6 +2299,7 @@ fn quantity(
                 ("C", 0.0, "0 or more"),
                 ("A", 0.0, "0 or more"),
                 ("τ", f64::MIN_POSITIVE, "positive"),
+                ("D", f64::NEG_INFINITY, "any real number"),
             ][term];
             (
                 &measurement.time_background[term],
@@ -2680,22 +2715,34 @@ pub(crate) fn starts_and_widths_us(time_edges_us: &[f64]) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The span `W` of bins given as starts from the first edge and widths, in µs.
+pub(crate) fn span_us(starts_and_widths_us: &[(f64, f64)]) -> f64 {
+    starts_and_widths_us
+        .last()
+        .map_or(1.0, |&(start, width)| start + width)
+}
+
+/// The time background's counts per pixel in each bin and their slopes in
+/// `[C, A, τ, D]`, the linear term rising by `D` over `span_us`.
 pub(crate) fn time_counts_per_pixel(
     starts_and_widths_us: &[(f64, f64)],
-    [c, a, tau]: [f64; 3],
-) -> (Vec<f64>, [Vec<f64>; 3]) {
+    [c, a, tau, d]: [f64; 4],
+    span_us: f64,
+) -> (Vec<f64>, [Vec<f64>; 4]) {
     let bins = starts_and_widths_us.len();
     let mut counts = Vec::with_capacity(bins);
-    let mut slopes: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(bins));
+    let mut slopes: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::with_capacity(bins));
     for &(start, width) in starts_and_widths_us {
         let decay = (-start / tau).exp();
         let after = (-(start + width) / tau).exp();
         let fraction = -(-width / tau).exp_m1();
         let integral = decay * (tau * fraction);
-        counts.push(c * width + a * integral);
+        let ramp = width * (start + 0.5 * width) / span_us;
+        counts.push(c * width + a * integral + d * ramp);
         slopes[0].push(width);
         slopes[1].push(integral);
         slopes[2].push(a * (decay * fraction + (decay * start * fraction - after * width) / tau));
+        slopes[3].push(ramp);
     }
     (counts, slopes)
 }
@@ -3047,11 +3094,12 @@ impl RegionsModel {
     }
 
     /// The time background per pixel that `region` records, and its slopes
-    /// in `[C, A, τ]`.
-    fn time_background(&self, params: &[f64], region: usize) -> (Vec<f64>, [Vec<f64>; 3]) {
+    /// in `[C, A, τ, D]`.
+    fn time_background(&self, params: &[f64], region: usize) -> (Vec<f64>, [Vec<f64>; 4]) {
         let at = self.layout.time_background;
         let bins = late(&self.bins, params[self.layout.regions[region].offset]);
-        time_counts_per_pixel(&bins, [params[at], params[at + 1], params[at + 2]])
+        let terms = [params[at], params[at + 1], params[at + 2], params[at + 3]];
+        time_counts_per_pixel(&bins, terms, span_us(&self.bins))
     }
 
     fn exponential(&self, f: f64) -> Vec<f64> {
@@ -3184,7 +3232,7 @@ impl FitModel for RegionsModel {
             (4, &ones),
             (5, &ones),
         ];
-        let backgrounds: Vec<(Vec<f64>, [Vec<f64>; 3])> = (0..regions)
+        let backgrounds: Vec<(Vec<f64>, [Vec<f64>; 4])> = (0..regions)
             .map(|r| self.time_background(params, r))
             .collect();
         let scaled = |factor: f64, values: &[f64]| -> Vec<f64> {
@@ -3426,6 +3474,7 @@ impl FitModel for RegionsModel {
                     };
                     let at = layout.time_background;
                     let per_late = params[at + 1] / params[at + 2];
+                    let per_drift = params[at + 3] / span_us(&self.bins);
                     let mut blocks = Vec::with_capacity(2 * regions);
                     for r in (0..regions).filter(|&r| only.is_none_or(|region| region == r)) {
                         let (group, scale) = (clocks.of_region[r], clocks.of(r));
@@ -3463,8 +3512,9 @@ impl FitModel for RegionsModel {
                                 }
                             }
                             if only.is_some() {
-                                for (c, x) in column.iter_mut().zip(&backgrounds[r].1[1]) {
-                                    *c += background * per_late * x;
+                                let [widths, integrals, ..] = &backgrounds[r].1;
+                                for ((c, x), w) in column.iter_mut().zip(integrals).zip(widths) {
+                                    *c += background * (per_late * x - per_drift * w);
                                 }
                             }
                             blocks.push((row, column));
@@ -3590,9 +3640,21 @@ mod tests {
             jacobian_against_central_differences(&grid(channel_fwhm_us), lattice);
         }
         let bins = starts_and_widths_us(&[350.0, 351.0, 400.0, 470.0]);
-        let (_, slopes) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MIN_POSITIVE]);
+        let span = span_us(&bins);
+        let ramp = Bypass {
+            time: [0.0, 0.0, 1.0, 20.0],
+            room: 0.0,
+        };
+        let shifted = ramp.open_counts_per_pixel(&bins, 2.0, 0.0);
+        let (start, width) = bins[bins.len() - 1];
+        let exact = 20.0 * width * (start - 2.0 + 0.5 * width) / span;
+        assert!(
+            (shifted[bins.len() - 1] / exact - 1.0).abs() <= 1e-12,
+            "{shifted:?}"
+        );
+        let (_, slopes) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MIN_POSITIVE, 0.0], span);
         assert!(slopes.iter().flatten().all(|s| s.is_finite()), "{slopes:?}");
-        let (counts, _) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MAX]);
+        let (counts, _) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MAX, 0.0], span);
         for (count, (_, width)) in counts.iter().zip(&bins) {
             assert!((count / (3.0 * width) - 1.0).abs() <= 1e-12, "{counts:?}");
         }
@@ -3608,13 +3670,13 @@ mod tests {
             &[1.0],
             &[[false; 2]],
         ));
-        let ([c, a, tau], late) = ([2000.0, 30000.0, 10.0], 0.3);
+        let ([c, a, tau, d], late) = ([2000.0, 30000.0, 10.0, -300.0], 0.3);
         let params: Vec<f64> = layout
             .roles
             .iter()
             .map(|role| match *role {
                 Role::TimingOffset { .. } => late,
-                Role::TimeBackground(term) => [c, a, tau][term],
+                Role::TimeBackground(term) => [c, a, tau, d][term],
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
                 _ => 0.0,
@@ -3630,7 +3692,10 @@ mod tests {
         );
         let (recorded, _) = model.time_background(&params, 0);
         let edges = grid.time_edges_us();
-        let rate = |t: f64| c + a * (-(t - late - edges[0]) / tau).exp();
+        let span = edges[edges.len() - 1] - edges[0];
+        let rate = |t: f64| {
+            c + d * (t - late - edges[0]) / span + a * (-(t - late - edges[0]) / tau).exp()
+        };
         for (k, counts) in recorded.iter().enumerate() {
             let h = (edges[k + 1] - edges[k]) / 64.0;
             let simpson: f64 = (0..64)
@@ -3668,7 +3733,7 @@ mod tests {
                 }
                 Role::GammaTransmission { .. } => 1.0,
                 Role::Normalization => 0.93,
-                Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
+                Role::TimeBackground(term) => [50.0, 300.0, 40.0, -20.0][term],
                 Role::SpreadShare => 0.5,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
@@ -3722,7 +3787,7 @@ mod tests {
                 Role::CaptureGammas { region } => [0.05, 0.0][region],
                 Role::InScatter { region } => [0.3, 0.0][region],
                 Role::TimingOffset { region } => [0.02, -0.01][region],
-                Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
+                Role::TimeBackground(term) => [50.0, 300.0, 40.0, -20.0][term],
                 Role::RoomBackground => 2.0e-3,
                 Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
@@ -3812,7 +3877,7 @@ mod tests {
                 Role::CaptureGammas { region } => [0.05, 0.03, 0.02][region],
                 Role::InScatter { region } => [0.3, 0.2, 0.4][region],
                 Role::TimingOffset { region } => [0.03, 0.03, -0.02][region],
-                Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
+                Role::TimeBackground(term) => [50.0, 300.0, 40.0, -20.0][term],
                 Role::RoomBackground => 2.0e-3,
                 Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
@@ -3928,7 +3993,7 @@ mod tests {
                 Role::InScatter { .. } => 0.0,
                 Role::TimingOffset { .. } => 0.0,
                 Role::SpreadShare => 0.0,
-                Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
+                Role::TimeBackground(term) => [0.0, 0.0, 1.0, 0.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
@@ -4137,7 +4202,12 @@ mod tests {
         assert!(decrement <= 1e-2, "{decrement}");
 
         let drifting = Measurement {
-            time_background: [Value::Fitted(50.0), Value::Known(0.0), Value::Known(1.0)],
+            time_background: [
+                Value::Fitted(50.0),
+                Value::Known(0.0),
+                Value::Known(1.0),
+                Value::Known(0.0),
+            ],
             room_background: None,
             spread: None,
             ..measurement
@@ -4185,7 +4255,7 @@ mod tests {
                 Role::InScatter { .. } => 0.0,
                 Role::TimingOffset { .. } => 0.0,
                 Role::SpreadShare => 0.0,
-                Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
+                Role::TimeBackground(term) => [0.0, 0.0, 1.0, 0.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
@@ -4414,7 +4484,7 @@ mod tests {
                 .copied()
                 .chain([3.0e-4, 5.0e-4, 300.0, 0.0, normalization])
                 .chain(background)
-                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
                 .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0])
                 .collect();
