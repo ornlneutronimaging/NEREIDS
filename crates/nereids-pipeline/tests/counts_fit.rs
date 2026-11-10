@@ -5350,6 +5350,104 @@ mod pulse_calibration {
             );
         }
     }
+
+    /// Lines between those of the calibration foil; a fit refuses lines outside their span.
+    const OTHER_LINES: [(f64, f64, f64); 6] = [
+        (4.5, 0.002, 0.06),
+        (9.0, 0.005, 0.06),
+        (18.0, 0.004, 0.06),
+        (36.0, 0.02, 0.06),
+        (75.0, 0.02, 0.06),
+        (90.0, 0.05, 0.06),
+    ];
+
+    /// Temperature errors of another foil at 373 and 1073 K under a calibration at 300 K with
+    /// every pulse number fitted, all counts spread uniformly over `path_m` and `time_us`.
+    fn read_with_spread(fwhm_us: f64, path_m: f64, time_us: f64) -> (CountsFit, [f64; 2]) {
+        let mut p = POWER_PULSE;
+        p[5] = fwhm_us;
+        let counts = |setup: &Setup, sample: &[(ResonanceData, f64)], kelvin: f64| {
+            let beam = beam(CALIBRATION_LEVEL);
+            let (open, through): (Vec<_>, Vec<_>) = (0..16)
+                .map(|k| {
+                    let u = (f64::from(k) + 0.5) / 16.0 - 0.5;
+                    let spread = Setup {
+                        edges: setup.edges.clone(),
+                        pulse: Arc::clone(&setup.pulse),
+                        t0_us: setup.t0_us + u * time_us,
+                        flight_path_m: setup.flight_path_m + u * path_m,
+                        ..*setup
+                    };
+                    expected_at(&spread, &beam, sample, kelvin)
+                })
+                .unzip();
+            let mean = |runs: Vec<Vec<f64>>| {
+                let bin = |i: usize| runs.iter().map(|run| run[i]).sum::<f64>() / 16.0;
+                rounded(&(0..runs[0].len()).map(bin).collect::<Vec<f64>>())
+            };
+            (mean(open), mean(through))
+        };
+        let foil = Setup {
+            pulse: venus_pulse(&p),
+            ..power_foil()
+        };
+        let m = foil_measurement(
+            &foil,
+            counts(&foil, &power_sample(), TEMPERATURE_K),
+            &power_sample(),
+        );
+        let mut start = calibration_start(&p, 1.0, Some(0.4));
+        start.pulse.exponents = [Value::Fitted(0.5); 2];
+        let (calibrated, calibration) =
+            PulseCalibration::new(&m, &start, foil_provenance()).expect("calibration");
+        let other = Setup {
+            edges: line_edges(&OTHER_LINES, (170.0, 1100.0)),
+            pulse: venus_pulse(&p),
+            t0_us: T0_US + 0.03,
+            flight_path_m: FLIGHT_PATH_M + 0.002,
+            ..power_foil()
+        };
+        let sample = [(
+            synthetic_isotope_multi(73, 181, &OTHER_LINES),
+            CALIBRATION_DENSITY,
+        )];
+        let errors = [373.0, 1073.0].map(|kelvin| {
+            let m = measurement(&other, counts(&other, &sample, kelvin), &sample);
+            let fit =
+                fit_counts(&fitted_from(m, 0.8 * kelvin), &calibrated.calibration()).expect("fit");
+            assert!(fit.converged, "{kelvin} K");
+            fit.temperature() - kelvin
+        });
+        (calibration, errors)
+    }
+
+    // Moderator face 10 cm wide, viewed 13.75° off its centre (Bilheux et al. 2023, Sec. 3).
+    const FACE_PATH_SPREAD_M: f64 = 0.024;
+    // Ring revolution less the extraction gap (Kustom 2000, Table 1).
+    const DESIGN_PROTON_PULSE_US: f64 = 0.695;
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn a_flight_path_spread_across_the_moderator_face_does_not_move_a_calibrated_temperature() {
+        let (_, errors) = read_with_spread(0.35, FACE_PATH_SPREAD_M, 0.0);
+        assert!(
+            errors.iter().all(|error| error.abs() <= 0.2),
+            "{errors:?} K"
+        );
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn a_flat_proton_pulse_is_calibrated_as_the_triangle_of_its_variance() {
+        let (calibration, errors) = read_with_spread(0.0, 0.0, DESIGN_PROTON_PULSE_US);
+        // Variances: box w²/12, triangle of FWHM h h²/6.
+        let ratio = calibration.fwhm_squared_us2 / (DESIGN_PROTON_PULSE_US.powi(2) / 2.0);
+        assert!((ratio - 1.0).abs() <= 0.02, "h² is {ratio} of the box's");
+        assert!(
+            errors.iter().all(|error| error.abs() <= 0.1),
+            "{errors:?} K"
+        );
+    }
 }
 
 mod maps {
