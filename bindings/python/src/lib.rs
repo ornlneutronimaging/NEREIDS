@@ -31,7 +31,7 @@ use nereids_pipeline::counts_fit::{
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, PatchCovariances};
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{Calibration, Pulse};
-use nereids_pipeline::pulse_calibration::PulseCalibration;
+use nereids_pipeline::pulse_calibration::{Provenance, PulseCalibration};
 
 /// Python wrapper for ENDF resonance data.
 ///
@@ -4960,6 +4960,40 @@ fn fit_map(
     .map_err(counts_error)
 }
 
+/// Calibrate the pulse on a foil's counts and write its pulse calibration
+/// file at path; returns the foil's fit.
+///
+/// The measurement is the foil alone in one region, each density and the
+/// temperature measured. foil, open_run and sample_run name the foil and its
+/// two runs.
+///
+/// Raises:
+///     ValueError: a foil, calibration or fit a pulse calibration refuses.
+///     OSError: the file cannot be written.
+#[pyfunction]
+fn calibrate_pulse(
+    py: Python<'_>,
+    measurement: PyRef<'_, PyMeasurement>,
+    calibration: PyRef<'_, PyCalibration>,
+    path: &str,
+    foil: String,
+    open_run: String,
+    sample_run: String,
+) -> PyResult<PyCountsFit> {
+    let measurement = measurement.inner.clone();
+    let calibration = calibration.inner.clone();
+    let provenance = Provenance {
+        foil,
+        open: open_run,
+        sample: sample_run,
+    };
+    let (calibrated, fit) = py
+        .detach(move || PulseCalibration::new(&measurement, &calibration, provenance))
+        .map_err(counts_error)?;
+    std::fs::write(path, calibrated.to_json())?;
+    Ok(PyCountsFit { inner: fit })
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -5034,5 +5068,6 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_bad_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(fit_counts, m)?)?;
     m.add_function(wrap_pyfunction!(fit_map, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate_pulse, m)?)?;
     Ok(())
 }

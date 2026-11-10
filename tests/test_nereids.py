@@ -868,6 +868,69 @@ class TestCountsApi:
                 os.path.join(root, "tests/data/endf/Ta-181-file32.endf")
             )
 
+    def test_a_foil_is_calibrated_into_a_file_a_calibration_reads(self, u238_data, tmp_path):
+        edges = np.linspace(650.0, 760.0, 111)
+        known, measured = nereids.Value.known, nereids.Value.measured
+
+        def foil(counts, density, temperature_k):
+            return nereids.Measurement(
+                time_edges_us=edges,
+                charge_ratio=1.0,
+                normalization=known(1.0),
+                regions=[
+                    nereids.Region(
+                        open_counts=np.full(110, 1.0e6),
+                        sample_counts=counts,
+                        pixels=1.0,
+                        background=[known(0.0)] * 3,
+                        gamma_transmission=known(1.0),
+                        material=nereids.Material(
+                            isotopes=[(u238_data, density)],
+                            temperature_k=temperature_k,
+                        ),
+                    )
+                ],
+            )
+
+        def calibration(alpha0):
+            return nereids.Calibration(
+                t0_us=known(3.0),
+                flight_path_m=known(25.0),
+                pulse=nereids.Pulse(
+                    alpha0=alpha0,
+                    alpha1=known(1.0),
+                    beta0=known(0.08),
+                    beta1=known(0.0),
+                    r=known(0.2),
+                    fwhm_squared_us2=known(0.0),
+                    energy_span_ev=(1.0, 200.0),
+                ),
+            )
+
+        model = nereids.fit_counts(
+            foil(np.full(110, 1.0e6), known(5e-4), known(300.0)),
+            calibration(known(0.5)),
+        )
+        counts = np.round(np.asarray(model.regions[0].predicted_sample))
+        start = calibration(nereids.Value.fitted(0.4))
+        path = str(tmp_path / "foil.json")
+        runs = {"foil": "foil-a", "open_run": "run-1", "sample_run": "run-2"}
+        measured_foil = foil(counts, measured(5e-4, 5e-6), measured(300.0, 5.0))
+        fit = nereids.calibrate_pulse(measured_foil, start, path, **runs)
+        assert fit.converged
+        assert fit.alpha[0] == pytest.approx(0.5, rel=0.02)
+        calibration = nereids.Calibration.from_pulse_calibration_file(path)
+        assert calibration.pulse.has_prior
+        assert calibration.pulse.alpha[0].kind == "fitted"
+        assert calibration.pulse.alpha[0].value == fit.alpha[0]
+        assert calibration.pulse.alpha[1].kind == "known"
+        unmeasured = foil(counts, measured(5e-4, 5e-6), nereids.Value.fitted(300.0))
+        with pytest.raises(ValueError, match="temperature"):
+            nereids.calibrate_pulse(
+                unmeasured, start, str(tmp_path / "refused.json"), **runs
+            )
+        assert not (tmp_path / "refused.json").exists()
+
     def test_a_resonance_covariance_reaches_the_material(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(root, "tests/data/endf/Ta-181-file32.endf")

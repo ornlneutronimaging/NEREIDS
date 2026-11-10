@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
+  sample_run)` calibrates the pulse on a foil of measured density and
+  temperature and writes the pulse calibration file that
+  `Calibration.from_pulse_calibration_file` reads, so the calibrate-then-measure
+  workflow runs from Python end to end.
 - `nereids_io::fits_stack` loads one chunk of a single-shutter raw Timepix-1
   frame-mode run: its FITS counts, time-bin edges and shutter; given the
   pulses that carried beam, it limits the triggers to them. A last frame whose

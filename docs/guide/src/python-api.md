@@ -177,6 +177,13 @@ t0 and the flight path are fitted from the calibrated ones, and the fitted
 pulse numbers are fitted from theirs under the calibration's prior, its mean
 and covariance (Pulse.has_prior); the others are known.
 
+calibrate_pulse(measurement, calibration, path, foil, open_run, sample_run)
+writes that file: it fits a calibration foil alone, in one region, with each
+density and the temperature measured (Value.measured), and returns the foil's
+fit. foil, open_run and sample_run name the foil and its two runs. A foil
+whose density or temperature is not measured, a fit that does not converge and
+a pulse number the counts do not determine are refused.
+
 #### RegionFit and CountsFit
 
 RegionFit.densities are the fitted areal densities in atoms/barn,

@@ -1601,3 +1601,17 @@ def fit_map(map: MapMeasurement, calibration: Calibration) -> CountsMap:
     """Fit a material over patches of the map pixels to the raw counts of
     both runs."""
     ...
+
+def calibrate_pulse(
+    measurement: Measurement,
+    calibration: Calibration,
+    path: str,
+    foil: str,
+    open_run: str,
+    sample_run: str,
+) -> CountsFit:
+    """Calibrate the pulse on a foil's counts and write its pulse calibration
+    file at path; returns the foil's fit. The measurement is the foil alone in
+    one region, each density and the temperature measured; foil, open_run and
+    sample_run name the foil and its two runs."""
+    ...
