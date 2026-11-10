@@ -648,6 +648,8 @@ pub enum EnergyLaw {
     Const(f64),
     /// `a0·√(E[eV]) + a1` — leading epithermal scaling of the fast rate `α(E)`.
     SqrtE { a0: f64, a1: f64 },
+    /// `a0·E^exponent + a1`, `E` in eV; an exponent of 1/2 is [`SqrtE`](EnergyLaw::SqrtE).
+    PowerE { a0: f64, a1: f64, exponent: f64 },
     /// Mantid IC form `1/(a0 + a1·λ)`, λ (Å) = `LAMBDA_ANGSTROM_FACTOR`/√E.
     /// Behaves as `α ∝ √E` at low E and saturates to `1/a0` at high E.
     InverseLambda { a0: f64, a1: f64 },
@@ -671,6 +673,15 @@ impl EnergyLaw {
         match *self {
             EnergyLaw::Const(c) => c,
             EnergyLaw::SqrtE { a0, a1 } => a0 * e.sqrt() + a1,
+            EnergyLaw::PowerE { a0, a1, exponent } => {
+                // `sqrt` and `powf(0.5)` may differ in the last bit.
+                let power = if exponent == 0.5 {
+                    e.sqrt()
+                } else {
+                    e.powf(exponent)
+                };
+                a0 * power + a1
+            }
             EnergyLaw::InverseLambda { a0, a1 } => {
                 let denom = inverse_lambda_denom(a0, a1, e);
                 if denom.abs() < MIN_RATE {
@@ -1856,6 +1867,15 @@ mod tests {
         assert_eq!(EnergyLaw::Const(3.0).eval(50.0), 3.0);
         let s = EnergyLaw::SqrtE { a0: 0.2, a1: 0.1 };
         assert!((s.eval(100.0) - (0.2 * 10.0 + 0.1)).abs() < 1e-12);
+        let power = |exponent| EnergyLaw::PowerE {
+            a0: 0.2,
+            a1: 0.1,
+            exponent,
+        };
+        assert!((power(0.25).eval(16.0) - (0.2 * 2.0 + 0.1)).abs() < 1e-12);
+        for energy in [0.0, 0.5, 7.3, 200.0] {
+            assert_eq!(power(0.5).eval(energy), s.eval(energy));
+        }
         // InverseLambda: α grows with E (λ shrinks).
         let il = EnergyLaw::InverseLambda { a0: 0.1, a1: 0.5 };
         assert!(il.eval(200.0) > il.eval(5.0));

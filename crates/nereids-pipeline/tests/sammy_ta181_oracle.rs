@@ -471,6 +471,7 @@ fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
         pulse: Pulse {
             alpha: [Value::Known(0.0), Value::Known(ALPHA)],
             beta: [Value::Known(0.0), Value::Known(1.0)],
+            exponents: [Value::Known(0.5); 2],
             r: Value::Known(0.0),
             fwhm_squared_us2: Value::Known(0.0),
             r_high: None,
@@ -663,6 +664,7 @@ fn fitted_pulse() -> Calibration {
             alpha: [Value::Fitted(0.02), Value::Fitted(START_FACTOR * ALPHA)],
             // β changes the pulse only through R, whose truth is 0.
             beta: [Value::Known(0.0), Value::Known(1.0)],
+            exponents: [Value::Known(0.5); 2],
             r: Value::Fitted(0.05),
             fwhm_squared_us2: Value::Known(0.0),
             r_high: None,

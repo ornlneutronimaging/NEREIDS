@@ -18,8 +18,8 @@ use crate::error::PipelineError;
 use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
 
 /// The pulse numbers a calibration fitted, as indices into
-/// `(α₀, α₁, β₀, β₁, R, h², R_high, f, τ_D)`, with the mean and covariance of its likelihood
-/// in them without their bounds.
+/// `(α₀, α₁, β₀, β₁, R, h², R_high, f, τ_D, p_α, p_β)`, with the mean and covariance of its
+/// likelihood in them without their bounds.
 #[derive(Debug, Clone)]
 pub struct PulsePrior {
     pub(crate) numbers: Vec<usize>,
@@ -46,23 +46,25 @@ impl Pulse {
     }
 }
 
-const FORMAT_VERSION: u32 = 5;
+const FORMAT_VERSION: u32 = 6;
 
-const PULSE_MODEL: &str = "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, \
-     E in eV, a storage fraction R, constant or linear in √E to R_high across the energy span, \
+const PULSE_MODEL: &str = "Ikeda–Carpenter pulse with α = α₀·E^p_α + α₁ and β = β₀·E^p_β + β₁ in \
+     1/µs, E in eV, a storage fraction R, constant or linear in √E to R_high across the energy span, \
      folded with the proton pulse's triangle of FWHM h and, when present, a detector tail of \
      fraction f and decay τ_D";
 
-const NUMBERS: [(&str, &str); 9] = [
-    ("alpha0", "1/(µs·√eV)"),
+const NUMBERS: [(&str, &str); 11] = [
+    ("alpha0", "1/(µs·eV^alpha_exponent)"),
     ("alpha1", "1/µs"),
-    ("beta0", "1/(µs·√eV)"),
+    ("beta0", "1/(µs·eV^beta_exponent)"),
     ("beta1", "1/µs"),
     ("r", "1"),
     ("fwhm_squared", "µs²"),
     ("r_high", "1"),
     ("tail_fraction", "1"),
     ("tail_decay", "µs"),
+    ("alpha_exponent", "1"),
+    ("beta_exponent", "1"),
 ];
 
 /// Where a calibration's counts came from: the identifiers of the physical
@@ -158,8 +160,8 @@ struct Foil {
 /// the densities and the temperature are.
 #[derive(Debug, Clone)]
 pub struct PulseCalibration {
-    numbers: [f64; 9],
-    status: [Status; 9],
+    numbers: [f64; 11],
+    status: [Status; 11],
     prior: Option<PulsePrior>,
     t0_us: f64,
     flight_path_m: f64,
@@ -239,8 +241,8 @@ impl PulseCalibration {
             .map(|(_, value)| !matches!(value, Value::Known(_)))
             .collect();
         let first_number = fitted.len() - PULSE_NUMBERS.len();
-        let mut status = [Status::Known; 9];
-        let mut covered = Vec::with_capacity(9);
+        let mut status = [Status::Known; 11];
+        let mut covered = Vec::with_capacity(11);
         for (number, name) in PULSE_NUMBERS.into_iter().enumerate() {
             let quantity = first_number + number;
             let i = fitted[..quantity].iter().filter(|&&f| f).count();
@@ -268,7 +270,7 @@ impl PulseCalibration {
             status[6] = Status::Absent;
         }
         if fit.detector_tail.is_none() {
-            status[7..].fill(Status::Absent);
+            status[7..9].fill(Status::Absent);
         }
         let tail = fit.detector_tail.unwrap_or([0.0; 2]);
         let numbers = [
@@ -281,6 +283,8 @@ impl PulseCalibration {
             fit.r_high.unwrap_or(0.0),
             tail[0],
             tail[1],
+            fit.exponents[0],
+            fit.exponents[1],
         ];
         let line_span_ev = if fitted[first_number..].contains(&true) {
             let present = foil_material(measurement)?
@@ -440,6 +444,7 @@ impl PulseCalibration {
             pulse: Pulse {
                 alpha: [value(0), value(1)],
                 beta: [value(2), value(3)],
+                exponents: [value(9), value(10)],
                 r: value(4),
                 fwhm_squared_us2: value(5),
                 r_high: present(6).then(|| value(6)),
@@ -452,9 +457,9 @@ impl PulseCalibration {
         }
     }
 
-    /// The calibration file: JSON of format version 5 that names the pulse
-    /// model and, in the order `α₀, α₁, β₀, β₁, R, h², R_high, f, τ_D`, each
-    /// pulse number with its unit, value and status (fitted, known, or absent
+    /// The calibration file: JSON of format version 6 that names the pulse
+    /// model and, in the order `α₀, α₁, β₀, β₁, R, h², R_high, f, τ_D, p_α,
+    /// p_β`, each pulse number with its unit, value and status (fitted, known, or absent
     /// for an `R_high` or a detector tail the pulse lacks), then the prior over the
     /// fitted numbers: its mean, which may lie past a number's bound, its
     /// covariance and rank; then `t0` and the flight path, the pulse's energy
@@ -512,7 +517,7 @@ impl PulseCalibration {
     ///
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if `text` is not such a file: not
-    /// format version 5 of this pulse model, a field missing or unknown, the
+    /// format version 6 of this pulse model, a field missing or unknown, the
     /// pulse numbers' names or units not in their order, a number absent
     /// other than `R_high` or both of the tail's or absent with a value
     /// other than 0, the mean, the
@@ -559,10 +564,10 @@ impl PulseCalibration {
                 "the pulse numbers are (name, unit) {NUMBERS:?}, in that order"
             ));
         }
-        let numbers: [f64; 9] = std::array::from_fn(|n| file.numbers[n].value);
-        let status: [Status; 9] = std::array::from_fn(|n| file.numbers[n].status);
+        let numbers: [f64; 11] = std::array::from_fn(|n| file.numbers[n].value);
+        let status: [Status; 11] = std::array::from_fn(|n| file.numbers[n].status);
         let absent = |n: usize| status[n] == Status::Absent;
-        if (0..6).any(absent) || absent(7) != absent(8) {
+        if (0..6).chain(9..11).any(absent) || absent(7) != absent(8) {
             return invalid(format!(
                 "only R_high or both of the detector tail's numbers are absent; got {status:?}"
             ));
@@ -573,7 +578,7 @@ impl PulseCalibration {
                 numbers[n], NUMBERS[n].0
             ));
         }
-        let covered: Vec<usize> = (0..9).filter(|&n| status[n] == Status::Fitted).collect();
+        let covered: Vec<usize> = (0..11).filter(|&n| status[n] == Status::Fitted).collect();
         let k = covered.len();
         if file.rank != k
             || file.mean.len() != k
@@ -1015,6 +1020,7 @@ mod tests {
             pulse: Pulse {
                 alpha: [Value::Known(0.5), Value::Fitted(1.0)],
                 beta: [Value::Fitted(0.08), beta1],
+                exponents: [Value::Known(0.5); 2],
                 r: Value::Fitted(0.2),
                 fwhm_squared_us2: Value::Fitted(0.1),
                 r_high: None,
@@ -1065,6 +1071,7 @@ mod tests {
             flight_path_m: 25.0,
             alpha: [0.5, 1.1],
             beta: [0.0, 0.01],
+            exponents: [0.5; 2],
             r: 0.21,
             fwhm_squared_us2: 0.12,
             r_high: None,
@@ -1267,9 +1274,9 @@ mod tests {
             0.012_537_345_881_063_615_f64.to_bits()
         );
         for expected in [
-            "\"format_version\": 5",
+            "\"format_version\": 6",
             "\"name\": \"alpha0\"",
-            "\"unit\": \"1/(µs·√eV)\"",
+            "\"unit\": \"1/(µs·eV^alpha_exponent)\"",
             "\"status\": \"fitted\"",
             "\"rank\": 4",
             "\"lattice\": null",
@@ -1449,13 +1456,13 @@ mod tests {
         }
     }
 
-    const VERSION_5: &str = r#"{
-  "format_version": 5,
-  "pulse_model": "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, E in eV, a storage fraction R, constant or linear in √E to R_high across the energy span, folded with the proton pulse's triangle of FWHM h and, when present, a detector tail of fraction f and decay τ_D",
+    const VERSION_6: &str = r#"{
+  "format_version": 6,
+  "pulse_model": "Ikeda–Carpenter pulse with α = α₀·E^p_α + α₁ and β = β₀·E^p_β + β₁ in 1/µs, E in eV, a storage fraction R, constant or linear in √E to R_high across the energy span, folded with the proton pulse's triangle of FWHM h and, when present, a detector tail of fraction f and decay τ_D",
   "numbers": [
     {
       "name": "alpha0",
-      "unit": "1/(µs·√eV)",
+      "unit": "1/(µs·eV^alpha_exponent)",
       "value": 0.5,
       "status": "known"
     },
@@ -1467,7 +1474,7 @@ mod tests {
     },
     {
       "name": "beta0",
-      "unit": "1/(µs·√eV)",
+      "unit": "1/(µs·eV^beta_exponent)",
       "value": 0.0,
       "status": "fitted"
     },
@@ -1506,6 +1513,18 @@ mod tests {
       "unit": "µs",
       "value": 0.0,
       "status": "absent"
+    },
+    {
+      "name": "alpha_exponent",
+      "unit": "1",
+      "value": 0.5,
+      "status": "known"
+    },
+    {
+      "name": "beta_exponent",
+      "unit": "1",
+      "value": 0.5,
+      "status": "known"
     }
   ],
   "mean": [
@@ -1613,10 +1632,10 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_format_version_5_byte_for_byte() {
+    fn the_file_is_format_version_6_byte_for_byte() {
         let original = original();
-        assert_eq!(original.to_json(), VERSION_5);
-        let read = PulseCalibration::from_json(VERSION_5).unwrap();
+        assert_eq!(original.to_json(), VERSION_6);
+        let read = PulseCalibration::from_json(VERSION_6).unwrap();
         assert_eq!(format!("{read:?}"), format!("{original:?}"));
     }
 

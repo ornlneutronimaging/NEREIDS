@@ -1288,13 +1288,14 @@ class Measurement:
     def regions(self) -> list[Region]: ...
 
 class Pulse:
-    """The Ikeda-Carpenter pulse: alpha = alpha0*sqrt(E) + alpha1 and
-    beta = beta0*sqrt(E) + beta1 in 1/microsecond, a storage fraction
+    """The Ikeda-Carpenter pulse: alpha = alpha0*E^p_alpha + alpha1 and
+    beta = beta0*E^p_beta + beta1 in 1/microsecond, a storage fraction
     R over energy_span_ev (eV), or linear in sqrt(E) from R at its low end to
     r_high at its high end, triangle FWHM h with fwhm_squared_us2 equal to h^2
     in microseconds squared, and an optional detector tail (f, tau_D): the detector records a
     fraction f of the counts late by an exponential delay of mean tau_D
-    microseconds."""
+    microseconds. exponents is (p_alpha, p_beta), each within 0 to 1; None
+    is a known 1/2."""
 
     def __init__(
         self,
@@ -1309,6 +1310,7 @@ class Pulse:
         line_span_ev: tuple[float, float] | None = None,
         r_high: Value | None = None,
         detector_tail: tuple[Value, Value] | None = None,
+        exponents: tuple[Value, Value] | None = None,
     ) -> None: ...
     @property
     def alpha(self) -> list[Value]: ...
@@ -1322,6 +1324,8 @@ class Pulse:
     def r_high(self) -> Value | None: ...
     @property
     def detector_tail(self) -> tuple[Value, Value] | None: ...
+    @property
+    def exponents(self) -> tuple[Value, Value]: ...
     @property
     def energy_span_ev(self) -> tuple[float, float]: ...
     @property
@@ -1403,6 +1407,8 @@ class CountsFit:
     def r_high(self) -> float | None: ...
     @property
     def detector_tail(self) -> tuple[float, float] | None: ...
+    @property
+    def exponents(self) -> tuple[float, float]: ...
     @property
     def time_background(self) -> list[float]: ...
     @property
@@ -1541,6 +1547,8 @@ class CountsMap:
     def r_high(self) -> float | None: ...
     @property
     def detector_tail(self) -> tuple[float, float] | None: ...
+    @property
+    def exponents(self) -> tuple[float, float]: ...
     @property
     def shared(self) -> list[str]: ...
     @property

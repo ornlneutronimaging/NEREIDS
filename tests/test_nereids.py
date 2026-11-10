@@ -974,8 +974,14 @@ class TestCountsApi:
             energy_span_ev=pulse.energy_span_ev,
             r_high=nereids.Value.fitted(0.3),
             detector_tail=(nereids.Value.fitted(0.1), nereids.Value.known(1.5)),
+            exponents=(nereids.Value.fitted(0.4), nereids.Value.known(0.45)),
         )
         assert (rising.r_high.kind, rising.r_high.value) == ("fitted", 0.3)
+        assert [(p.kind, p.value) for p in pulse.exponents] == [("known", 0.5)] * 2
+        assert [(p.kind, p.value) for p in rising.exponents] == [
+            ("fitted", 0.4),
+            ("known", 0.45),
+        ]
         assert pulse.detector_tail is None
         f, decay = rising.detector_tail
         assert (f.kind, f.value, decay.kind, decay.value) == ("fitted", 0.1, "known", 1.5)

@@ -26,7 +26,7 @@ use nereids_physics::detector_spread::region_shares;
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
 use nereids_physics::forward_scatter::{ForwardYield, forward_yield, lowest_exit_ratio};
-use nereids_physics::ikeda_carpenter::IkedaCarpenterParams;
+use nereids_physics::ikeda_carpenter::{EnergyLaw, IkedaCarpenterParams};
 use nereids_physics::lattice_doppler::{PhononSpectrum, broaden_in_lattice};
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::thickness::{interacting_per_depth, uneven_transmission};
@@ -283,6 +283,8 @@ pub struct CountsFit {
     pub alpha: [f64; 2],
     /// The pulse's `[β₀, β₁]`, each the known or the fitted one.
     pub beta: [f64; 2],
+    /// The pulse's `[p_α, p_β]`, each the known or the fitted one.
+    pub exponents: [f64; 2],
     /// The pulse's `R`: the known one, or the fitted one.
     pub r: f64,
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
@@ -1817,6 +1819,7 @@ pub(crate) fn fit_counts_answer(
         flight_path_m: params[layout.flight_path],
         alpha: [params[layout.pulse], params[layout.pulse + 1]],
         beta: [params[layout.pulse + 2], params[layout.pulse + 3]],
+        exponents: [params[layout.pulse + 9], params[layout.pulse + 10]],
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
         r_high: calibration.pulse.r_high.map(|_| params[layout.pulse + 6]),
@@ -2072,7 +2075,7 @@ struct Profile {
 
 pub(crate) const BACKGROUND_TERMS: [&str; 5] = ["b0", "b1", "b2", "d", "f"];
 
-pub(crate) const SHARED: [Role; 17] = [
+pub(crate) const SHARED: [Role; 19] = [
     Role::Normalization,
     Role::TimeBackground(0),
     Role::TimeBackground(1),
@@ -2090,6 +2093,8 @@ pub(crate) const SHARED: [Role; 17] = [
     Role::Pulse(6),
     Role::Pulse(7),
     Role::Pulse(8),
+    Role::Pulse(9),
+    Role::Pulse(10),
 ];
 
 pub(crate) fn shared_parameters(
@@ -2215,7 +2220,7 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
             Role::T0,
             Role::FlightPath,
         ])
-        .chain((0..9).map(Role::Pulse))
+        .chain((0..11).map(Role::Pulse))
         .collect()
 }
 
@@ -3221,16 +3226,36 @@ impl FitModel for RegionsModel {
                 .collect();
             [share.iter().map(|s| 1.0 - s).collect(), share]
         });
-        let pulse_columns: [(usize, &[f64]); 9] = [
-            (0, root_energy),
+        // ∂(a0·E^p + a1)/∂a0 = E^p and ∂/∂p = a0·E^p·ln E.
+        let power = |a0: f64, exponent: f64| -> [Vec<f64>; 2] {
+            let unit = EnergyLaw::PowerE {
+                a0: 1.0,
+                a1: 0.0,
+                exponent,
+            };
+            let power: Vec<f64> = self.flight_energies.iter().map(|&e| unit.eval(e)).collect();
+            let slope = power
+                .iter()
+                .zip(&self.flight_energies)
+                .map(|(power, e)| a0 * power * e.ln())
+                .collect();
+            [power, slope]
+        };
+        let numbers = &params[layout.pulse..];
+        let [alpha_power, alpha_exponent] = power(numbers[0], numbers[9]);
+        let [beta_power, beta_exponent] = power(numbers[2], numbers[10]);
+        let pulse_columns: [(usize, &[f64]); 11] = [
+            (0, &alpha_power),
             (0, &ones),
-            (1, root_energy),
+            (1, &beta_power),
             (1, &ones),
             (2, &low),
             (3, &ones),
             (2, &high),
             (4, &ones),
             (5, &ones),
+            (0, &alpha_exponent),
+            (1, &beta_exponent),
         ];
         let backgrounds: Vec<(Vec<f64>, [Vec<f64>; 4])> = (0..regions)
             .map(|r| self.time_background(params, r))
@@ -3737,7 +3762,7 @@ mod tests {
                 Role::SpreadShare => 0.5,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
-                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0][n],
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0, 0.5, 0.5][n],
                 _ => 0.0,
             })
             .collect();
@@ -3792,7 +3817,7 @@ mod tests {
                 Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
-                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0][n],
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0, 0.5, 0.5][n],
             })
             .collect();
         let data = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
@@ -3882,7 +3907,9 @@ mod tests {
                 Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
-                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.25, 0.1, 1.5][n],
+                Role::Pulse(n) => [
+                    0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.25, 0.1, 1.5, 0.42, 0.58,
+                ][n],
             })
             .collect();
         let model = RegionsModel::new(
@@ -3997,7 +4024,7 @@ mod tests {
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
-                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0][n],
+                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5][n],
             })
             .collect();
         let model = RegionsModel::new(&grid, &beams, &isotopes, (1.2, [0.0; 2]), T0_US, &layout);
@@ -4059,6 +4086,7 @@ mod tests {
             pulse: Pulse {
                 alpha: [Value::Known(0.35), Value::Known(0.05)],
                 beta: [Value::Known(0.0), Value::Known(0.25)],
+                exponents: [Value::Known(0.5); 2],
                 r: Value::Known(0.15),
                 fwhm_squared_us2: Value::Known(0.0),
                 r_high: None,
@@ -4259,7 +4287,7 @@ mod tests {
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
-                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0][n],
+                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5][n],
             })
             .collect();
         let counts: Vec<f64> =
@@ -4324,6 +4352,7 @@ mod tests {
             pulse: Pulse {
                 alpha: [Value::Fitted(0.35), Value::Fitted(0.05)],
                 beta: [Value::Known(0.0), Value::Known(0.25)],
+                exponents: [Value::Known(0.5); 2],
                 r: Value::Known(0.15),
                 fwhm_squared_us2: Value::Known(0.0),
                 r_high: None,
@@ -4486,7 +4515,7 @@ mod tests {
                 .chain(background)
                 .chain([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
-                .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0])
+                .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5])
                 .collect();
             model.evaluate(&params).expect("counts")
         };

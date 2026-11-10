@@ -223,14 +223,17 @@ fn recorded(
 
 fn known(pulse: &IkedaCarpenter) -> Pulse {
     let coefficients = |law: &EnergyLaw| match *law {
-        EnergyLaw::SqrtE { a0, a1 } => [a0, a1],
-        EnergyLaw::Const(c) => [0.0, c],
-        ref other => panic!("{other:?} is not a law in √E"),
+        EnergyLaw::SqrtE { a0, a1 } => [a0, a1, 0.5],
+        EnergyLaw::PowerE { a0, a1, exponent } => [a0, a1, exponent],
+        EnergyLaw::Const(c) => [0.0, c, 0.5],
+        ref other => panic!("{other:?} is not a power law"),
     };
     let (params, detector) = (pulse.params(), pulse.detector_pulse());
+    let [alpha, beta] = [&params.alpha, &params.beta].map(coefficients);
     Pulse {
-        alpha: coefficients(&params.alpha).map(Value::Known),
-        beta: coefficients(&params.beta).map(Value::Known),
+        alpha: [alpha[0], alpha[1]].map(Value::Known),
+        beta: [beta[0], beta[1]].map(Value::Known),
+        exponents: [alpha[2], beta[2]].map(Value::Known),
         r: Value::Known(coefficients(&params.r)[1]),
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         r_high: None,
@@ -4014,13 +4017,15 @@ fn venus_pulse(numbers: &[f64]) -> Arc<IkedaCarpenter> {
     Arc::new(
         IkedaCarpenter::new(
             IkedaCarpenterParams {
-                alpha: EnergyLaw::SqrtE {
+                alpha: EnergyLaw::PowerE {
                     a0: numbers[0],
                     a1: numbers[1],
+                    exponent: numbers.get(6).copied().unwrap_or(0.5),
                 },
-                beta: EnergyLaw::SqrtE {
+                beta: EnergyLaw::PowerE {
                     a0: numbers[2],
                     a1: numbers[3],
+                    exponent: numbers.get(7).copied().unwrap_or(0.5),
                 },
                 r: EnergyLaw::Const(numbers[4]),
                 burst_sigma_us: None,
@@ -4044,23 +4049,27 @@ fn calibration_foil(pulse: &[f64], t0_us: f64, flight_path_m: f64) -> Setup {
 }
 
 fn foil_window(lines: &[(f64, f64, f64)], pulse: &[f64], t0_us: f64, flight_path_m: f64) -> Setup {
-    let lines_us: Vec<f64> = lines
-        .iter()
-        .map(|&(energy, _, _)| T0_US + CLOCK / energy.sqrt())
-        .collect();
-    let edges = std::iter::successors(Some(240.0), |&t: &f64| {
-        let near_a_line = lines_us.iter().any(|line| (t - line).abs() < 10.0);
-        (t < 600.0).then_some(t + if near_a_line { 1.0 } else { 8.0 })
-    })
-    .collect();
     Setup {
-        edges,
+        edges: line_edges(lines, (240.0, 600.0)),
         pulse: venus_pulse(pulse),
         energy_range_ev: (4.0, 120.0),
         simulator_step_us: 1.0 / 32.0,
         t0_us,
         flight_path_m,
     }
+}
+
+/// Edges 1 µs apart within 10 µs of a line and 8 µs apart elsewhere.
+fn line_edges(lines: &[(f64, f64, f64)], (first_us, last_us): (f64, f64)) -> Vec<f64> {
+    let lines_us: Vec<f64> = lines
+        .iter()
+        .map(|&(energy, _, _)| T0_US + CLOCK / energy.sqrt())
+        .collect();
+    std::iter::successors(Some(first_us), |&t: &f64| {
+        let near_a_line = lines_us.iter().any(|line| (t - line).abs() < 10.0);
+        (t < last_us).then_some(t + if near_a_line { 1.0 } else { 8.0 })
+    })
+    .collect()
 }
 
 fn calibration_sample(density: f64) -> [(ResonanceData, f64); 1] {
@@ -5159,6 +5168,187 @@ mod pulse_calibration {
             "no calibration ended alpha0 on its bound"
         );
         agree_as_chi_squared(&tests);
+    }
+
+    const POWER_PULSE: [f64; 8] = [0.6, 0.8, 0.1, 0.0, 0.2, 0.0, 0.37, 0.4];
+    const POWER_LINES: [(f64, f64, f64); 6] = [
+        (3.0, 0.001, 0.06),
+        (6.0, 0.01, 0.06),
+        (12.0, 0.003, 0.06),
+        (25.0, 0.02, 0.06),
+        (50.0, 0.01, 0.06),
+        (100.0, 0.05, 0.06),
+    ];
+
+    fn power_foil() -> Setup {
+        Setup {
+            edges: line_edges(&POWER_LINES, (170.0, 1100.0)),
+            pulse: venus_pulse(&POWER_PULSE),
+            energy_range_ev: (1.5, 190.0),
+            simulator_step_us: 1.0 / 32.0,
+            t0_us: T0_US,
+            flight_path_m: FLIGHT_PATH_M,
+        }
+    }
+
+    fn power_sample() -> [(ResonanceData, f64); 1] {
+        [(
+            synthetic_isotope_multi(73, 181, &POWER_LINES),
+            CALIBRATION_DENSITY,
+        )]
+    }
+
+    fn power_start(exponents: [Value; 2], sign: f64) -> Calibration {
+        let mut calibration = calibration_start(&POWER_PULSE, sign, None);
+        calibration.pulse.exponents = exponents;
+        calibration
+    }
+
+    /// Covariance rows: density, temperature, t0, flight path, α₀, α₁, β₀, R, p_α, p_β.
+    fn power_truth() -> [f64; 10] {
+        let p = POWER_PULSE;
+        [
+            CALIBRATION_DENSITY,
+            TEMPERATURE_K,
+            T0_US,
+            FLIGHT_PATH_M,
+            p[0],
+            p[1],
+            p[2],
+            p[4],
+            p[6],
+            p[7],
+        ]
+    }
+
+    fn power_estimates(fit: &CountsFit) -> [f64; 10] {
+        let [density, temperature, t0, path, a0, a1, b0, r, _] = calibration_estimates(fit);
+        let [p_alpha, p_beta] = fit.exponents;
+        [
+            density,
+            temperature,
+            t0,
+            path,
+            a0,
+            a1,
+            b0,
+            r,
+            p_alpha,
+            p_beta,
+        ]
+    }
+
+    #[test]
+    fn a_pulse_with_other_exponents_is_calibrated_with_them() {
+        let setup = power_foil();
+        let counts = expected(&setup, &beam(CALIBRATION_LEVEL), &power_sample());
+        let m = foil_measurement(
+            &setup,
+            (rounded(&counts.0), rounded(&counts.1)),
+            &power_sample(),
+        );
+        for sign in [1.0, -1.0] {
+            let start = power_start([Value::Fitted(0.5); 2], sign);
+            let (calibrated, fit) =
+                PulseCalibration::new(&m, &start, foil_provenance()).expect("calibration");
+            let text = calibrated.to_json();
+            let read = PulseCalibration::from_json(&text).expect("file");
+            assert_eq!(read.to_json(), text);
+            let carried = read.calibration().pulse;
+            assert!(carried.prior.is_some());
+            for (carried, fitted) in carried.exponents.iter().zip(fit.exponents) {
+                assert!(
+                    matches!(*carried, Value::Fitted(p) if p == fitted),
+                    "{carried:?}"
+                );
+            }
+            let estimates = power_estimates(&fit);
+            for (i, truth) in power_truth().into_iter().enumerate() {
+                let pull = (estimates[i] - truth) / error_bar(&fit, i);
+                assert!(pull.abs() <= BOUND.sqrt(), "{sign} {i}: {pull}");
+            }
+            for (exponent, truth) in fit.exponents.iter().zip(&POWER_PULSE[6..]) {
+                assert!((exponent - truth).abs() <= 1e-3, "{sign}: {exponent}");
+            }
+        }
+    }
+
+    #[test]
+    fn exponents_held_at_one_half_move_the_temperature_of_counts_made_with_others() {
+        let setup = power_foil();
+        let counts = expected(&setup, &beam(CALIBRATION_LEVEL), &power_sample());
+        let m = fitted_from(
+            foil_measurement(
+                &setup,
+                (rounded(&counts.0), rounded(&counts.1)),
+                &power_sample(),
+            ),
+            250.0,
+        );
+        let fit =
+            |exponents: [Value; 2]| fit_counts(&m, &power_start(exponents, 1.0)).expect("fit");
+        let (fitted, held) = (fit([Value::Fitted(0.5); 2]), fit([Value::Known(0.5); 2]));
+        assert!(fitted.converged && held.converged);
+        let error = |fit: &CountsFit| fit.temperature() - TEMPERATURE_K;
+        assert!(
+            error(&fitted).abs() <= 0.1 && fitted.deviance <= 1.0,
+            "fitted: {} K, deviance {}",
+            error(&fitted),
+            fitted.deviance
+        );
+        assert!(
+            error(&held) <= -2.0 && held.deviance >= 50.0,
+            "held: {} K, deviance {}",
+            error(&held),
+            held.deviance
+        );
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn calibrated_exponents_have_error_bars_that_are_their_scatter() {
+        let setup = power_foil();
+        let expected = expected(&setup, &beam(CALIBRATION_LEVEL), &power_sample());
+        let fits: Vec<CountsFit> = (0..200_u64)
+            .into_par_iter()
+            .map(|seed| {
+                let counts = draws(&expected, 90_000 + seed, [1.0; 2]);
+                let mut m = foil_measurement(&setup, counts, &power_sample());
+                let mut rng = ChaCha12Rng::seed_from_u64(2_090_000 + seed);
+                let mut drawn = |measured: &mut Value| {
+                    let Value::Measured { value, sd } = measured else {
+                        panic!("{measured:?} is not measured");
+                    };
+                    *value = Normal::new(*value, *sd).expect("sd").sample(&mut rng);
+                };
+                drawn(&mut m.material_mut().isotopes[0].1);
+                drawn(&mut m.material_mut().temperature_k);
+                let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
+                fit_counts(&m, &power_start([Value::Fitted(0.5); 2], sign)).expect("fit")
+            })
+            .filter(|fit| fit.converged && !fit.on_bound.contains(&true))
+            .collect();
+        assert!(
+            fits.len() >= 198,
+            "{} converged off their bounds",
+            fits.len()
+        );
+        let centred = super::error_bar_pulls::Z / (fits.len() as f64).sqrt();
+        for (i, truth) in power_truth().into_iter().enumerate() {
+            let pulls: Vec<f64> = fits
+                .iter()
+                .map(|fit| (power_estimates(fit)[i] - truth) / error_bar(fit, i))
+                .collect();
+            let (mean, sd) = super::error_bar_pulls::moments(&pulls);
+            let covered =
+                pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / pulls.len() as f64;
+            assert!(
+                mean.abs() <= centred
+                    && (0.85..=1.15).contains(&sd)
+                    && (0.58..=0.78).contains(&covered),
+                "{i}: mean {mean} within {centred}, sd {sd}, within one sd {covered}"
+            );
+        }
     }
 }
 

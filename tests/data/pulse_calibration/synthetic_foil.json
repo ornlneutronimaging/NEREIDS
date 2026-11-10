@@ -1,10 +1,10 @@
 {
-  "format_version": 5,
-  "pulse_model": "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, E in eV, a storage fraction R, constant or linear in √E to R_high across the energy span, folded with the proton pulse's triangle of FWHM h and, when present, a detector tail of fraction f and decay τ_D",
+  "format_version": 6,
+  "pulse_model": "Ikeda–Carpenter pulse with α = α₀·E^p_α + α₁ and β = β₀·E^p_β + β₁ in 1/µs, E in eV, a storage fraction R, constant or linear in √E to R_high across the energy span, folded with the proton pulse's triangle of FWHM h and, when present, a detector tail of fraction f and decay τ_D",
   "numbers": [
     {
       "name": "alpha0",
-      "unit": "1/(µs·√eV)",
+      "unit": "1/(µs·eV^alpha_exponent)",
       "value": 0.4999927878757253,
       "status": "fitted"
     },
@@ -16,7 +16,7 @@
     },
     {
       "name": "beta0",
-      "unit": "1/(µs·√eV)",
+      "unit": "1/(µs·eV^beta_exponent)",
       "value": 0.07999972236359487,
       "status": "fitted"
     },
@@ -55,6 +55,18 @@
       "unit": "µs",
       "value": 0.0,
       "status": "absent"
+    },
+    {
+      "name": "alpha_exponent",
+      "unit": "1",
+      "value": 0.5,
+      "status": "known"
+    },
+    {
+      "name": "beta_exponent",
+      "unit": "1",
+      "value": 0.5,
+      "status": "known"
     }
   ],
   "mean": [
