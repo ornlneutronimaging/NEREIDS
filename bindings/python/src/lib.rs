@@ -31,7 +31,7 @@ use nereids_pipeline::counts_fit::{
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, PatchCovariances};
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{Calibration, Pulse};
-use nereids_pipeline::pulse_calibration::PulseCalibration;
+use nereids_pipeline::pulse_calibration::{Provenance, PulseCalibration};
 
 /// Python wrapper for ENDF resonance data.
 ///
@@ -4960,6 +4960,77 @@ fn fit_map(
     .map_err(counts_error)
 }
 
+/// Write text at path through a sibling file, so a failed write leaves a
+/// file already at path as it was.
+fn replace_file(path: &str, text: &str) -> std::io::Result<()> {
+    let partial = format!("{path}.partial");
+    std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&partial);
+        })
+}
+
+/// Calibrate the pulse on a foil's counts and write its pulse calibration
+/// file at path; returns the foil's fit.
+///
+/// The measurement is the foil alone in one region, each density and the
+/// temperature measured. foil, open_run and sample_run name the foil and its
+/// two runs.
+///
+/// Raises:
+///     ValueError: a foil, calibration or fit a pulse calibration refuses.
+///     OSError: the file cannot be written.
+#[pyfunction]
+fn calibrate_pulse(
+    py: Python<'_>,
+    measurement: PyRef<'_, PyMeasurement>,
+    calibration: PyRef<'_, PyCalibration>,
+    path: &str,
+    foil: String,
+    open_run: String,
+    sample_run: String,
+) -> PyResult<PyCountsFit> {
+    let measurement = measurement.inner.clone();
+    let calibration = calibration.inner.clone();
+    let provenance = Provenance {
+        foil,
+        open: open_run,
+        sample: sample_run,
+    };
+    let (calibrated, fit) = py
+        .detach(move || PulseCalibration::new(&measurement, &calibration, provenance))
+        .map_err(counts_error)?;
+    replace_file(path, &calibrated.to_json())?;
+    Ok(PyCountsFit { inner: fit })
+}
+
+/// Record in the pulse calibration file at path its transfer to the foil of
+/// the file at other_path; returns (d², degrees of freedom, p).
+///
+/// The two foils are physically different, calibrated alone, and share no
+/// run but the open-beam run. The file is rewritten only when p is above
+/// 0.01.
+///
+/// Raises:
+///     ValueError: a file that is not a pulse calibration, two calibrations
+///         a transfer refuses, or p at most 0.01.
+///     OSError: a file cannot be read or written.
+#[pyfunction]
+fn record_pulse_transfer(path: &str, other_path: &str) -> PyResult<(f64, usize, f64)> {
+    let read = |path: &str| -> PyResult<PulseCalibration> {
+        PulseCalibration::from_json(&std::fs::read_to_string(path)?).map_err(counts_error)
+    };
+    let (calibration, other) = (read(path)?, read(other_path)?);
+    let agreement = calibration
+        .transfer(&other)
+        .map_err(counts_error)?
+        .agreement();
+    let recorded = calibration.record_transfer(&other).map_err(counts_error)?;
+    replace_file(path, &recorded.to_json())?;
+    Ok((agreement.q, agreement.dof, agreement.p))
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -5034,5 +5105,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_bad_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(fit_counts, m)?)?;
     m.add_function(wrap_pyfunction!(fit_map, m)?)?;
+    m.add_function(wrap_pyfunction!(calibrate_pulse, m)?)?;
+    m.add_function(wrap_pyfunction!(record_pulse_transfer, m)?)?;
     Ok(())
 }

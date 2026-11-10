@@ -1601,3 +1601,25 @@ def fit_map(map: MapMeasurement, calibration: Calibration) -> CountsMap:
     """Fit a material over patches of the map pixels to the raw counts of
     both runs."""
     ...
+
+def calibrate_pulse(
+    measurement: Measurement,
+    calibration: Calibration,
+    path: str,
+    foil: str,
+    open_run: str,
+    sample_run: str,
+) -> CountsFit:
+    """Calibrate the pulse on a foil's counts and write its pulse calibration
+    file at path; returns the foil's fit. The measurement is the foil alone in
+    one region, each density and the temperature measured; foil, open_run and
+    sample_run name the foil and its two runs."""
+    ...
+
+def record_pulse_transfer(path: str, other_path: str) -> tuple[float, int, float]:
+    """Record in the pulse calibration file at path its transfer to the foil
+    of the file at other_path; returns (d2, degrees of freedom, p). The two
+    foils are physically different, calibrated alone, and share no run but the
+    open-beam run. The file is rewritten only when p is above 0.01; at most
+    0.01 raises ValueError."""
+    ...
