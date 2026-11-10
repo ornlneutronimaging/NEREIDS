@@ -5421,6 +5421,49 @@ mod pulse_calibration {
         (calibration, errors)
     }
 
+    #[test]
+    fn a_temperature_fitted_with_every_pulse_number_keeps_its_error_bar() {
+        let mut p = POWER_PULSE;
+        p[5] = 0.35;
+        let setup = Setup {
+            pulse: venus_pulse(&p),
+            ..power_foil()
+        };
+        let counts = with_background(
+            &setup,
+            &beam(CALIBRATION_LEVEL),
+            &power_sample(),
+            TEMPERATURE_K,
+            [0.95, 0.03, 0.01, 0.01],
+        );
+        let mut m = fitted_from(
+            measurement(
+                &setup,
+                (rounded(&counts.0), rounded(&counts.1)),
+                &power_sample(),
+            ),
+            250.0,
+        );
+        m.normalization = Value::Fitted(1.0);
+        m.regions[0].background = padded([Value::Fitted(0.0); 3]);
+        let mut free = calibration_start(&p, 1.0, Some(0.4));
+        free.pulse.exponents = [Value::Fitted(0.5); 2];
+        let held = Calibration {
+            pulse: known(&venus_pulse(&p)),
+            ..free.clone()
+        };
+        let [held, free] = [held, free].map(|calibration| {
+            let fit = fit_counts(&m, &calibration).expect("fit");
+            assert!(fit.converged && !fit.on_bound.contains(&true));
+            assert!((fit.temperature() - TEMPERATURE_K).abs() <= 0.1);
+            error_bar(&fit, 1)
+        });
+        assert!(
+            (1.0..=1.3).contains(&(free / held)),
+            "±{free} K against ±{held} K"
+        );
+    }
+
     // Moderator face 10 cm wide, viewed 13.75° off its centre (Bilheux et al. 2023, Sec. 3).
     const FACE_PATH_SPREAD_M: f64 = 0.024;
     // Ring revolution less the extraction gap (Kustom 2000, Table 1).
