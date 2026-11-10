@@ -177,6 +177,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
     Pulse {
         alpha: coefficients(&params.alpha).map(Value::Known),
         beta: coefficients(&params.beta).map(Value::Known),
+        exponents: [Value::Known(0.5); 2],
         r: Value::Known(coefficients(&params.r)[1]),
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         r_high: None,

@@ -23,8 +23,9 @@ use crate::pulse_calibration::PulsePrior;
 /// grid to be accepted.
 pub const BOUND: f64 = 0.01;
 
-pub(crate) const PULSE_NUMBERS: [&str; 9] =
-    ["α₀", "α₁", "β₀", "β₁", "R", "h²", "R_high", "f", "τ_D"];
+pub(crate) const PULSE_NUMBERS: [&str; 11] = [
+    "α₀", "α₁", "β₀", "β₁", "R", "h²", "R_high", "f", "τ_D", "p_α", "p_β",
+];
 
 const NO_TAIL: [Value; 2] = [Value::Known(0.0), Value::Known(1.0)];
 
@@ -59,6 +60,8 @@ impl Calibration {
             FRACTION,
             FRACTION,
             (DETECTOR_TAIL_DECAY_US, "from 1e-9 to 1e9"),
+            FRACTION,
+            FRACTION,
         ];
         let mut parameters = vec![
             self.t0_us
@@ -78,8 +81,8 @@ impl Calibration {
     }
 }
 
-/// The Ikeda–Carpenter pulse with `α = α₀√E + α₁` and `β = β₀√E + β₁` in
-/// 1/µs, `E` in eV, a storage fraction `R` over `energy_span_ev`, or linear in
+/// The Ikeda–Carpenter pulse with `α = α₀·E^p_α + α₁` and `β = β₀·E^p_β + β₁`
+/// in 1/µs, `E` in eV, a storage fraction `R` over `energy_span_ev`, or linear in
 /// `√E` from `R` at its low end to `R_high` at its high end, the proton
 /// pulse's triangle of FWHM `h` in µs, given by `h²`, in which the counts are
 /// smooth down to `h = 0`, and an optional detector tail.  `α` and `β` must be
@@ -87,10 +90,12 @@ impl Calibration {
 /// 0.
 #[derive(Debug, Clone)]
 pub struct Pulse {
-    /// `[α₀, α₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
+    /// `[α₀, α₁]`, in 1/(µs·eV^p_α) and 1/µs, each 0 or more.
     pub alpha: [Value; 2],
-    /// `[β₀, β₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
+    /// `[β₀, β₁]`, in 1/(µs·eV^p_β) and 1/µs, each 0 or more.
     pub beta: [Value; 2],
+    /// `[p_α, p_β]`, each within 0–1; 1/2 is slowing down in an infinite medium.
+    pub exponents: [Value; 2],
     /// `R`, within 0–1: the storage fraction, at the low end of
     /// `energy_span_ev` when [`Self::r_high`] is given.
     pub r: Value,
@@ -127,10 +132,10 @@ pub struct Pulse {
 }
 
 impl Pulse {
-    /// `[α₀, α₁, β₀, β₁, R, h², R_high, f, τ_D]`, in the order of the fit's
-    /// pulse numbers; `R_high` known 0 and unused without one, and `f` known 0
-    /// without a detector tail.
-    pub(crate) fn numbers(&self) -> [&Value; 9] {
+    /// `[α₀, α₁, β₀, β₁, R, h², R_high, f, τ_D, p_α, p_β]`, in the order of the
+    /// fit's pulse numbers; `R_high` known 0 and unused without one, and `f`
+    /// known 0 without a detector tail.
+    pub(crate) fn numbers(&self) -> [&Value; 11] {
         let [f, decay] = self.detector_tail.as_ref().unwrap_or(&NO_TAIL);
         [
             &self.alpha[0],
@@ -142,6 +147,8 @@ impl Pulse {
             self.r_high.as_ref().unwrap_or(&CONSTANT),
             f,
             decay,
+            &self.exponents[0],
+            &self.exponents[1],
         ]
     }
 
@@ -165,13 +172,15 @@ impl Pulse {
 /// from `R` to `R_high` over `storage_span`, or `R` without it.
 pub(crate) fn laws(numbers: &[f64], storage_span: Option<(f64, f64)>) -> IkedaCarpenterParams {
     IkedaCarpenterParams {
-        alpha: EnergyLaw::SqrtE {
+        alpha: EnergyLaw::PowerE {
             a0: numbers[0],
             a1: numbers[1],
+            exponent: numbers[9],
         },
-        beta: EnergyLaw::SqrtE {
+        beta: EnergyLaw::PowerE {
             a0: numbers[2],
             a1: numbers[3],
+            exponent: numbers[10],
         },
         r: storage_span.map_or(EnergyLaw::Const(numbers[4]), |span_ev| {
             EnergyLaw::SqrtEBetween {

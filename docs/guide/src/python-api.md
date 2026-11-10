@@ -156,14 +156,16 @@ sum(w*exp(-r/s)/(2*pi*s**2)) on a grid of (rows, columns) cells.
 #### Pulse
 
 Pulse(alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev,
-n_tau=600, line_span_ev=None, r_high=None, detector_tail=None): the Ikeda-Carpenter laws
-alpha = alpha0*sqrt(E) + alpha1 and beta = beta0*sqrt(E) + beta1 in
-1/microsecond, the storage fraction R over energy_span_ev (eV), or linear in
+n_tau=600, line_span_ev=None, r_high=None, detector_tail=None, exponents=None): the
+Ikeda-Carpenter laws alpha = alpha0*E^p_alpha + alpha1 and
+beta = beta0*E^p_beta + beta1 in 1/microsecond, the storage fraction R over energy_span_ev (eV), or linear in
 sqrt(E) from R at its low end to r_high at its high end when r_high is given,
 and the proton triangle with fwhm_squared_us2 equal
 to h^2 in microseconds squared. detector_tail is (f, tau_D): the detector
 records a fraction f of the counts late by an exponential delay of mean tau_D
-microseconds; None records none late. Each parameter is a Value so it can be
+microseconds; None records none late. exponents is (p_alpha, p_beta), each
+within 0 to 1; None is a known 1/2, slowing down in an infinite medium. Each
+parameter is a Value so it can be
 held or fitted.
 
 #### Calibration

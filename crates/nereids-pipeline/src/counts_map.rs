@@ -318,6 +318,8 @@ pub struct CountsMap<'a> {
     pub alpha: [f64; 2],
     /// The pulse's `[β₀, β₁]`, each the known or the fitted one.
     pub beta: [f64; 2],
+    /// The pulse's `[p_α, p_β]`, each the known or the fitted one.
+    pub exponents: [f64; 2],
     /// The pulse's `R`: the known one, or the fitted one.
     pub r: f64,
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
@@ -893,6 +895,7 @@ fn fit_map_from<'a>(
             pulse: Pulse {
                 alpha: [known(2), known(3)],
                 beta: [known(4), known(5)],
+                exponents: [known(11), known(12)],
                 r: known(6),
                 fwhm_squared_us2: known(7),
                 r_high: calibration.pulse.r_high.map(|_| known(8)),
@@ -1481,6 +1484,7 @@ fn fit_map_from<'a>(
         flight_path_m: values[t0 + 1],
         alpha: [values[t0 + 2], values[t0 + 3]],
         beta: [values[t0 + 4], values[t0 + 5]],
+        exponents: [values[t0 + 11], values[t0 + 12]],
         r: values[t0 + 6],
         fwhm_squared_us2: values[t0 + 7],
         r_high: calibration.pulse.r_high.map(|_| values[t0 + 8]),

@@ -3842,8 +3842,8 @@ impl PyMeasurement {
     }
 }
 
-/// The Ikeda-Carpenter pulse with alpha = alpha0*sqrt(E) + alpha1 and
-/// beta = beta0*sqrt(E) + beta1 in 1/microsecond, E in eV, a storage fraction
+/// The Ikeda-Carpenter pulse with alpha = alpha0*E^p_alpha + alpha1 and
+/// beta = beta0*E^p_beta + beta1 in 1/microsecond, E in eV, a storage fraction
 /// R over energy_span_ev, or linear in sqrt(E) from R at its low end to r_high
 /// at its high end, the proton pulse's triangle of FWHM h in microseconds,
 /// given by h^2, and an optional detector tail (f, tau_D): the detector
@@ -3860,9 +3860,10 @@ impl PyPulse {
     /// energy_span_ev is (low, high) in eV; n_tau is the number of samples
     /// across the prompt core (at least 8).  line_span_ev gives the (low, high)
     /// energies in eV of a calibration foil's resonances, or None to check
-    /// nothing.  detector_tail is (f, tau_D), or None for no tail.
+    /// nothing.  detector_tail is (f, tau_D), or None for no tail.  exponents
+    /// is (p_alpha, p_beta), each within 0 to 1, or None for a known 1/2.
     #[new]
-    #[pyo3(signature = (alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev, n_tau=600, line_span_ev=None, r_high=None, detector_tail=None))]
+    #[pyo3(signature = (alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev, n_tau=600, line_span_ev=None, r_high=None, detector_tail=None, exponents=None))]
     fn new(
         alpha0: PyValue,
         alpha1: PyValue,
@@ -3875,6 +3876,7 @@ impl PyPulse {
         line_span_ev: Option<(f64, f64)>,
         r_high: Option<PyValue>,
         detector_tail: Option<(PyValue, PyValue)>,
+        exponents: Option<(PyValue, PyValue)>,
     ) -> Self {
         Self {
             inner: Pulse {
@@ -3884,6 +3886,9 @@ impl PyPulse {
                 fwhm_squared_us2: fwhm_squared_us2.inner,
                 r_high: r_high.map(|value| value.inner),
                 detector_tail: detector_tail.map(|(f, decay)| [f.inner, decay.inner]),
+                exponents: exponents.map_or([Value::Known(0.5); 2], |(alpha, beta)| {
+                    [alpha.inner, beta.inner]
+                }),
                 energy_span_ev,
                 n_tau,
                 line_span_ev,
@@ -3898,7 +3903,7 @@ impl PyPulse {
         self.inner.prior.is_some()
     }
 
-    /// [alpha0, alpha1], in 1/(microsecond*sqrt(eV)) and 1/microsecond.
+    /// [alpha0, alpha1], in 1/(microsecond*eV^p_alpha) and 1/microsecond.
     #[getter]
     fn alpha(&self) -> Vec<PyValue> {
         self.inner
@@ -3908,7 +3913,7 @@ impl PyPulse {
             .collect()
     }
 
-    /// [beta0, beta1], in 1/(microsecond*sqrt(eV)) and 1/microsecond.
+    /// [beta0, beta1], in 1/(microsecond*eV^p_beta) and 1/microsecond.
     #[getter]
     fn beta(&self) -> Vec<PyValue> {
         self.inner
@@ -3947,6 +3952,13 @@ impl PyPulse {
         self.inner
             .detector_tail
             .map(|[f, decay]| (PyValue { inner: f }, PyValue { inner: decay }))
+    }
+
+    /// (p_alpha, p_beta).
+    #[getter]
+    fn exponents(&self) -> (PyValue, PyValue) {
+        let [alpha, beta] = self.inner.exponents;
+        (PyValue { inner: alpha }, PyValue { inner: beta })
     }
 
     /// The (low, high) energies in eV the laws hold over.
@@ -4226,6 +4238,12 @@ impl PyCountsFit {
     #[getter]
     fn detector_tail(&self) -> Option<(f64, f64)> {
         self.inner.detector_tail.map(|[f, decay]| (f, decay))
+    }
+
+    /// The pulse's (p_alpha, p_beta).
+    #[getter]
+    fn exponents(&self) -> (f64, f64) {
+        self.inner.exponents.into()
     }
 
     /// The time background's [C, A, tau, D].
@@ -4590,6 +4608,7 @@ struct PyCountsMap {
     fwhm_squared_us2: f64,
     r_high: Option<f64>,
     detector_tail: Option<[f64; 2]>,
+    exponents: [f64; 2],
     shared: Vec<String>,
     shared_covariance: Option<FlatMatrix>,
     measured_pulls: Option<Vec<f64>>,
@@ -4626,6 +4645,7 @@ impl PyCountsMap {
             fwhm_squared_us2: map.fwhm_squared_us2,
             r_high: map.r_high,
             detector_tail: map.detector_tail,
+            exponents: map.exponents,
             shared: map.shared.iter().map(|name| name.to_string()).collect(),
             shared_covariance: map.shared_covariance.clone(),
             measured_pulls: map.measured_pulls.clone(),
@@ -4789,6 +4809,12 @@ impl PyCountsMap {
     #[getter]
     fn detector_tail(&self) -> Option<(f64, f64)> {
         self.detector_tail.map(|[f, decay]| (f, decay))
+    }
+
+    /// The pulse's (p_alpha, p_beta).
+    #[getter]
+    fn exponents(&self) -> (f64, f64) {
+        self.exponents.into()
     }
 
     /// The fitted shared quantities, in order.

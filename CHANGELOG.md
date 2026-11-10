@@ -25,9 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   whose runs carry their live fractions into the pixel and map fits; it does
   not rebin them, and a project holding them is saved linked and needs Load
   runs after reopening.
-- A pulse calibration carries all nine pulse numbers: `r_high` and the
-  detector tail are calibrated like the other six, and its file, format
-  version 5, marks the ones the pulse lacks `absent`.
+- The pulse's moderation rates follow `α = α₀·E^p_α + α₁` and
+  `β = β₀·E^p_β + β₁` with the exponents fitted within 0–1 like the other
+  pulse numbers (`Pulse.exponents`, `CountsFit.exponents`; Python
+  `exponents=`). A known 1/2, the Python default, is the `√E` law of slowing
+  down in an infinite medium; measured moderators give 0.34–0.48 (Hasemi et
+  al. 2015; Yuan et al. 1997).
+- A pulse calibration carries all eleven pulse numbers: `r_high`, the
+  detector tail and the exponents are calibrated like the other six, and its
+  file, format version 6, marks the ones the pulse lacks `absent`.
 - `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission, a
   `fit_counts` temperature fit and a pulse calibration of the foil with a
   lattice with SAMMY at the VENUS bins.

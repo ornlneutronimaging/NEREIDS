@@ -158,6 +158,7 @@ fn calibration(request: &FitRequest) -> Calibration {
         pulse: Pulse {
             alpha: [Value::Known(p.alpha0), Value::Known(p.alpha1)],
             beta: [Value::Known(p.beta0), Value::Known(p.beta1)],
+            exponents: [Value::Known(0.5); 2],
             r: Value::Known(p.r),
             fwhm_squared_us2: Value::Known(p.fwhm_us * p.fwhm_us),
             r_high: None,
