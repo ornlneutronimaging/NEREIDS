@@ -4960,6 +4960,17 @@ fn fit_map(
     .map_err(counts_error)
 }
 
+/// Write text at path through a sibling file, so a failed write leaves a
+/// file already at path as it was.
+fn replace_file(path: &str, text: &str) -> std::io::Result<()> {
+    let partial = format!("{path}.partial");
+    std::fs::write(&partial, text)
+        .and_then(|()| std::fs::rename(&partial, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&partial);
+        })
+}
+
 /// Calibrate the pulse on a foil's counts and write its pulse calibration
 /// file at path; returns the foil's fit.
 ///
@@ -4990,7 +5001,7 @@ fn calibrate_pulse(
     let (calibrated, fit) = py
         .detach(move || PulseCalibration::new(&measurement, &calibration, provenance))
         .map_err(counts_error)?;
-    std::fs::write(path, calibrated.to_json())?;
+    replace_file(path, &calibrated.to_json())?;
     Ok(PyCountsFit { inner: fit })
 }
 
@@ -5016,7 +5027,7 @@ fn record_pulse_transfer(path: &str, other_path: &str) -> PyResult<(f64, usize, 
         .map_err(counts_error)?
         .agreement();
     let recorded = calibration.record_transfer(&other).map_err(counts_error)?;
-    std::fs::write(path, recorded.to_json())?;
+    replace_file(path, &recorded.to_json())?;
     Ok((agreement.q, agreement.dof, agreement.p))
 }
 

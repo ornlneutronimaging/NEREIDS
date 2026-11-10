@@ -960,6 +960,15 @@ class TestCountsApi:
         assert nereids.Calibration.from_pulse_calibration_file(path).pulse.has_prior
         with pytest.raises(ValueError, match="physically different"):
             nereids.record_pulse_transfer(path, path)
+        with pytest.raises(OSError):
+            nereids.calibrate_pulse(
+                measured_foil, start, str(tmp_path / "absent" / "foil.json"), **runs
+            )
+        assert sorted(file.name for file in tmp_path.iterdir()) == [
+            "foil.json",
+            "other-pulse.json",
+            "same-pulse.json",
+        ]
 
     def test_a_resonance_covariance_reaches_the_material(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
