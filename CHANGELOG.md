@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   whose runs carry their live fractions into the pixel and map fits; it does
   not rebin them, and a project holding them is saved linked and needs Load
   runs after reopening.
+- A pulse calibration carries all nine pulse numbers: `r_high` and the
+  detector tail are calibrated like the other six, and its file, format
+  version 5, marks the ones the pulse lacks `absent`.
 - `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission, a
   `fit_counts` temperature fit and a pulse calibration of the foil with a
   lattice with SAMMY at the VENUS bins.
@@ -80,18 +83,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The pulse's storage fraction can change with energy. `Pulse` gains `r_high`,
   the storage fraction at the high end of `energy_span_ev`, linear in
   `sqrt(E)` from `r` at its low end; `None`, the default, holds it at `r`.
-  `fit_counts` and `fit_map` can fit it; results report `r_high`. A pulse
-  calibration refuses it.
+  `fit_counts` and `fit_map` can fit it; results report `r_high`.
 - `Pulse` gains `detector_tail`, `(f, tau_D)`: the detector records a fraction
   `f` of the counts late by an exponential delay of mean `tau_D` µs. `None`,
   the default, records every count at its arrival. `fit_counts` and `fit_map`
-  can fit both; results report `detector_tail`. A pulse calibration refuses a
-  tail.
+  can fit both; results report `detector_tail`.
 - A counts-fit `Material` gains `lattice`, a `PhononSpectrum`: its cross
   sections are broadened by the harmonic lattice and its temperature is the
   thermodynamic one. Python gains `PhononSpectrum` and `Material(lattice=...)`;
   MCP fits accept `fit.debye_temperature_k`. A pulse calibration takes a foil
-  with a lattice, and its file, format version 4, records the foil's phonon
+  with a lattice, and its file records the foil's phonon
   spectrum, or null for the free gas.
 - `lattice_doppler::broaden_in_lattice` Doppler-broadens a cross section by
   nuclei bound in a harmonic crystal (Lamb's model), from a `PhononSpectrum`
