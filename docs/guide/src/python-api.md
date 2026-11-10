@@ -184,6 +184,13 @@ fit. foil, open_run and sample_run name the foil and its two runs. A foil
 whose density or temperature is not measured, a fit that does not converge and
 a pulse number the counts do not determine are refused.
 
+record_pulse_transfer(path, other_path) tests whether the pulse of the file at
+path agrees with that of a second, physically different foil calibrated alone,
+which shares no run with it but the open-beam run. It returns d², its degrees
+of freedom and p over the pulse numbers both foils fitted. With p above 0.01
+the file at path is rewritten with the transfer recorded; otherwise ValueError
+is raised and the file is left as it was.
+
 #### RegionFit and CountsFit
 
 RegionFit.densities are the fitted areal densities in atoms/barn,

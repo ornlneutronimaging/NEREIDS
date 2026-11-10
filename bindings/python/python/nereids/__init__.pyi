@@ -1615,3 +1615,11 @@ def calibrate_pulse(
     one region, each density and the temperature measured; foil, open_run and
     sample_run name the foil and its two runs."""
     ...
+
+def record_pulse_transfer(path: str, other_path: str) -> tuple[float, int, float]:
+    """Record in the pulse calibration file at path its transfer to the foil
+    of the file at other_path; returns (d2, degrees of freedom, p). The two
+    foils are physically different, calibrated alone, and share no run but the
+    open-beam run. The file is rewritten only when p is above 0.01; at most
+    0.01 raises ValueError."""
+    ...

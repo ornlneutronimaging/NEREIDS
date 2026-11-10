@@ -4,6 +4,7 @@ All tests use synthetic data built with ``nereids.create_resonance_data()``
 so no network access or ENDF downloads are required.
 """
 
+import json
 import math
 import os
 import tempfile
@@ -919,17 +920,46 @@ class TestCountsApi:
         fit = nereids.calibrate_pulse(measured_foil, start, path, **runs)
         assert fit.converged
         assert fit.alpha[0] == pytest.approx(0.5, rel=0.02)
-        calibration = nereids.Calibration.from_pulse_calibration_file(path)
-        assert calibration.pulse.has_prior
-        assert calibration.pulse.alpha[0].kind == "fitted"
-        assert calibration.pulse.alpha[0].value == fit.alpha[0]
-        assert calibration.pulse.alpha[1].kind == "known"
+        read = nereids.Calibration.from_pulse_calibration_file(path)
+        assert read.pulse.has_prior
+        assert read.pulse.alpha[0].kind == "fitted"
+        assert read.pulse.alpha[0].value == fit.alpha[0]
+        assert read.pulse.alpha[1].kind == "known"
         unmeasured = foil(counts, measured(5e-4, 5e-6), nereids.Value.fitted(300.0))
         with pytest.raises(ValueError, match="temperature"):
             nereids.calibrate_pulse(
                 unmeasured, start, str(tmp_path / "refused.json"), **runs
             )
         assert not (tmp_path / "refused.json").exists()
+
+        def second(alpha0, name):
+            other = nereids.fit_counts(
+                foil(np.full(110, 1.0e6), known(5e-4), known(300.0)),
+                calibration(known(alpha0)),
+            )
+            counts = np.round(np.asarray(other.regions[0].predicted_sample))
+            file = str(tmp_path / name)
+            nereids.calibrate_pulse(
+                foil(counts, measured(5e-4, 5e-6), measured(300.0, 5.0)),
+                start,
+                file,
+                foil="foil-b",
+                open_run="run-1",
+                sample_run="run-3",
+            )
+            return file
+
+        unchecked = open(path).read()
+        assert json.loads(unchecked)["transfer"] == "unchecked"
+        with pytest.raises(ValueError, match="does not transfer"):
+            nereids.record_pulse_transfer(path, second(0.7, "other-pulse.json"))
+        assert open(path).read() == unchecked
+        d2, dof, p = nereids.record_pulse_transfer(path, second(0.5, "same-pulse.json"))
+        assert (dof, p > 0.01) == (1, True) and d2 >= 0.0
+        assert json.loads(open(path).read())["transfer"]["p"] == p
+        assert nereids.Calibration.from_pulse_calibration_file(path).pulse.has_prior
+        with pytest.raises(ValueError, match="physically different"):
+            nereids.record_pulse_transfer(path, path)
 
     def test_a_resonance_covariance_reaches_the_material(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
