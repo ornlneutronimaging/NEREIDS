@@ -514,7 +514,8 @@ impl PulseCalibration {
     /// [`PipelineError::InvalidParameter`] if `text` is not such a file: not
     /// format version 5 of this pulse model, a field missing or unknown, the
     /// pulse numbers' names or units not in their order, a number absent
-    /// other than `R_high` or both of the tail's, the mean, the
+    /// other than `R_high` or both of the tail's or absent with a value
+    /// other than 0, the mean, the
     /// covariance or the rank not over the fitted numbers, the line span
     /// missing while a pulse number
     /// was fitted, present when none was, or not `low ≤ high` within the
@@ -564,6 +565,12 @@ impl PulseCalibration {
         if (0..6).any(absent) || absent(7) != absent(8) {
             return invalid(format!(
                 "only R_high or both of the detector tail's numbers are absent; got {status:?}"
+            ));
+        }
+        if let Some(n) = (6..9).find(|&n| absent(n) && numbers[n] != 0.0) {
+            return invalid(format!(
+                "an absent pulse number has the value 0; got {} for {}",
+                numbers[n], NUMBERS[n].0
             ));
         }
         let covered: Vec<usize> = (0..9).filter(|&n| status[n] == Status::Fitted).collect();
@@ -1286,9 +1293,10 @@ mod tests {
     #[test]
     fn files_that_are_not_such_a_calibration_are_refused() {
         let original: serde_json::Value = serde_json::from_str(&file()).unwrap();
-        let edits: [Edit; 26] = [
+        let edits: [Edit; 27] = [
             ("version", |v| v["format_version"] = 1.into()),
             ("absent", |v| v["numbers"][4]["status"] = "absent".into()),
+            ("absent value", |v| v["numbers"][6]["value"] = 0.5.into()),
             ("half a tail", |v| {
                 v["numbers"][8]["status"] = "known".into()
             }),
