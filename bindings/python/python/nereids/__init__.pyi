@@ -1256,6 +1256,22 @@ class Spread:
     @property
     def kernel(self) -> list[tuple[float, float]]: ...
 
+class EnvironmentScatter:
+    """Neutrons the sample environment scatters evenly over the detector.
+
+    fraction is s; open_mean and sample_mean are the detector's mean arriving
+    counts per pixel in each bin of the open-beam run and of the sample run.
+    """
+
+    def __init__(
+        self,
+        fraction: Value,
+        open_mean: list[float],
+        sample_mean: list[float],
+    ) -> None: ...
+    @property
+    def fraction(self) -> Value: ...
+
 class Measurement:
     """An open-beam run and a sample run recorded in the same time bins.
 
@@ -1264,7 +1280,7 @@ class Measurement:
     sample run normalization a.  time_background is [C, A, tau], [C, A, tau, D]
     (D the rise over the edges' span; a fitted D needs tau known or within an
     upper bound of half the span) or NO_TIME_BACKGROUND; room_background is a RoomBackground or None; spread
-    is a Spread or None.
+    is a Spread or None; environment_scatter is an EnvironmentScatter or None.
     """
 
     def __init__(
@@ -1276,6 +1292,7 @@ class Measurement:
         time_background: list[Value] | None = None,
         room_background: RoomBackground | None = None,
         spread: Spread | None = None,
+        environment_scatter: EnvironmentScatter | None = None,
     ) -> None: ...
     @property
     def time_edges_us(self) -> NDArray[np.float64]: ...
@@ -1289,6 +1306,8 @@ class Measurement:
     def room_background(self) -> RoomBackground | None: ...
     @property
     def spread(self) -> Spread | None: ...
+    @property
+    def environment_scatter(self) -> EnvironmentScatter | None: ...
     @property
     def regions(self) -> list[Region]: ...
 
@@ -1422,6 +1441,8 @@ class CountsFit:
     def room_background(self) -> float: ...
     @property
     def spread_share(self) -> float: ...
+    @property
+    def scatter_fraction(self) -> float: ...
     @property
     def covariance(self) -> NDArray[np.float64] | None: ...
     @property

@@ -25,8 +25,8 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::counts_fit::{
-    CountsFit, ExcludedRange, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit,
-    RoomBackground, Spread, Value,
+    CountsFit, EnvironmentScatter, ExcludedRange, Material, Measurement, NO_TIME_BACKGROUND,
+    Region, RegionFit, RoomBackground, Spread, Value,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, PatchCovariances};
 use nereids_pipeline::error::PipelineError;
@@ -3757,6 +3757,35 @@ impl PySpread {
     }
 }
 
+/// Neutrons the sample environment scatters evenly over the detector: the
+/// fraction s and the detector's mean arriving counts per pixel in each bin.
+#[pyclass(name = "EnvironmentScatter", from_py_object)]
+#[derive(Clone)]
+struct PyEnvironmentScatter {
+    inner: EnvironmentScatter,
+}
+
+#[pymethods]
+impl PyEnvironmentScatter {
+    #[new]
+    fn new(fraction: PyValue, open_mean: Vec<f64>, sample_mean: Vec<f64>) -> Self {
+        Self {
+            inner: EnvironmentScatter {
+                fraction: fraction.inner,
+                detector_mean: [open_mean, sample_mean],
+            },
+        }
+    }
+
+    /// The fraction s scattered over the detector.
+    #[getter]
+    fn fraction(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.fraction,
+        }
+    }
+}
+
 /// An open-beam run and a sample run recorded in the same time bins, read in
 /// one or more regions of the detector.
 #[pyclass(name = "Measurement", from_py_object)]
@@ -3770,7 +3799,7 @@ impl PyMeasurement {
     /// time_edges_us are the time-bin edges in microseconds; charge_ratio is
     /// the sample run's proton charge over the open-beam run's.
     #[new]
-    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None, room_background=None, spread=None))]
+    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None, room_background=None, spread=None, environment_scatter=None))]
     fn new(
         time_edges_us: Vec<f64>,
         charge_ratio: f64,
@@ -3779,6 +3808,7 @@ impl PyMeasurement {
         time_background: Option<Vec<PyValue>>,
         room_background: Option<PyRoomBackground>,
         spread: Option<PySpread>,
+        environment_scatter: Option<PyEnvironmentScatter>,
     ) -> PyResult<Self> {
         let time_background = match time_background {
             Some(values) => time_terms(values)?,
@@ -3792,6 +3822,7 @@ impl PyMeasurement {
                 time_background,
                 room_background: room_background.map(|room| room.inner),
                 spread: spread.map(|spread| spread.inner),
+                environment_scatter: environment_scatter.map(|scatter| scatter.inner),
                 regions: regions.into_iter().map(|region| region.inner).collect(),
             },
         })
@@ -3839,6 +3870,13 @@ impl PyMeasurement {
     #[getter]
     fn spread(&self) -> Option<PySpread> {
         self.inner.spread.clone().map(|inner| PySpread { inner })
+    }
+
+    /// The environment scatter, or None.
+    #[getter]
+    fn environment_scatter(&self) -> Option<PyEnvironmentScatter> {
+        let scatter = self.inner.environment_scatter.clone();
+        scatter.map(|inner| PyEnvironmentScatter { inner })
     }
 
     /// The regions, in the order given.
@@ -4291,6 +4329,12 @@ impl PyCountsFit {
     #[getter]
     fn spread_share(&self) -> f64 {
         self.inner.spread_share
+    }
+
+    /// The environment scatter's fraction s, 0 without one.
+    #[getter]
+    fn scatter_fraction(&self) -> f64 {
+        self.inner.scatter_fraction
     }
 
     /// Covariance of the fitted quantities, or None when the fit did not
@@ -5079,6 +5123,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRegion>()?;
     m.add_class::<PyRoomBackground>()?;
     m.add_class::<PySpread>()?;
+    m.add_class::<PyEnvironmentScatter>()?;
     m.add_class::<PyMeasurement>()?;
     m.add_class::<PyPulse>()?;
     m.add_class::<PyCalibration>()?;

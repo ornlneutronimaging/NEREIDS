@@ -56,6 +56,7 @@ time-bin edges (microseconds), not an energy grid.
 | Region | Both runs' counts for one set of pixels, its background [b0, b1, b2, d, f], its area in pixels, the gamma transmission, and the material. |
 | RoomBackground | Counts per microsecond per pixel per frame that follow each run's duration, and each run's frames. |
 | Spread | The share of each detector cell's counts recorded elsewhere, the spread kernel, and each region's cells. |
+| EnvironmentScatter | The fraction of the neutrons the sample environment scatters evenly over the detector, and the detector's mean counts per pixel in each bin of each run. |
 | Measurement | The time-bin edges, charge ratio, normalization, time and room backgrounds and regions of one fit. |
 | Pulse | Ikeda-Carpenter pulse parameters and the energy span they hold over. |
 | Calibration | Timing offset t0 (microseconds), flight path (m), and Pulse. |
@@ -144,7 +145,7 @@ spread needs every region's dt known and the same.
 #### Measurement
 
 Measurement(time_edges_us, charge_ratio, normalization, regions,
-time_background=None, room_background=None, spread=None) holds one open-beam/sample run
+time_background=None, room_background=None, spread=None, environment_scatter=None) holds one open-beam/sample run
 pair. time_edges_us are the shared time-bin edges in microseconds (length =
 bins + 1), charge_ratio is the sample run's proton charge over the open-beam
 run's, and normalization is the sample run's normalization a. time_background
@@ -159,6 +160,14 @@ Spread(share, kernel, grid, cells) or None: region r records
 F_rq the share of region q's spread counts recorded in region r's cells, for
 the kernel's (weight, length in cells) terms
 sum(w*exp(-r/s)/(2*pi*s**2)) on a grid of (rows, columns) cells.
+environment_scatter is EnvironmentScatter(fraction, open_mean, sample_mean) or
+None: in each bin of each run a region of P pixels records
+(1 - s)*mu + s*P*m of the counts mu arriving in it, s the fraction and m the
+run's mean in that bin. Compute each mean as the run's counts over the live
+fraction, averaged over every good pixel of the detector; the fit takes the
+means as exact. A region of open pixels in the same Measurement measures s
+when the sample darkens enough of the detector. A spread and an environment
+scatter together are refused.
 
 #### Pulse
 

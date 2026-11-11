@@ -589,6 +589,7 @@ pub fn fit_map<'a>(
         time_background: map.time_background,
         room_background: map.room_background,
         spread: None,
+        environment_scatter: None,
         regions: Vec::new(),
     })?;
     let bins = starts_and_widths_us(&map.time_edges_us);
@@ -770,6 +771,7 @@ fn fit_map_from<'a>(
         time_background,
         room_background,
         spread: None,
+        environment_scatter: None,
         regions,
     };
 

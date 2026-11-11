@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   flight path and pulse; `RegionFit.excluded_bins` lists them, and the pulse
   calibration file records the ranges. Nothing is left out unless stated.
   Python: `Material(excluded_ranges=[(low_ev, high_ev, reason)])`.
+- `EnvironmentScatter` on `Measurement::environment_scatter` gives the counts
+  fit the fraction `s` of the neutrons that a sample environment, such as a
+  furnace, scatters evenly over the detector: in each bin of each run a region
+  of `P` pixels records `(1 − s)·μ + s·P·m` of its arriving counts `μ`, `m` the
+  run's mean arriving counts per detector pixel, given as data. The scatter
+  fills the resonance dips of the sample run, and an open-beam run with the
+  environment in place does not cancel it. A region of open pixels in the same
+  fit fixes `s`, which `CountsFit::scatter_fraction` returns. It is refused
+  with a `Spread`. Python has `EnvironmentScatter` and
+  `Measurement(environment_scatter=...)`.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
   sample_run)` calibrates the pulse on a foil of measured density and
   temperature and writes the pulse calibration file that
