@@ -1198,8 +1198,8 @@ pub(crate) fn excluded_bins(
         .flat_map(|m| &m.excluded_ranges)
         .flat_map(|range| {
             let (low, high) = range.energy_ev;
-            // The arrivals fill the interval between their extrema.  The pieces halve until
-            // their bounds and the arrivals at their ends leave out the same bins.
+            // The arrivals fill the interval between their extrema.  The pieces halve until their
+            // bounds and end arrivals agree on the bins; at the limit the bounds decide.
             let mut pieces = 1;
             loop {
                 let knot = |i: u32| low + (high - low) * f64::from(i) / f64::from(pieces);
