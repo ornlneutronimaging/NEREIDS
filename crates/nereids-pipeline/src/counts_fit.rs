@@ -243,9 +243,9 @@ pub struct Region {
 
 /// An energy range a fit leaves out of a material's sample run.
 ///
-/// The fit leaves out the sample run's bins that overlap the span between the
-/// mean arrival times of neutrons of the range's two energies, at the fitted
-/// clock offsets, flight path and pulse.
+/// The fit leaves out the sample run's bins that the mean arrival time of a
+/// neutron of an energy in the range can fall in, at the fitted clock offsets,
+/// flight path and pulse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExcludedRange {
@@ -1160,27 +1160,28 @@ pub(crate) fn excluded_bins(
     storage_span: Option<(f64, f64)>,
 ) -> Vec<usize> {
     let laws = laws(&numbers[2..], storage_span);
-    let arrival_us = |energy: f64| {
-        numbers[0]
-            + TOF_FACTOR * numbers[1] / energy.sqrt()
-            + 3.0 / laws.alpha.eval(energy)
-            + laws.r.eval(energy) / laws.beta.eval(energy)
-            + laws
-                .detector_tail
-                .map_or(0.0, |tail| tail.fraction * tail.decay_us)
+    let tail = laws
+        .detector_tail
+        .map_or(0.0, |tail| tail.fraction * tail.decay_us);
+    // Each term of the mean arrival time is monotonic in the energy, so its values at a
+    // range's ends bound it inside the range, and the sums of the bounds hold every arrival.
+    let span_us = |(low, high): (f64, f64)| {
+        let ends = |f: &dyn Fn(f64) -> f64| {
+            let (a, b) = (f(low), f(high));
+            (a.min(b), a.max(b))
+        };
+        let rise = ends(&|e| 3.0 / laws.alpha.eval(e));
+        let (r, beta) = (ends(&|e| laws.r.eval(e)), ends(&|e| laws.beta.eval(e)));
+        let flight = |e: f64| numbers[0] + TOF_FACTOR * numbers[1] / e.sqrt() + tail;
+        (
+            flight(high) + rise.0 + (r.0 / beta.0).min(r.0 / beta.1),
+            flight(low) + rise.1 + (r.1 / beta.0).max(r.1 / beta.1),
+        )
     };
     let spans: Vec<(f64, f64)> = material
         .into_iter()
         .flat_map(|m| &m.excluded_ranges)
-        .map(|range| {
-            let (low, high) = range.energy_ev;
-            // A storage fraction that rises with energy can bend the arrival time inside the range.
-            (0..=8)
-                .map(|i| arrival_us(low + (high - low) * f64::from(i) / 8.0))
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(first, last), t| {
-                    (first.min(t), last.max(t))
-                })
-        })
+        .map(|range| span_us(range.energy_ev))
         .collect();
     (0..time_edges_us.len() - 1)
         .filter(|&k| {
@@ -4713,11 +4714,12 @@ mod tests {
 
     #[test]
     fn a_range_leaves_out_every_bin_its_energies_arrive_in() {
-        let edges: Vec<f64> = (500..=560).map(f64::from).collect();
-        // R rises from 0 to 1 over 13-15 eV, so 14.2 eV arrives after 13.6 eV.
-        let numbers = [
-            0.0, 25.0, 0.0, 0.5, 0.0, 0.01, 0.0, 0.0, 1.0, 0.0, 1.0, 0.5, 0.5,
-        ];
+        // R rises from 0 to 1 over 13-15 eV, so 14.2 eV can arrive after 13.6 eV.
+        let pulse = |beta: f64| {
+            [
+                0.0, 25.0, 0.0, 0.5, 0.0, beta, 0.0, 0.0, 1.0, 0.0, 1.0, 0.5, 0.5,
+            ]
+        };
         let material = Material {
             covariances: Vec::new(),
             isotopes: vec![(
@@ -4733,14 +4735,12 @@ mod tests {
             thickness_variance: Value::Known(0.0),
             lattice: None,
         };
-        let bins = excluded_bins(&edges, Some(&material), &numbers, Some((13.0, 15.0)));
-        assert_eq!(bins, (26..=46).collect::<Vec<usize>>());
-        // With this β the arrival time has its minimum inside the range, in bin 3.
-        let bent = [
-            0.0, 25.0, 0.0, 0.5, 0.0, 0.0287, 0.0, 0.0, 1.0, 0.0, 1.0, 0.5, 0.5,
-        ];
-        let fine: Vec<f64> = (0..=12).map(|k| 506.6 + 0.05 * f64::from(k)).collect();
-        let bins = excluded_bins(&fine, Some(&material), &bent, Some((13.0, 15.0)));
-        assert_eq!(bins, [3, 4, 5]);
+        let bins = |edges: &[f64], beta: f64| {
+            excluded_bins(edges, Some(&material), &pulse(beta), Some((13.0, 15.0)))
+        };
+        // With this β the arrival time has its minimum, 506.785921 µs, inside the range.
+        assert_eq!(bins(&[506.784921, 506.786155], 0.0287), [0]);
+        let edges: Vec<f64> = (500..=560).map(f64::from).collect();
+        assert_eq!(bins(&edges, 0.01), (16..=56).collect::<Vec<usize>>());
     }
 }
