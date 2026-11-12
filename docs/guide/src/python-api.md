@@ -88,7 +88,7 @@ Doppler width Delta gives the lattice's variance Delta**2/2.
 #### Material
 
 Material(isotopes, temperature_k, library="endf8.1", thickness_variance=None,
-lattice=None, covariances=[]) takes a list of (ResonanceData, Value) pairs, each density in
+lattice=None, covariances=[], excluded_ranges=[]) takes a list of (ResonanceData, Value) pairs, each density in
 atoms/barn, a temperature Value in K, and the relative variance v of the areal
 density over the region's pixels, known 0 by default: the region transmits
 (1 + v*D)**(-1/v), the mean for a Gamma-distributed areal density, D the
@@ -97,7 +97,14 @@ vibrate with: the cross sections are broadened by the harmonic lattice and
 temperature_k is the thermodynamic temperature. None broadens by the free gas,
 for which a solid's temperature is its effective one. covariances pairs an
 index into isotopes with that isotope's ResonanceCovariance, which the fit's
-covariance carries.
+covariance carries. excluded_ranges lists (low eV, high eV, reason) ranges where an
+isotope's evaluated cross section is wrong: the fit leaves out the sample
+run's bins that overlap a range at the fitted t0, flight path and pulse, and
+a pulse calibration file records the ranges. State the evidence as the
+reason; a poor fit is not one. Ta-181 in ENDF/B-VIII.1 has its line at
+13.84 eV where VENUS foils show it at 13.79 eV, so
+excluded_ranges=[(13.6, 14.2, "ENDF/B-VIII.1 line at 13.84 eV, measured at 13.79 eV")]
+leaves it out.
 
 #### ResonanceCovariance
 
@@ -196,8 +203,9 @@ is raised and the file is left as it was.
 RegionFit.densities are the fitted areal densities in atoms/barn,
 temperature_k the temperature in K (None without a material), predicted_open
 and predicted_sample the counts per bin the fit predicts, overdispersion the
-[open-beam, sample] values (None when unmeasured), and timing_offset_us
-the region's timing offset in microseconds.
+[open-beam, sample] values (None when unmeasured), excluded_bins the
+sample bins the material's excluded_ranges leave out, and timing_offset_us the
+region's timing offset in microseconds.
 
 CountsFit.regions holds one RegionFit per region. normalization, t0_us,
 flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high and detector_tail (each
@@ -384,7 +392,7 @@ The measurement is keyed on time-bin edges in microseconds; convert to or from
 an energy axis with tof_to_energy and energy_to_tof when needed. Every Value is
 either held (known) or fitted, so a fit can free or fix each density,
 temperature, background term, normalization, t0, flight path and pulse number
-independently. The material's library controls which sample bins are left out
+independently. The material's excluded_ranges give the sample bins left out
 of the likelihood. A tabulated instrument resolution is not part of this
 engine: the pulse is the moderator model.
 

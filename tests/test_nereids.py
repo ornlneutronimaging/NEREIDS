@@ -989,6 +989,42 @@ class TestCountsApi:
         np.testing.assert_array_equal(carried.covariance, covariance.covariance)
         assert carried.resonances == covariance.resonances
 
+    def test_a_material_states_the_ranges_a_fit_leaves_out(self, u238_data):
+        known = nereids.Value.known
+
+        def fit(excluded_ranges, counts=np.full(110, 1.0e6)):
+            material = nereids.Material(
+                isotopes=[(u238_data, known(5e-4))],
+                temperature_k=known(300.0),
+                excluded_ranges=excluded_ranges,
+            )
+            assert material.excluded_ranges == excluded_ranges
+            measurement = nereids.Measurement(
+                time_edges_us=np.linspace(650.0, 760.0, 111),
+                charge_ratio=1.0,
+                normalization=known(1.0),
+                regions=[
+                    nereids.Region(
+                        open_counts=np.full(110, 1.0e6),
+                        sample_counts=counts,
+                        pixels=1.0,
+                        background=[known(0.0)] * 3,
+                        gamma_transmission=known(1.0),
+                        material=material,
+                    )
+                ],
+            )
+            return nereids.fit_counts(measurement, self._calibration())
+
+        model = fit([])
+        assert model.regions[0].excluded_bins == []
+        counts = np.round(np.asarray(model.regions[0].predicted_sample))
+        stated = [(6.5, 6.9, "evaluated line misplaced")]
+        left_out = fit(stated, counts).regions[0].excluded_bins
+        assert left_out and all(0 <= k < 110 for k in left_out)
+        with pytest.raises(ValueError, match="reason"):
+            fit([(6.5, 6.9, " ")], counts)
+
     def test_value_kinds(self):
         known = nereids.Value.known(2.0)
         assert known.kind == "known" and known.value == 2.0

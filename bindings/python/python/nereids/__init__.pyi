@@ -1146,7 +1146,9 @@ class Material:
     PhononSpectrum the nuclei vibrate with, which makes temperature_k the
     thermodynamic temperature, or None for the free gas; covariances pairs an
     index into isotopes with that isotope's ResonanceCovariance, which the
-    fit's covariance carries."""
+    fit's covariance carries; excluded_ranges lists (low eV, high eV, reason)
+    ranges where an evaluated cross section is wrong, whose sample-run bins the
+    fit leaves out."""
 
     def __init__(
         self,
@@ -1156,7 +1158,10 @@ class Material:
         thickness_variance: Value | None = None,
         lattice: PhononSpectrum | None = None,
         covariances: list[tuple[int, ResonanceCovariance]] = ...,
+        excluded_ranges: list[tuple[float, float, str]] = ...,
     ) -> None: ...
+    @property
+    def excluded_ranges(self) -> list[tuple[float, float, str]]: ...
     @property
     def isotopes(self) -> list[tuple[ResonanceData, Value]]: ...
     @property
@@ -1383,6 +1388,8 @@ class RegionFit:
     def predicted_sample(self) -> NDArray[np.float64]: ...
     @property
     def overdispersion(self) -> list[float | None]: ...
+    @property
+    def excluded_bins(self) -> list[int]: ...
 
 class CountsFit:
     """The fitted quantities of every region and the quantities they share."""

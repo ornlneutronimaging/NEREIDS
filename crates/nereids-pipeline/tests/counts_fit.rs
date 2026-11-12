@@ -15,14 +15,14 @@ use nereids_physics::continuous_doppler::{Channel, SUPPORT_X, broaden_channel};
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{
-    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
+    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_pulse,
 };
 use nereids_physics::lattice_doppler::{PhononSpectrum, broaden_in_lattice};
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
-    CountsFit, Material, Measurement, NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit,
-    RoomBackground, Spread, Value, fit_counts,
+    CountsFit, ExcludedRange, Material, Measurement, NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND,
+    Region, RegionFit, RoomBackground, Spread, Value, fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map, region_live};
 use nereids_pipeline::error::PipelineError;
@@ -279,6 +279,7 @@ fn measurement(
             material: Some(Material {
                 covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
+                excluded_ranges: Vec::new(),
                 isotopes: isotopes
                     .iter()
                     .map(|(d, n)| (d.clone(), Value::Fitted(*n)))
@@ -410,6 +411,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                 material: (r == 0).then(|| Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
+                    excluded_ranges: Vec::new(),
                     isotopes: lines.iter().map(|(d, n)| (d.clone(), sample(*n))).collect(),
                     temperature_k: sample(TEMPERATURE_K),
                     thickness_variance: Value::Known(0.0),
@@ -676,6 +678,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             Some(Material {
                 covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
+                excluded_ranges: Vec::new(),
                 isotopes: vec![(hot, Value::Fitted(0.5 * THIN))],
                 temperature_k: Value::Fitted(1000.0),
                 thickness_variance: Value::Known(0.0),
@@ -692,6 +695,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             Some(Material {
                 covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
+                excluded_ranges: Vec::new(),
                 isotopes: vec![(
                     other,
                     Value::Measured {
@@ -861,6 +865,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         material: Material {
             covariances: Vec::new(),
             library: EndfLibrary::EndfB8_0,
+            excluded_ranges: Vec::new(),
             isotopes: isotopes
                 .iter()
                 .map(|data| (data.clone(), Value::Fitted(THIN)))
@@ -1218,6 +1223,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
     let material = Material {
         covariances: Vec::new(),
         library: EndfLibrary::EndfB8_0,
+        excluded_ranges: Vec::new(),
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
         thickness_variance: Value::Known(0.0),
@@ -1420,6 +1426,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
     let material = Material {
         covariances: Vec::new(),
         library: EndfLibrary::EndfB8_0,
+        excluded_ranges: Vec::new(),
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
         thickness_variance: Value::Known(0.0),
@@ -1956,6 +1963,7 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
                 material: materials[r].map(|n| Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
+                    excluded_ranges: Vec::new(),
                     isotopes: vec![(
                         isotope.clone(),
                         if r == 0 {
@@ -2184,6 +2192,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
         material: Material {
             covariances: Vec::new(),
             library: EndfLibrary::EndfB8_0,
+            excluded_ranges: Vec::new(),
             isotopes: vec![(hafnium_like(20.0), Value::Fitted(THIN))],
             temperature_k: Value::Known(TEMPERATURE_K),
             thickness_variance: Value::Known(0.0),
@@ -2685,7 +2694,6 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     let truth = [(hafnium_like(20.0), 3.0 / 7805.1), (tantalum, 1.5 / 7805.1)];
     let counts = with_background(&setup, &beam(1.0e6), &truth, TEMPERATURE_K, TERMS);
     let mut m = recorded(&setup, counts, &truth);
-    m.material_mut().library = EndfLibrary::EndfB8_1;
     m.material_mut().temperature_k = temperature;
     m.normalization = Value::Fitted(TERMS[0]);
     m.regions[0].background[0] = Value::Fitted(TERMS[1]);
@@ -3565,37 +3573,191 @@ fn a_hot_sample_fitted_from_room_temperature_reads_its_temperature() {
     assert!(overdispersion < 1.1, "{overdispersion}");
 }
 
-fn reaching_13_95_ev(setup: Setup) -> Setup {
+fn misplaced_line() -> Vec<ExcludedRange> {
+    vec![ExcludedRange {
+        energy_ev: (13.6, 14.2),
+        reason: "the evaluation misplaces the line".into(),
+    }]
+}
+
+fn reaching_the_window(setup: Setup) -> Setup {
     Setup {
         edges: (380..=530).map(f64::from).collect(),
         ..setup
     }
 }
 
+fn bins_reached(setup: &Setup, t0_us: f64, flight_path_m: f64) -> Vec<usize> {
+    let laws = setup.pulse.params();
+    let arrival_us = |e: f64| {
+        let (alpha, beta, r) = (laws.alpha.eval(e), laws.beta.eval(e), laws.r.eval(e));
+        let (step, n) = (1e-3, (60e3 / alpha.min(beta)) as usize);
+        let mean_delay: f64 = (0..=n)
+            .map(|i| i as f64 * step * ic_pulse(alpha, beta, r, i as f64 * step))
+            .sum::<f64>()
+            * step;
+        t0_us + TOF_FACTOR * flight_path_m / e.sqrt() + mean_delay
+    };
+    let (first, last) = (arrival_us(14.2), arrival_us(13.6));
+    let edges = &setup.edges;
+    (0..edges.len() - 1)
+        .filter(|&k| edges[k] < last && first < edges[k + 1])
+        .collect()
+}
+
 #[test]
-fn a_misplaced_ta181_line_raises_the_overdispersion_with_every_library() {
-    let setup = reaching_13_95_ev(Setup {
+fn a_spread_leaves_a_left_out_line_out_of_the_regions_it_reaches() {
+    let setup = reaching_the_window(Setup {
+        pulse: venus_pulse(&CALIBRATION_PULSE),
+        ..standard()
+    });
+    let tantalum = synthetic_isotope_multi(73, 181, &[(13.95, 0.003, 0.06), (20.0, 0.01, 0.06)]);
+    let counts = expected(&setup, &beam(1.0e4), &[(tantalum.clone(), THIN)]);
+    let open = expected(&setup, &beam(1.0e4), &[]);
+    let fit = |share| {
+        let mut m = measurement(
+            &setup,
+            (rounded(&counts.0), rounded(&counts.1)),
+            &[(tantalum.clone(), THIN)],
+        );
+        m.material_mut().excluded_ranges = misplaced_line();
+        let mut empty = m.regions[0].clone();
+        empty.material = None;
+        (empty.open_counts, empty.sample_counts) = (rounded(&open.0), rounded(&open.1));
+        m.regions.push(empty);
+        m.spread = Some(Spread {
+            share,
+            kernel: vec![(1.0, 1.0)],
+            grid: [1, 2],
+            cells: vec![vec![[0, 0]], vec![[0, 1]]],
+        });
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let spread = fit(Value::Known(0.02));
+    assert!(!spread.regions[0].excluded_bins.is_empty());
+    assert_eq!(
+        spread.regions[1].excluded_bins,
+        spread.regions[0].excluded_bins
+    );
+    assert!(fit(Value::Known(0.0)).regions[1].excluded_bins.is_empty());
+}
+
+#[test]
+fn a_stated_range_leaves_a_misplaced_line_out_of_the_fit_from_any_start() {
+    let setup = reaching_the_window(Setup {
         pulse: venus_pulse(&CALIBRATION_PULSE),
         ..standard()
     });
     let tantalum = |at| synthetic_isotope_multi(73, 181, &[(at, 0.003, 0.06), (20.0, 0.01, 0.06)]);
     let counts = expected(&setup, &beam(1.0e4), &[(tantalum(13.95), THIN)]);
-    for library in [EndfLibrary::EndfB8_0, EndfLibrary::EndfB8_1] {
+    let fit = |excluded: Vec<ExcludedRange>, t0_us, sample: &[f64]| {
         let model = [(tantalum(13.915), THIN)];
         let mut m = fitted_from(
-            measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &model),
+            measurement(&setup, (rounded(&counts.0), sample.to_vec()), &model),
             280.0,
         );
-        m.material_mut().library = library;
+        m.material_mut().excluded_ranges = excluded;
         let calibration = Calibration {
-            t0_us: Value::Fitted(T0_US),
+            t0_us: Value::Fitted(t0_us),
             ..calibration(&setup)
         };
         let fit = fit_counts(&m, &calibration).expect("fit");
-        assert!(fit.converged, "{library:?}");
-        let overdispersion = fit.regions[0].overdispersion[1].expect("measured");
-        assert!(overdispersion >= 10.0, "{library:?}: {overdispersion}");
+        assert!(fit.converged);
+        fit
+    };
+    let sample = rounded(&counts.1);
+    let left_out = fit(misplaced_line(), T0_US, &sample);
+    let region = &left_out.regions[0];
+    let bins = bins_reached(&setup, left_out.t0_us, left_out.flight_path_m);
+    assert!(!bins.is_empty());
+    assert_eq!(region.excluded_bins, bins);
+    assert_eq!(region.overdispersion[1], Some(1.0));
+    let n = (region.densities[0] - THIN) / error_bar(&left_out, 0);
+    let t = (left_out.temperature() - TEMPERATURE_K) / error_bar(&left_out, 1);
+    assert!(n.abs() <= 1.0 && t.abs() <= 1.0, "{n} sd, {t} sd");
+    let kept = fit(Vec::new(), T0_US, &sample);
+    assert!(kept.regions[0].excluded_bins.is_empty());
+    assert!(kept.regions[0].overdispersion[1].expect("measured") >= 10.0);
+
+    let mut altered = sample.clone();
+    for &k in &bins {
+        altered[k] = 3.0 * altered[k] + 7.0;
     }
+    let refitted = fit(misplaced_line(), T0_US, &altered);
+    let again = &refitted.regions[0];
+    assert_eq!(
+        (&again.densities, again.temperature_k, again.overdispersion),
+        (
+            &region.densities,
+            region.temperature_k,
+            region.overdispersion
+        )
+    );
+    assert_eq!(
+        (refitted.deviance, format!("{:?}", refitted.covariance)),
+        (left_out.deviance, format!("{:?}", left_out.covariance))
+    );
+    for offset in [-2.0, 2.0] {
+        let off = fit(misplaced_line(), T0_US + offset, &sample);
+        assert_eq!(off.regions[0].excluded_bins, bins);
+        let moved = (off.temperature() - left_out.temperature()) / error_bar(&left_out, 1);
+        assert!(moved.abs() <= 0.05, "{offset} µs: {moved} sd");
+    }
+}
+
+#[test]
+fn an_excluded_range_without_ordered_ends_or_a_reason_is_refused() {
+    let setup = reaching_the_window(standard());
+    let line = [(synthetic_isotope(73, 181, 13.9, 0.01, 0.06), THIN)];
+    let counts = expected(&setup, &beam(1.0e4), &line);
+    for (energy_ev, reason) in [
+        ((14.2, 13.6), "misplaced"),
+        ((0.0, 14.2), "misplaced"),
+        ((13.6, 14.2), " "),
+    ] {
+        let mut m = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &line);
+        m.material_mut().excluded_ranges = vec![ExcludedRange {
+            energy_ev,
+            reason: reason.into(),
+        }];
+        assert!(matches!(
+            fit_counts(&m, &calibration(&setup)),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
+}
+
+#[test]
+fn a_black_line_inside_a_stated_range_adds_nothing_and_predicts_no_negative_counts() {
+    let setup = reaching_the_window(Setup {
+        pulse: pulse(0.0, 200.0),
+        ..standard()
+    });
+    let line = synthetic_isotope(73, 181, 13.9, 0.01, 0.06);
+    let black = [(line.clone(), 0.5)];
+    let expected_black = expected(&setup, &beam(1.0e4), &black);
+    let dark = bins_reached(&setup, T0_US, FLIGHT_PATH_M)
+        .into_iter()
+        .find(|&k| expected_black.1[k] < NEGLIGIBLE_PREDICTION)
+        .expect("a dark bin in the window");
+    let mut counts = rounded(&expected_black.1);
+    counts[dark] = 1.0;
+    let mut m = measurement(&setup, (rounded(&expected_black.0), counts), &black);
+    assert!(matches!(
+        fit_counts(&m, &calibration(&setup)),
+        Err(PipelineError::UnmodelledCounts { .. })
+    ));
+    m.material_mut().excluded_ranges = misplaced_line();
+    let fit = fit_counts(&m, &calibration(&setup)).expect("the window holds the dark bin");
+    assert!(fit.regions[0].excluded_bins.contains(&dark));
+
+    let thin = [(line, 0.01)];
+    let counts = draws(&expected(&setup, &beam(1.0e4), &thin), 0, [1.0, 1.0]);
+    let mut drawn = measurement(&setup, counts, &thin);
+    drawn.regions[0].background[0] = Value::Fitted(0.0);
+    drawn.material_mut().excluded_ranges = misplaced_line();
+    let fit = fit_counts(&drawn, &calibration(&setup)).expect("no negative prediction");
+    assert!(!fit.regions[0].excluded_bins.is_empty());
 }
 
 mod error_bar_pulls {
@@ -5591,6 +5753,7 @@ mod maps {
                 material: Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
+                    excluded_ranges: Vec::new(),
                     isotopes: self
                         .isotopes
                         .iter()
@@ -5746,6 +5909,48 @@ mod maps {
         assert!(result.failed[[0, 1]].is_none(), "{:?}", result.failed);
         assert!((0..2).all(|m| result.densities[m][[0, 1]] == 0.0));
         assert!(result.temperature_sd_k[[0, 1]].is_nan());
+    }
+
+    #[test]
+    fn a_map_leaves_out_its_window_bins_at_its_shared_values_and_reaches_the_joint_fit() {
+        let tantalum =
+            |at| synthetic_isotope_multi(73, 181, &[(17.0, 0.01, 0.06), (at, 0.001, 0.06)]);
+        let tiled = tiled_from(
+            reaching_the_window(map_setup()),
+            [
+                tantalum(13.95),
+                synthetic_isotope(74, 182, 24.0, 0.01, 0.06),
+            ],
+            0.05,
+            &[([THIN, THIN], 300.0)],
+            |_, _| 0,
+            (1, 2),
+        );
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
+        map.material.isotopes[0].0 = tantalum(13.915);
+        map.material.excluded_ranges = misplaced_line();
+        let joint = tiled.joint(&map, &tiled.calibration());
+        assert!(joint.converged);
+        map.normalization = Value::Fitted(0.97 * joint.normalization);
+        let result = fit_map(&map, &tiled.calibration()).expect("map");
+        assert!(result.converged, "{:?}", result.unconverged);
+        let bins = bins_reached(&tiled.setup, result.t0_us, result.flight_path_m);
+        assert!(!bins.is_empty());
+        for j in 0..2 {
+            assert_eq!(joint.regions[j].excluded_bins, bins);
+            let patch = result.fits[[0, j]].as_ref().expect("a fit");
+            assert_eq!(patch.excluded_bins, bins);
+        }
+        let sd = joint
+            .covariance
+            .as_ref()
+            .expect("covariance")
+            .get(6, 6)
+            .sqrt();
+        let gap = (result.normalization - joint.normalization) / sd;
+        assert!(gap.abs() <= 0.05, "{gap}");
+        let deviance = result.deviance / joint.deviance - 1.0;
+        assert!(deviance.abs() <= 1e-3, "{deviance}");
     }
 
     #[test]

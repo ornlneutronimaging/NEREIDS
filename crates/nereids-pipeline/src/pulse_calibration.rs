@@ -13,7 +13,9 @@ use nereids_physics::transmission::resonance_center_energies;
 use serde::{Deserialize, Serialize};
 
 use crate::counts_fit::TEMPERATURE_BOUNDS_K;
-use crate::counts_fit::{CountsFit, Material, Measurement, Region, Value, fit_counts, quantities};
+use crate::counts_fit::{
+    CountsFit, ExcludedRange, Material, Measurement, Region, Value, fit_counts, quantities,
+};
 use crate::error::PipelineError;
 use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
 
@@ -141,6 +143,8 @@ struct Foil {
     #[serde(deserialize_with = "Option::deserialize")]
     lattice: Option<Lattice>,
     library: EndfLibrary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    excluded_ranges: Vec<ExcludedRange>,
 }
 
 /// A pulse calibrated on a foil by [`fit_counts`], as its calibration file
@@ -465,7 +469,8 @@ impl PulseCalibration {
     /// covariance and rank; then `t0` and the flight path, the pulse's energy
     /// span and `n_tau`, the line span, the foil's isotopes and temperature
     /// with their stated uncertainties, its phonon spectrum's step and values,
-    /// or null for the free gas, and its library, the foil and run
+    /// or null for the free gas, its library and the energy ranges it left
+    /// out with their reasons, the foil and run
     /// identifiers, the sample run's overdispersion, and the transfer to
     /// another foil: `"unchecked"`, or the other foil and its identifiers, its
     /// sample run's overdispersion, `d2`, `dof` and `p`.
@@ -505,10 +510,12 @@ impl PulseCalibration {
             foil: self.foil.clone(),
             provenance: FileProvenance::from(&self.provenance),
             sample_overdispersion: self.sample_overdispersion,
-            transfer: self.transfer.clone().map_or(
-                FileTransfer::Unchecked(Unchecked::Unchecked),
-                FileTransfer::Checked,
-            ),
+            transfer: self
+                .transfer
+                .clone()
+                .map_or(FileTransfer::Unchecked(Unchecked::Unchecked), |record| {
+                    FileTransfer::Checked(Box::new(record))
+                }),
         };
         serde_json::to_string_pretty(&file).expect("these field types always serialize")
     }
@@ -638,7 +645,7 @@ impl PulseCalibration {
             FileTransfer::Unchecked(_) => None,
             FileTransfer::Checked(record) => {
                 check_record(&record, &provenance, k)?;
-                Some(record)
+                Some(*record)
             }
         };
         let pulse = Self {
@@ -690,7 +697,7 @@ impl Transfer {
 #[serde(untagged)]
 enum FileTransfer {
     Unchecked(Unchecked),
-    Checked(TransferRecord),
+    Checked(Box<TransferRecord>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -872,6 +879,7 @@ fn foil(measurement: &Measurement) -> Result<Foil, PipelineError> {
             density: spectrum.density().to_vec(),
         }),
         library: material.library,
+        excluded_ranges: material.excluded_ranges.clone(),
     })
 }
 
@@ -914,7 +922,9 @@ fn check_foil(foil: &Foil) -> Result<(), PipelineError> {
             PipelineError::InvalidParameter(format!("a calibration foil's lattice has an {e}"))
         })?;
     }
-    Ok(())
+    foil.excluded_ranges
+        .iter()
+        .try_for_each(ExcludedRange::check)
 }
 
 fn lines_in_window<'a>(
@@ -981,6 +991,7 @@ mod tests {
                 material: Some(Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
+                    excluded_ranges: Vec::new(),
                     isotopes: std::iter::once(foil).chain(impurity).collect(),
                     temperature_k: Value::Measured {
                         value: 300.0,
@@ -1053,6 +1064,7 @@ mod tests {
         };
         CountsFit {
             regions: vec![RegionFit {
+                excluded_bins: Vec::new(),
                 densities: vec![2e-3],
                 temperature_k: Some(300.0),
                 thickness_variance: Some(0.0),
@@ -1263,6 +1275,29 @@ mod tests {
     }
 
     #[test]
+    fn a_calibration_file_records_the_ranges_its_foil_left_out() {
+        let mut m = measurement(Some(55.0));
+        material(&mut m).excluded_ranges = vec![ExcludedRange {
+            energy_ev: (13.6, 14.2),
+            reason: "the evaluation misplaces the line".into(),
+        }];
+        let text = calibrated(&m, &calibration(Value::Known(0.01)), fit(8))
+            .unwrap()
+            .to_json();
+        let recorded: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            recorded["foil"]["excluded_ranges"][0],
+            serde_json::json!({
+                "energy_ev": [13.6, 14.2],
+                "reason": "the evaluation misplaces the line"
+            })
+        );
+        let read = PulseCalibration::from_json(&text).unwrap();
+        assert_eq!(read.to_json(), text);
+        assert!(!file().contains("excluded_ranges"));
+    }
+
+    #[test]
     fn a_calibration_reads_back_from_its_file_bit_for_bit() {
         let original = original();
         let text = original.to_json();
@@ -1300,7 +1335,7 @@ mod tests {
     #[test]
     fn files_that_are_not_such_a_calibration_are_refused() {
         let original: serde_json::Value = serde_json::from_str(&file()).unwrap();
-        let edits: [Edit; 27] = [
+        let edits: [Edit; 28] = [
             ("version", |v| v["format_version"] = 1.into()),
             ("absent", |v| v["numbers"][4]["status"] = "absent".into()),
             ("absent value", |v| v["numbers"][6]["value"] = 0.5.into()),
@@ -1344,6 +1379,10 @@ mod tests {
             }),
             ("unknown library", |v| {
                 v["foil"]["library"] = "ENDF/B-IX".into()
+            }),
+            ("excluded range out of order", |v| {
+                v["foil"]["excluded_ranges"] =
+                    serde_json::json!([{"energy_ev": [14.2, 13.6], "reason": "misplaced"}]);
             }),
             ("temperature sd", |v| {
                 v["foil"]["temperature_k"]["sd"] = serde_json::Value::Null;
