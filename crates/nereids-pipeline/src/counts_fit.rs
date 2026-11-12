@@ -1153,6 +1153,9 @@ pub(crate) fn checked<'a>(
     })
 }
 
+/// The most pieces an excluded range is split into to bound its arrival times.
+const MOST_RANGE_PIECES: u32 = 4096;
+
 pub(crate) fn excluded_bins(
     time_edges_us: &[f64],
     material: Option<&Material>,
@@ -1163,33 +1166,59 @@ pub(crate) fn excluded_bins(
     let tail = laws
         .detector_tail
         .map_or(0.0, |tail| tail.fraction * tail.decay_us);
-    // Each term of the mean arrival time is monotonic in the energy, so its values at a
-    // range's ends bound it inside the range, and the sums of the bounds hold every arrival.
-    let span_us = |(low, high): (f64, f64)| {
+    let flight = |e: f64| numbers[0] + TOF_FACTOR * numbers[1] / e.sqrt() + tail;
+    let arrival =
+        |e: f64| flight(e) + 3.0 / laws.alpha.eval(e) + laws.r.eval(e) / laws.beta.eval(e);
+    // Each term of the arrival time is monotonic in the energy, so its values at two
+    // energies bound it between them, and the sums of the bounds hold every arrival.
+    let bound = |low: f64, high: f64| {
         let ends = |f: &dyn Fn(f64) -> f64| {
             let (a, b) = (f(low), f(high));
             (a.min(b), a.max(b))
         };
         let rise = ends(&|e| 3.0 / laws.alpha.eval(e));
         let (r, beta) = (ends(&|e| laws.r.eval(e)), ends(&|e| laws.beta.eval(e)));
-        let flight = |e: f64| numbers[0] + TOF_FACTOR * numbers[1] / e.sqrt() + tail;
         (
             flight(high) + rise.0 + (r.0 / beta.0).min(r.0 / beta.1),
             flight(low) + rise.1 + (r.1 / beta.0).max(r.1 / beta.1),
         )
     };
-    let spans: Vec<(f64, f64)> = material
+    let reached = |(first, last): (f64, f64)| -> Vec<usize> {
+        (0..time_edges_us.len() - 1)
+            .filter(|&k| time_edges_us[k] < last && first < time_edges_us[k + 1])
+            .collect()
+    };
+    let widest = |spans: &mut dyn Iterator<Item = (f64, f64)>| {
+        spans.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), (lo, hi)| {
+            (a.min(lo), b.max(hi))
+        })
+    };
+    let mut bins: Vec<usize> = material
         .into_iter()
         .flat_map(|m| &m.excluded_ranges)
-        .map(|range| span_us(range.energy_ev))
-        .collect();
-    (0..time_edges_us.len() - 1)
-        .filter(|&k| {
-            spans
-                .iter()
-                .any(|&(first, last)| time_edges_us[k] < last && first < time_edges_us[k + 1])
+        .flat_map(|range| {
+            let (low, high) = range.energy_ev;
+            // The arrivals fill the interval between their extrema.  The pieces halve until
+            // their bounds and the arrivals at their ends leave out the same bins.
+            let mut pieces = 1;
+            loop {
+                let knot = |i: u32| low + (high - low) * f64::from(i) / f64::from(pieces);
+                let sampled = widest(&mut (0..=pieces).map(|i| {
+                    let t = arrival(knot(i));
+                    (t, t)
+                }));
+                let bounded = widest(&mut (0..pieces).map(|i| bound(knot(i), knot(i + 1))));
+                let out = reached(bounded);
+                if out == reached(sampled) || pieces == MOST_RANGE_PIECES {
+                    break out;
+                }
+                pieces *= 2;
+            }
         })
-        .collect()
+        .collect();
+    bins.sort_unstable();
+    bins.dedup();
+    bins
 }
 
 type Slopes = (Vec<Vec<f64>>, FlatMatrix);
@@ -4738,9 +4767,10 @@ mod tests {
         let bins = |edges: &[f64], beta: f64| {
             excluded_bins(edges, Some(&material), &pulse(beta), Some((13.0, 15.0)))
         };
+        // Here the energies arrive between 526.877 and 546.501 µs.
+        let edges: Vec<f64> = (500..=560).map(f64::from).collect();
+        assert_eq!(bins(&edges, 0.01), (26..=46).collect::<Vec<usize>>());
         // With this β the arrival time has its minimum, 506.785921 µs, inside the range.
         assert_eq!(bins(&[506.784921, 506.786155], 0.0287), [0]);
-        let edges: Vec<f64> = (500..=560).map(f64::from).collect();
-        assert_eq!(bins(&edges, 0.01), (16..=56).collect::<Vec<usize>>());
     }
 }
