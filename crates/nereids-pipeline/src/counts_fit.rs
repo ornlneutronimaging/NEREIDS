@@ -1173,8 +1173,13 @@ pub(crate) fn excluded_bins(
         .into_iter()
         .flat_map(|m| &m.excluded_ranges)
         .map(|range| {
-            let (a, b) = (arrival_us(range.energy_ev.0), arrival_us(range.energy_ev.1));
-            (a.min(b), a.max(b))
+            let (low, high) = range.energy_ev;
+            // A storage fraction that rises with energy can bend the arrival time inside the range.
+            (0..=8)
+                .map(|i| arrival_us(low + (high - low) * f64::from(i) / 8.0))
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(first, last), t| {
+                    (first.min(t), last.max(t))
+                })
         })
         .collect();
     (0..time_edges_us.len() - 1)
@@ -4707,7 +4712,7 @@ mod tests {
     }
 
     #[test]
-    fn a_range_whose_low_end_arrives_first_still_leaves_its_bins_out() {
+    fn a_range_leaves_out_every_bin_its_energies_arrive_in() {
         let edges: Vec<f64> = (500..=560).map(f64::from).collect();
         // R rises from 0 to 1 over 13-15 eV, so 14.2 eV arrives after 13.6 eV.
         let numbers = [
@@ -4730,5 +4735,12 @@ mod tests {
         };
         let bins = excluded_bins(&edges, Some(&material), &numbers, Some((13.0, 15.0)));
         assert_eq!(bins, (26..=46).collect::<Vec<usize>>());
+        // With this β the arrival time has its minimum inside the range, in bin 3.
+        let bent = [
+            0.0, 25.0, 0.0, 0.5, 0.0, 0.0287, 0.0, 0.0, 1.0, 0.0, 1.0, 0.5, 0.5,
+        ];
+        let fine: Vec<f64> = (0..=12).map(|k| 506.6 + 0.05 * f64::from(k)).collect();
+        let bins = excluded_bins(&fine, Some(&material), &bent, Some((13.0, 15.0)));
+        assert_eq!(bins, [3, 4, 5]);
     }
 }

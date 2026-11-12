@@ -4184,7 +4184,8 @@ impl PyRegionFit {
         self.overdispersion.to_vec()
     }
 
-    /// Indices of the sample run's bins the material's excluded ranges leave out.
+    /// Indices of the sample run's bins the material's excluded ranges leave
+    /// out, with those of every region that spreads counts into it.
     #[getter]
     fn excluded_bins(&self) -> Vec<usize> {
         self.excluded_bins.clone()
