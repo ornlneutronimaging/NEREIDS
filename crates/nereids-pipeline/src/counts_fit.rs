@@ -137,7 +137,9 @@ pub struct Measurement {
     /// at the open-beam run's proton charge that reach the detector without
     /// passing through the moderator pulse, at time `t` of the time edges'
     /// clock, `t₁` the first edge and `W` the edges' span: `C` and `A` 0 or
-    /// more, `τ` in µs positive, `D` the rise over the span, any real number.
+    /// more, `τ` in µs positive and, unless known, at least the first bin's
+    /// width, since far below it only `A·τ` shows in the counts, `D` the rise
+    /// over the span, any real number.
     /// A `D` not known needs `τ` known or within an upper bound of at most
     /// `W/2`. [`NO_TIME_BACKGROUND`] gives none.
     pub time_background: [Value; 4],
@@ -2601,17 +2603,30 @@ fn quantity(
             "within 0–1".into(),
         ),
         Role::TimeBackground(term) => {
-            let (name, low, allowed) = [
-                ("C", 0.0, "0 or more"),
-                ("A", 0.0, "0 or more"),
-                ("τ", f64::MIN_POSITIVE, "positive"),
-                ("D", f64::NEG_INFINITY, "any real number"),
-            ][term];
+            let value = &measurement.time_background[term];
+            let first_bin = match measurement.time_edges_us.as_slice() {
+                [first, second, ..] if second > first => Some(second - first),
+                _ => None,
+            };
+            let (name, low, allowed) = match term {
+                0 => ("C", 0.0, "0 or more".to_string()),
+                1 => ("A", 0.0, "0 or more".to_string()),
+                // Far below the first bin's width only A·τ shows in the counts.
+                2 => match first_bin.filter(|_| !matches!(value, Value::Known(_))) {
+                    Some(width) => (
+                        "τ",
+                        width,
+                        format!("at least the first bin's width of {width} µs"),
+                    ),
+                    None => ("τ", f64::MIN_POSITIVE, "positive".to_string()),
+                },
+                _ => ("D", f64::NEG_INFINITY, "any real number".to_string()),
+            };
             (
-                &measurement.time_background[term],
+                value,
                 format!("time background {name}"),
                 low..=f64::INFINITY,
-                allowed.into(),
+                allowed,
             )
         }
         Role::RoomBackground => (

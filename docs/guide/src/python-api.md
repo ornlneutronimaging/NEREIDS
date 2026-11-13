@@ -151,7 +151,9 @@ bins + 1), charge_ratio is the sample run's proton charge over the open-beam
 run's, and normalization is the sample run's normalization a. time_background
 is [C, A, tau], [C, A, tau, D] or NO_TIME_BACKGROUND: the counts per µs per
 pixel C + D·(t − t₁)/W + A·exp(−(t − t₁)/τ), W the edges' span; a fitted D
-needs tau known or within an upper bound of at most W/2. room_background is
+needs tau known or within an upper bound of at most W/2, and a tau that is not
+known is at least the first bin's width; give a faster decay as known.
+room_background is
 RoomBackground(rate, frames) or None: rate counts per microsecond per pixel
 per frame in both runs, not scaled by the charge ratio, the normalization or
 the gamma transmission, and frames the (open-beam, sample) frames. spread is

@@ -192,6 +192,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A time background's decay time `τ` that is not known is bounded below by the
+  first bin's width, and a start or bound under it is refused. Far below a
+  bin's width only `A·τ` shows in the counts, and a counts fit driven there
+  stopped at `τ` near zero with "no step of the fitter lowers the objective".
+  A decay the bins do not resolve is given as known.
 - NNDC file names pad the mass number to three digits, so ENDF/B-VIII.0 and
   VIII.1 isotopes with A < 100 download from NNDC again instead of only from
   IAEA.

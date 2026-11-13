@@ -2270,6 +2270,41 @@ fn a_region_recording_early_meets_a_decaying_time_background_on_its_own_clock() 
 }
 
 #[test]
+fn a_decay_time_started_ten_times_too_long_is_found() {
+    let setup = standard();
+    let [a, tau] = [3.0e4, 10.0];
+    let sample = [(hafnium_like(20.0), 5.0e-3)];
+    let background = time_background(&setup.edges, [0.0, a, tau, 0.0]);
+    let plus = |counts: &[f64], scale: f64| -> Vec<f64> {
+        let counts = counts.iter().zip(&background);
+        counts.map(|(n, g)| (n + scale * g).round()).collect()
+    };
+    let (open, transmitted) = expected(&setup, &beam(1.0e5), &sample);
+    let runs = (plus(&open, 1.0), plus(&transmitted, CHARGE_RATIO));
+    let mut m = measurement(&setup, runs, &sample);
+    m.normalization = Value::Fitted(1.3);
+    m.time_background = [
+        Value::Known(0.0),
+        Value::Fitted(1.0e3),
+        Value::Fitted(10.0 * tau),
+        Value::Known(0.0),
+    ];
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert_eq!(fit.unconverged, None);
+    let truths = [sample[0].1, 1.0, a, tau];
+    let fitted = [
+        fit.regions[0].densities[0],
+        fit.normalization,
+        fit.time_background[1],
+        fit.time_background[2],
+    ];
+    for (i, (x, t)) in fitted.into_iter().zip(truths).enumerate() {
+        let pull = (x - t) / error_bar(&fit, i);
+        assert!(pull.abs() <= BOUND.sqrt(), "{i}: {x} vs {t}, pull {pull}");
+    }
+}
+
+#[test]
 fn a_crystal_s_temperature_is_read_through_its_lattice() {
     let setup = standard();
     let (isotope, density) = (hafnium_like(20.0), 5.0e-3);
@@ -3216,6 +3251,11 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.normalization = Value::Known(0.0));
     invalid(&|m| m.normalization = Value::Known(f64::INFINITY));
     invalid(&|m| m.regions[0].background[1] = Value::Fitted(f64::NAN));
+    let half_a_bin = 0.5 * (setup.edges[1] - setup.edges[0]);
+    invalid(&|m| {
+        m.time_background[1] = Value::Fitted(1.0e3);
+        m.time_background[2] = Value::Fitted(half_a_bin);
+    });
     for sd in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         invalid(&|m| m.material_mut().temperature_k = Value::Measured { value: 300.0, sd });
     }
