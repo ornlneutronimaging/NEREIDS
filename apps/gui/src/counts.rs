@@ -180,6 +180,7 @@ fn material(request: &FitRequest) -> Material {
             .collect(),
         temperature_k: Value::Known(request.temperature_k),
         library: request.library,
+        excluded_ranges: Vec::new(),
         covariances: Vec::new(),
         thickness_variance: Value::Known(0.0),
         lattice: None,

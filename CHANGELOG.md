@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A counts-fit `Material` gains `excluded_ranges`, a list of `ExcludedRange`: energy
+  ranges where an isotope's evaluated cross section is wrong, each with the
+  evidence as its reason. `fit_counts`, `fit_map` and a pulse calibration
+  leave out the sample run's bins that overlap a range at the fitted `t0`,
+  flight path and pulse; `RegionFit.excluded_bins` lists them, and the pulse
+  calibration file records the ranges. Nothing is left out unless stated.
+  Python: `Material(excluded_ranges=[(low_ev, high_ev, reason)])`.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
   sample_run)` calibrates the pulse on a foil of measured density and
   temperature and writes the pulse calibration file that

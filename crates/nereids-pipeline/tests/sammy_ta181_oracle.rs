@@ -647,6 +647,7 @@ fn foil_alone(
                 temperature_k,
                 thickness_variance: Value::Known(0.0),
                 library: EndfLibrary::EndfB8_1,
+                excluded_ranges: Vec::new(),
                 covariances: Vec::new(),
                 lattice,
             }),

@@ -32,6 +32,7 @@ use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::thickness::{interacting_per_depth, uneven_transmission};
 use nereids_physics::transmission::resonance_center_energies;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
@@ -240,6 +241,33 @@ pub struct Region {
     pub material: Option<Material>,
 }
 
+/// An energy range a fit leaves out of a material's sample run.
+///
+/// The fit leaves out the sample run's bins that the mean arrival time of a
+/// neutron of an energy in the range can fall in, at the fitted clock offsets,
+/// flight path and pulse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExcludedRange {
+    /// The range's ends in eV, the lower first, both positive.
+    pub energy_ev: (f64, f64),
+    /// The evidence that the evaluated cross section is wrong there; not blank.
+    pub reason: String,
+}
+
+impl ExcludedRange {
+    pub(crate) fn check(&self) -> Result<(), PipelineError> {
+        let (low, high) = self.energy_ev;
+        if low > 0.0 && low < high && high.is_finite() && !self.reason.trim().is_empty() {
+            return Ok(());
+        }
+        Err(PipelineError::InvalidParameter(format!(
+            "an excluded range needs positive ends in eV, the lower first, and the reason the \
+             evaluation is wrong there, got {self:?}"
+        )))
+    }
+}
+
 /// A material's isotopes and temperature.
 #[derive(Debug, Clone)]
 pub struct Material {
@@ -257,6 +285,8 @@ pub struct Material {
     pub thickness_variance: Value,
     /// The library the isotopes' resonance data were read from.
     pub library: EndfLibrary,
+    /// Energy ranges where an isotope's evaluated cross section is wrong.
+    pub excluded_ranges: Vec<ExcludedRange>,
     /// The covariance of the resonance parameters of the isotopes listed, each
     /// with its index in `isotopes`, which [`CountsFit::covariance`] carries;
     /// an isotope not listed has its resonance parameters taken as exact.
@@ -344,12 +374,14 @@ pub struct CountsFit {
     /// of its bounds.
     pub on_bound: Vec<bool>,
     /// Each run's half Poisson deviance over the overdispersion it was
-    /// weighted with, summed over both runs of every region at the fit.
+    /// weighted with, summed over both runs of every region at the fit, outside
+    /// the sample runs' [`RegionFit::excluded_bins`].
     pub deviance: f64,
     /// Whether the fitter converged, the open-beam fits' time background
     /// settled at the fitted one, every sample run's overdispersion settled,
-    /// the grid met its rule at the fitted temperatures, and its flight times
-    /// cover the fitted `t0`, flight path and pulse.
+    /// the grid met its rule at the fitted temperatures, its flight times
+    /// cover the fitted `t0`, flight path and pulse, and the bins left out at
+    /// those are the ones the fit left out.
     pub converged: bool,
     /// For each measured quantity, in the covariance's order, its value
     /// without the fit's bounds ([`Self::unbounded`]) less its measurement
@@ -425,11 +457,18 @@ pub struct RegionFit {
     /// over their Poisson variance: the value each run's counts are divided by
     /// in the returned fit.  The open-beam run's is the region's open-beam
     /// fit's [`OpenBeamFit::overdispersion`](crate::open_beam::OpenBeamFit::overdispersion); the sample run's is measured the
-    /// same way, on the bins the first fit predicts at least one count, by the
+    /// same way, on the bins outside `excluded_bins` the first fit predicts at
+    /// least one count, by the
     /// previous fit, and within 1% by the returned one when the fit converged.
     /// `None` when the run's counts have not measured it; the open-beam run is
     /// then weighted with 1, and the sample run as the open-beam run.
     pub overdispersion: [Option<f64>; 2],
+    /// Indices, ascending, of the sample run's bins its material's
+    /// [`Material::excluded_ranges`] leave out, and, under a spread whose share
+    /// is not known 0, those of every region that spreads counts into it: they
+    /// add nothing to the deviance, the information or the sample run's
+    /// overdispersion.
+    pub excluded_bins: Vec<usize>,
 }
 
 /// Fit the areal densities and temperatures of the regions' materials, each
@@ -525,10 +564,13 @@ pub struct RegionFit {
 /// and covariance.  Each region's open-beam run is weighted with its
 /// open-beam fit's overdispersion, and its sample run first with the same.
 /// The fit is repeated from its answer while any sample run's
-/// overdispersion, measured on the bins that the first fit predicts at least
-/// one count, changes by more than 1%, the coarser grid of the accepted pair is
-/// wider than the rule at the fitted temperatures, or its flight times miss
-/// some that the fitted `t0`, `L` and pulse need.  The next first grid is the
+/// overdispersion, measured on the bins outside those left out that the first
+/// fit predicts at least one count, changes by more than 1%, the coarser grid
+/// of the accepted pair is
+/// wider than the rule at the fitted temperatures, its flight times miss
+/// some that the fitted `t0`, `L` and pulse need, or the bins left out at
+/// those differ from the ones it left out, which for the first fit are those
+/// at the starting ones.  The next first grid is the
 /// finer of that pair's coarser grid and the rule's grid at the fitted
 /// temperatures, or, when the flight times miss, the rule's grid of a grid
 /// built at the fitted `t0`, `L` and pulse.  After twenty fits it is reported
@@ -537,11 +579,11 @@ pub struct RegionFit {
 /// The fitter finds a local minimum.  Where a temperature is fitted and the
 /// counts reject the fit, some region's sample-run overdispersion exceeding 1
 /// by more than three of its standard deviations under Poisson counts,
-/// `√(2/ν)` over the run's `ν` bins, the fit is made
+/// `√(2/ν)` over the run's `ν` bins outside those left out, the fit is made
 /// again with each fitted temperature started at 2,500 K, or at the bound
 /// nearest it.  The second fit is returned when it converged and the first
 /// did not, or when both or neither converged and its half Poisson deviance
-/// of every run's counts is
+/// of every run's counts, outside the sample bins either fit leaves out, is
 /// lower by more than [`NEWTON_DECREMENT_TOL`]; a second fit that fails is
 /// set aside.  Where a black resonance
 /// empties bins and the background is near zero, a fitted background with no
@@ -626,14 +668,14 @@ pub fn fit_counts(
 
 /// Whether some region's sample-run overdispersion at `fit` exceeds 1 by more
 /// than [`REJECTING_SDS`] of its standard deviations under Poisson counts,
-/// `√(2/ν)` over the run's `ν` bins.
+/// `√(2/ν)` over the run's `ν` bins outside those left out.
 fn rejected(measurement: &Measurement, fit: &CountsFit) -> bool {
     measurement
         .regions
         .iter()
         .zip(&fit.regions)
         .any(|(region, at)| {
-            let bins = region.sample_counts.len() as f64;
+            let bins = (region.sample_counts.len() - at.excluded_bins.len()) as f64;
             at.overdispersion[1].is_some_and(|phi| phi > 1.0 + REJECTING_SDS * (2.0 / bins).sqrt())
         })
 }
@@ -663,23 +705,37 @@ fn better(measurement: &Measurement, fit: &CountsFit, other: &CountsFit) -> bool
     if fit.converged != other.converged {
         return fit.converged;
     }
-    counts_deviance(measurement, fit) + NEWTON_DECREMENT_TOL < counts_deviance(measurement, other)
+    counts_deviance(measurement, fit, other) + NEWTON_DECREMENT_TOL
+        < counts_deviance(measurement, other, fit)
 }
 
-/// The half Poisson deviance of every run's counts at `fit`.
-fn counts_deviance(measurement: &Measurement, fit: &CountsFit) -> f64 {
-    measurement
+/// The half Poisson deviance of every run's counts at `fit`, outside the
+/// sample bins `fit` or `other` leaves out.
+fn counts_deviance(measurement: &Measurement, fit: &CountsFit, other: &CountsFit) -> f64 {
+    let runs = measurement
         .regions
         .iter()
         .zip(&fit.regions)
-        .flat_map(|(region, at)| {
-            [&region.open_counts, &region.sample_counts]
-                .into_iter()
-                .zip(&at.predicted)
-        })
-        .flat_map(|(counts, predicted)| counts.iter().zip(predicted))
-        .map(|(&y, &mu)| half_deviance(y, mu))
-        .sum()
+        .zip(&other.regions);
+    runs.map(|((region, at), beside)| {
+        let kept = |k: &usize| {
+            at.excluded_bins.binary_search(k).is_err()
+                && beside.excluded_bins.binary_search(k).is_err()
+        };
+        let open: f64 = (region.open_counts.iter().zip(&at.predicted[0]))
+            .map(|(&y, &mu)| half_deviance(y, mu))
+            .sum();
+        let sample: f64 = (region
+            .sample_counts
+            .iter()
+            .zip(&at.predicted[1])
+            .enumerate())
+        .filter(|(k, _)| kept(k))
+        .map(|(_, (&y, &mu))| half_deviance(y, mu))
+        .sum();
+        open + sample
+    })
+    .sum()
 }
 
 fn fit_settled(
@@ -801,6 +857,7 @@ pub(crate) struct Starts {
     pub(crate) origin_us: f64,
     pub(crate) shared_leverage: Option<Vec<f64>>,
     pub(crate) bound: f64,
+    pub(crate) excluded: Vec<Vec<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -826,6 +883,7 @@ pub(crate) struct Checked<'a> {
     measured: Vec<(usize, f64, f64)>,
     lines: Vec<Lines<'a>>,
     instrument: Vec<FitParameter>,
+    offsets: Vec<f64>,
     base: FlightTimeGrid,
     resonances_in_span: Vec<Vec<Vec<f64>>>,
 }
@@ -851,6 +909,9 @@ pub(crate) fn checked<'a>(
         return invalid(format!(
             "the charge ratio must be finite and positive, got {charge_ratio}"
         ));
+    }
+    for range in materials().flat_map(|(_, m)| &m.excluded_ranges) {
+        range.check()?;
     }
     // An exponential far slower than the span is nearly a line, which C and D already give.
     let [_, _, tau, d] = &measurement.time_background;
@@ -1086,9 +1147,78 @@ pub(crate) fn checked<'a>(
         measured,
         lines,
         instrument,
+        offsets,
         base,
         resonances_in_span,
     })
+}
+
+/// The most pieces an excluded range is split into to bound its arrival times.
+const MOST_RANGE_PIECES: u32 = 4096;
+
+pub(crate) fn excluded_bins(
+    time_edges_us: &[f64],
+    material: Option<&Material>,
+    numbers: &[f64],
+    storage_span: Option<(f64, f64)>,
+) -> Vec<usize> {
+    let laws = laws(&numbers[2..], storage_span);
+    let tail = laws
+        .detector_tail
+        .map_or(0.0, |tail| tail.fraction * tail.decay_us);
+    let flight = |e: f64| numbers[0] + TOF_FACTOR * numbers[1] / e.sqrt() + tail;
+    let arrival =
+        |e: f64| flight(e) + 3.0 / laws.alpha.eval(e) + laws.r.eval(e) / laws.beta.eval(e);
+    // Each term of the arrival time is monotonic in the energy, so its values at two
+    // energies bound it between them, and the sums of the bounds hold every arrival.
+    let bound = |low: f64, high: f64| {
+        let ends = |f: &dyn Fn(f64) -> f64| {
+            let (a, b) = (f(low), f(high));
+            (a.min(b), a.max(b))
+        };
+        let rise = ends(&|e| 3.0 / laws.alpha.eval(e));
+        let (r, beta) = (ends(&|e| laws.r.eval(e)), ends(&|e| laws.beta.eval(e)));
+        (
+            flight(high) + rise.0 + (r.0 / beta.0).min(r.0 / beta.1),
+            flight(low) + rise.1 + (r.1 / beta.0).max(r.1 / beta.1),
+        )
+    };
+    let reached = |(first, last): (f64, f64)| -> Vec<usize> {
+        (0..time_edges_us.len() - 1)
+            .filter(|&k| time_edges_us[k] < last && first < time_edges_us[k + 1])
+            .collect()
+    };
+    let widest = |spans: &mut dyn Iterator<Item = (f64, f64)>| {
+        spans.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), (lo, hi)| {
+            (a.min(lo), b.max(hi))
+        })
+    };
+    let mut bins: Vec<usize> = material
+        .into_iter()
+        .flat_map(|m| &m.excluded_ranges)
+        .flat_map(|range| {
+            let (low, high) = range.energy_ev;
+            // The arrivals fill the interval between their extrema.  The pieces halve until their
+            // bounds and end arrivals agree on the bins; at the limit the bounds decide.
+            let mut pieces = 1;
+            loop {
+                let knot = |i: u32| low + (high - low) * f64::from(i) / f64::from(pieces);
+                let sampled = widest(&mut (0..=pieces).map(|i| {
+                    let t = arrival(knot(i));
+                    (t, t)
+                }));
+                let bounded = widest(&mut (0..pieces).map(|i| bound(knot(i), knot(i + 1))));
+                let out = reached(bounded);
+                if out == reached(sampled) || pieces == MOST_RANGE_PIECES {
+                    break out;
+                }
+                pieces *= 2;
+            }
+        })
+        .collect();
+    bins.sort_unstable();
+    bins.dedup();
+    bins
 }
 
 type Slopes = (Vec<Vec<f64>>, FlatMatrix);
@@ -1346,6 +1476,7 @@ pub(crate) fn fit_counts_answer(
         measured,
         lines,
         instrument,
+        offsets,
         mut base,
         mut resonances_in_span,
     } = checked(measurement, calibration)?;
@@ -1355,6 +1486,10 @@ pub(crate) fn fit_counts_answer(
     let frames = measurement
         .room_background
         .map_or([0.0; 2], |room| room.frames);
+    let spreading = measurement
+        .spread
+        .as_ref()
+        .is_some_and(|spread| spread.share != Value::Known(0.0));
     let bins = time_edges_us.len() - 1;
     if let Some(starts) = starts {
         assert_eq!(starts.beams.len(), regions.len(), "one beam per region");
@@ -1362,11 +1497,52 @@ pub(crate) fn fit_counts_answer(
             assert_eq!(leverage.len(), regions.len(), "one leverage per region");
         }
     }
-    let dispersion_of = |weights: &[f64]| -> Vec<f64> {
-        (0..2 * regions.len() * bins)
-            .map(|k| weights[k / bins])
-            .collect()
+    let excluded_at = |numbers: &[f64], offsets: &[f64]| -> Vec<Vec<usize>> {
+        let own: Vec<Vec<usize>> = regions
+            .iter()
+            .zip(offsets)
+            .map(|(region, offset)| {
+                let mut numbers = numbers.to_vec();
+                numbers[0] += offset;
+                excluded_bins(
+                    time_edges_us,
+                    region.material.as_ref(),
+                    &numbers,
+                    calibration.pulse.storage_span(),
+                )
+            })
+            .collect();
+        match &mixing {
+            Some(shares) if spreading => shares
+                .iter()
+                .enumerate()
+                .map(|(r, from)| {
+                    let mut out: Vec<usize> = own
+                        .iter()
+                        .enumerate()
+                        .filter(|&(q, _)| q == r || from[q] > 0.0)
+                        .flat_map(|(_, out)| out.iter().copied())
+                        .collect();
+                    out.sort_unstable();
+                    out.dedup();
+                    out
+                })
+                .collect(),
+            _ => own,
+        }
     };
+    let dispersion_of = |excluded: &[Vec<usize>], weights: &[f64]| -> Vec<f64> {
+        let mut dispersion: Vec<f64> = (0..2 * regions.len() * bins)
+            .map(|k| weights[k / bins])
+            .collect();
+        for (r, out) in excluded.iter().enumerate() {
+            for &k in out {
+                dispersion[(2 * r + 1) * bins + k] = f64::INFINITY;
+            }
+        }
+        dispersion
+    };
+    let mut excluded = starts.map_or_else(|| excluded_at(&start, &offsets), |s| s.excluded.clone());
     let mut live = Vec::with_capacity(2 * regions.len() * bins);
     for (r, region) in regions.iter().enumerate() {
         let checked = || -> Result<[Vec<f64>; 2], PipelineError> {
@@ -1519,7 +1695,7 @@ pub(crate) fn fit_counts_answer(
     let mut passes = 0;
     let (fit, rule_halvings, overdispersions, settled) = loop {
         passes += 1;
-        let dispersion = dispersion_of(&weights);
+        let dispersion = dispersion_of(&excluded, &weights);
         let fit = fit_on_halved_grids(
             &first.0,
             &mut parameters,
@@ -1581,7 +1757,23 @@ pub(crate) fn fit_counts_answer(
             .enumerate()
             .map(|(r, next)| (next / weights[2 * r + 1] - 1.0).abs() <= SETTLED_OVERDISPERSION)
             .collect();
-        let settled = each_settled.iter().all(|&s| s);
+        let at_fit = starts.map_or_else(
+            || {
+                excluded_at(
+                    &[fitted(layout.t0), fitted(layout.flight_path)]
+                        .into_iter()
+                        .chain(fit.result.params[layout.pulse..].iter().copied())
+                        .collect::<Vec<f64>>(),
+                    &layout
+                        .regions
+                        .iter()
+                        .map(|place| fitted(place.offset))
+                        .collect::<Vec<f64>>(),
+                )
+            },
+            |s| s.excluded.clone(),
+        );
+        let settled = each_settled.iter().all(|&s| s) && at_fit == excluded;
         let resolved = 2.0 * fit.step_us
             <= 0.5 * narrowest_us(&base, &resonances_in_span, &fit.result.params)?;
         let covered = fit.converged && covering(&fit.coarse, &fit.result.params)?;
@@ -1620,8 +1812,9 @@ pub(crate) fn fit_counts_answer(
             weights[2 * r + 1] = next[r];
             sample_measured[r] = sample.is_some();
         }
+        excluded = at_fit;
     };
-    let dispersion = dispersion_of(&weights);
+    let dispersion = dispersion_of(&excluded, &weights);
     let converged = fit.converged && settled;
     if converged {
         calibrated_lines(
@@ -1788,6 +1981,7 @@ pub(crate) fn fit_counts_answer(
                 fit.predicted[(2 * r + 1) * bins..(2 * r + 2) * bins].to_vec(),
             ],
             overdispersion,
+            excluded_bins: excluded[r].clone(),
         })
         .collect();
     let mut fitted = vec![false; params.len()];
@@ -3607,6 +3801,7 @@ mod tests {
             material: Some(Material {
                 covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
+                excluded_ranges: Vec::new(),
                 isotopes: vec![(
                     synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
                     Value::Fitted(1e-4),
@@ -4072,6 +4267,7 @@ mod tests {
                     material: material.map(|data| Material {
                         covariances: Vec::new(),
                         library: EndfLibrary::EndfB8_0,
+                        excluded_ranges: Vec::new(),
                         isotopes: vec![(data, Value::Fitted(3.0e-4))],
                         temperature_k: Value::Fitted(350.0),
                         thickness_variance: Value::Known(0.0),
@@ -4182,6 +4378,7 @@ mod tests {
         };
         let joined = &fit.regions[0];
         let starts = Starts {
+            excluded: vec![joined.excluded_bins.clone()],
             beams: vec![BeamStart {
                 beam: joined.beam.clone(),
                 overdispersion: joined.overdispersion[0],
@@ -4310,6 +4507,7 @@ mod tests {
         let material = Material {
             covariances: Vec::new(),
             library: EndfLibrary::EndfB8_0,
+            excluded_ranges: Vec::new(),
             isotopes: vec![(hafnium, Value::Fitted(3.0e-4))],
             temperature_k: Value::Fitted(350.0),
             thickness_variance: Value::Known(0.0),
@@ -4541,5 +4739,38 @@ mod tests {
                 "{k}: {residual} vs {tolerance}"
             );
         }
+    }
+
+    #[test]
+    fn a_range_leaves_out_every_bin_its_energies_arrive_in() {
+        // R rises from 0 to 1 over 13-15 eV, so 14.2 eV can arrive after 13.6 eV.
+        let pulse = |beta: f64| {
+            [
+                0.0, 25.0, 0.0, 0.5, 0.0, beta, 0.0, 0.0, 1.0, 0.0, 1.0, 0.5, 0.5,
+            ]
+        };
+        let material = Material {
+            covariances: Vec::new(),
+            isotopes: vec![(
+                synthetic_isotope(73, 181, 13.9, 0.01, 0.06),
+                Value::Known(1e-4),
+            )],
+            temperature_k: Value::Known(300.0),
+            library: EndfLibrary::EndfB8_1,
+            excluded_ranges: vec![ExcludedRange {
+                energy_ev: (13.6, 14.2),
+                reason: "misplaced".into(),
+            }],
+            thickness_variance: Value::Known(0.0),
+            lattice: None,
+        };
+        let bins = |edges: &[f64], beta: f64| {
+            excluded_bins(edges, Some(&material), &pulse(beta), Some((13.0, 15.0)))
+        };
+        // Here the energies arrive between 526.877 and 546.501 µs.
+        let edges: Vec<f64> = (500..=560).map(f64::from).collect();
+        assert_eq!(bins(&edges, 0.01), (26..=46).collect::<Vec<usize>>());
+        // With this β the arrival time has its minimum, 506.785921 µs, inside the range.
+        assert_eq!(bins(&[506.784921, 506.786155], 0.0287), [0]);
     }
 }

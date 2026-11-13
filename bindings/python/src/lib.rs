@@ -25,8 +25,8 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::counts_fit::{
-    CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground,
-    Spread, Value,
+    CountsFit, ExcludedRange, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit,
+    RoomBackground, Spread, Value,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, PatchCovariances};
 use nereids_pipeline::error::PipelineError;
@@ -3413,9 +3413,11 @@ impl PyMaterial {
     /// the areal density over the region's pixels, known 0 by default; lattice
     /// is the PhononSpectrum the nuclei vibrate with, None for the free gas;
     /// covariances pairs an index into isotopes with that isotope's
-    /// ResonanceCovariance, which the fit's covariance carries.
+    /// ResonanceCovariance, which the fit's covariance carries; excluded_ranges
+    /// lists (low eV, high eV, reason) ranges where an evaluated cross section
+    /// is wrong, whose sample-run bins the fit leaves out.
     #[new]
-    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None, lattice=None, covariances=Vec::new()))]
+    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None, lattice=None, covariances=Vec::new(), excluded_ranges=Vec::new()))]
     fn new(
         isotopes: Vec<(PyResonanceData, PyValue)>,
         temperature_k: PyValue,
@@ -3423,6 +3425,7 @@ impl PyMaterial {
         thickness_variance: Option<PyValue>,
         lattice: Option<PyPhononSpectrum>,
         covariances: Vec<(usize, PyResonanceCovariance)>,
+        excluded_ranges: Vec<(f64, f64, String)>,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Material {
@@ -3434,12 +3437,29 @@ impl PyMaterial {
                 thickness_variance: thickness_variance.map_or(Value::Known(0.0), |v| v.inner),
                 lattice: lattice.map(|spectrum| spectrum.inner),
                 library: parse_library_name(library)?,
+                excluded_ranges: excluded_ranges
+                    .into_iter()
+                    .map(|(low, high, reason)| ExcludedRange {
+                        energy_ev: (low, high),
+                        reason,
+                    })
+                    .collect(),
                 covariances: covariances
                     .into_iter()
                     .map(|(index, covariance)| (index, covariance.inner))
                     .collect(),
             },
         })
+    }
+
+    /// The (low eV, high eV, reason) ranges the fit leaves out.
+    #[getter]
+    fn excluded_ranges(&self) -> Vec<(f64, f64, String)> {
+        self.inner
+            .excluded_ranges
+            .iter()
+            .map(|range| (range.energy_ev.0, range.energy_ev.1, range.reason.clone()))
+            .collect()
     }
 
     /// Each isotope index with its ResonanceCovariance.
@@ -4067,6 +4087,7 @@ struct PyRegionFit {
     predicted_open: Vec<f64>,
     predicted_sample: Vec<f64>,
     overdispersion: [Option<f64>; 2],
+    excluded_bins: Vec<usize>,
 }
 
 impl PyRegionFit {
@@ -4084,6 +4105,7 @@ impl PyRegionFit {
             predicted_open: region.predicted[0].clone(),
             predicted_sample: region.predicted[1].clone(),
             overdispersion: region.overdispersion,
+            excluded_bins: region.excluded_bins.clone(),
         }
     }
 }
@@ -4160,6 +4182,13 @@ impl PyRegionFit {
     #[getter]
     fn overdispersion(&self) -> Vec<Option<f64>> {
         self.overdispersion.to_vec()
+    }
+
+    /// Indices of the sample run's bins the material's excluded ranges leave
+    /// out, with those of every region that spreads counts into it.
+    #[getter]
+    fn excluded_bins(&self) -> Vec<usize> {
+        self.excluded_bins.clone()
     }
 
     fn __repr__(&self) -> String {
