@@ -31,7 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `CountsFit::unconverged` holds the rule, such as "no step of the fitter
   lowers the objective" or "the fitter reached its step limit", and a pulse
   calibration's refusal quotes it. `PoissonResult::stop` is the fitter's
-  rule, a `Stop`. Python has `CountsFit.unconverged`.
+  rule, a `Stop`. Python has `CountsFit.unconverged`. At the step limit or
+  with no step the rule names the quantities the fit was still moving, as in
+  "the fitter reached its step limit, still moving time background A":
+  `PoissonResult::moving` lists them.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
   sample_run)` calibrates the pulse on a foil of measured density and
   temperature and writes the pulse calibration file that

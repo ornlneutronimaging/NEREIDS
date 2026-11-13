@@ -239,6 +239,10 @@ pub struct PoissonResult {
     pub converged: bool,
     /// The rule that ended the fit.
     pub stop: Stop,
+    /// The free parameters, by their place among them, that the direction
+    /// holding most of the Newton decrement moves most, where the fit stopped
+    /// at its step limit or with no step; empty otherwise.
+    pub moving: Vec<usize>,
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
     /// Covariance of the free parameters; the rows and columns of a
@@ -568,6 +572,19 @@ impl Decomposition {
             .sum::<f64>()
     }
 
+    fn moving(&self, linear: &Linearization) -> Vec<usize> {
+        let share = |k: &usize| self.along(*k, linear).abs();
+        let Some(k) = self.spanned().max_by(|a, b| share(a).total_cmp(&share(b))) else {
+            return Vec::new();
+        };
+        let weights = &self.right[k];
+        let peak = weights.iter().fold(0.0_f64, |m, w| m.max(w.abs()));
+        let most = self.columns.iter().zip(weights);
+        most.filter(|(_, w)| w.abs() >= 0.5 * peak)
+            .map(|(&col, _)| col)
+            .collect()
+    }
+
     fn is_determined(&self, k: usize) -> bool {
         self.singular[k].powi(2) >= DEGENERATE_EIGENVALUE
     }
@@ -883,6 +900,7 @@ pub fn poisson_fit(
     let mut iterations = 0;
     let mut at_minimum = None;
     let mut stop = Stop::Start;
+    let mut moving = Vec::new();
     let mut damping = INITIAL_DAMPING;
     while value.is_finite() {
         let linear = linearize(model, params, &free, priors, y_obs, &y_model)?;
@@ -910,6 +928,7 @@ pub fn poisson_fit(
         }
         if iterations == config.max_iter {
             stop = Stop::StepLimit;
+            moving = decomposition.moving(&linear);
             break;
         }
         let start = params.free_values();
@@ -936,6 +955,7 @@ pub fn poisson_fit(
         }
         let Some((trial_model, trial_value)) = accepted else {
             stop = Stop::NoStep;
+            moving = decomposition.moving(&linear);
             break;
         };
         y_model = trial_model;
@@ -968,6 +988,7 @@ pub fn poisson_fit(
         iterations,
         converged: at_minimum.is_some(),
         stop,
+        moving,
         params: params.all_values(),
         covariance,
         uncertainties,
@@ -1193,6 +1214,7 @@ mod tests {
         assert!(steps > 1);
         let last = fit_decay(&model, &observed, (20.0, 0.3), steps);
         assert!(last.converged && last.stop == Stop::Minimum, "{last:?}");
+        assert!(last.moving.is_empty());
         let short = fit_decay(&model, &observed, (20.0, 0.3), steps - 1);
         assert!(
             !short.converged && short.stop == Stop::StepLimit,
@@ -1955,6 +1977,27 @@ mod tests {
             max_iter: 0,
             ..PoissonConfig::default()
         }
+    }
+
+    #[test]
+    fn a_fit_stopped_at_its_step_limit_names_the_parameters_it_was_moving() {
+        let model = Affine {
+            offset: vec![1.0; 2],
+            jacobian: vec![vec![1.0, 0.0], vec![0.0, 1.0e-3]],
+        };
+        for (observed, moving) in [([0.9, 1.0], [0]), ([1.0, 0.9], [1])] {
+            let result =
+                poisson_fit(&model, &observed, &[], &mut two_free(), &at_the_start()).unwrap();
+            assert_eq!(result.stop, Stop::StepLimit);
+            assert_eq!(result.moving, moving);
+        }
+        let both = Affine {
+            offset: vec![1.0; 2],
+            jacobian: vec![vec![1.0, 1.0], vec![0.0, 1.0e-3]],
+        };
+        let result =
+            poisson_fit(&both, &[1.0, 0.9], &[], &mut two_free(), &at_the_start()).unwrap();
+        assert_eq!(result.moving, [0, 1]);
     }
 
     #[test]

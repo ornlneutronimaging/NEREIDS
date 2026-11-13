@@ -410,7 +410,8 @@ pub struct CountsFit {
     /// cover the fitted `t0`, flight path and pulse, and the bins left out at
     /// those are the ones the fit left out.
     pub converged: bool,
-    /// The rule that ended the fit unconverged; `None` when it converged.
+    /// The rule that ended the fit unconverged, with the quantities the fitter
+    /// was still moving at its step limit or with no step; `None` when it converged.
     pub unconverged: Option<String>,
     /// For each measured quantity, in the covariance's order, its value
     /// without the fit's bounds ([`Self::unbounded`]) less its measurement

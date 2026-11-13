@@ -611,7 +611,16 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
         let unconverged = match result.stop {
             Stop::Minimum if result.params.iter().all(|p| p.is_finite()) => None,
             Stop::Minimum => Some("a fitted number is not finite".to_string()),
-            stop => Some(stop.to_string()),
+            stop => {
+                let free = parameters.free_indices();
+                let names: Vec<&str> = (result.moving.iter())
+                    .map(|&j| &*parameters.params[free[j]].name)
+                    .collect();
+                Some(match names.is_empty() {
+                    true => stop.to_string(),
+                    false => format!("{stop}, still moving {}", names.join(", ")),
+                })
+            }
         };
         let converged = unconverged.is_none();
         let predicted = fine.evaluate(&result.params)?;
@@ -862,7 +871,7 @@ pub(crate) mod tests {
         assert!(!fit.converged);
         assert_eq!(
             fit.unconverged.as_deref(),
-            Some("no step of the fitter lowers the objective")
+            Some("no step of the fitter lowers the objective, still moving level")
         );
     }
 

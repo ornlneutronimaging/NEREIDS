@@ -231,8 +231,9 @@ room_background are the shared fitted values; covariance is the fitted-quantity 
 the fit did not converge), unbounded_mean and unbounded_covariance the same
 Gaussian without the bounds, on_bound the bounds flags, deviance the half
 Poisson deviance over the overdispersion, converged the fit status, and
-unconverged the rule that ended a fit that did not converge (None when it
-did).
+unconverged the rule that ended a fit that did not converge, with the
+quantities the fitter was still moving at its step limit or with no step
+(None when it did).
 measured_pulls and pulse_consistency are None when unavailable.
 
 #### Patch, MapMeasurement and CountsMap
