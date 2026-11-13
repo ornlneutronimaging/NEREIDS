@@ -54,7 +54,7 @@ egui_plot = "0.35"
 # Portal backend only; do not re-enable "gtk3". EXACT-VERSION PIN: the GUI's
 # dialog-failure classification matches rfd 0.17.2's log wording; any bump must
 # re-verify FileDialogs::apply_native_outcome and logging.rs.
-rfd = { version = "=0.17.2", default-features = false }
+rfd = { version = "=0.18.0", default-features = false }
 # Pure-egui fallback dialog; LOCKSTEP with egui minors — bump together.
 egui-file-dialog = "0.13"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
