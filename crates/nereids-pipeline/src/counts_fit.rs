@@ -411,7 +411,8 @@ pub struct CountsFit {
     /// those are the ones the fit left out.
     pub converged: bool,
     /// The rule that ended the fit unconverged, with the quantities the fitter
-    /// was still moving at its step limit or with no step; `None` when it converged.
+    /// was still moving, the decrease still predicted and the impossible or
+    /// refused trial steps at its step limit or with no step; `None` when it converged.
     pub unconverged: Option<String>,
     /// For each measured quantity, in the covariance's order, its value
     /// without the fit's bounds ([`Self::unbounded`]) less its measurement

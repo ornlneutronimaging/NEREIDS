@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lowers the objective" or "the fitter reached its step limit", and a pulse
   calibration's refusal quotes it. `PoissonResult::stop` is the fitter's
   rule, a `Stop`. Python has `CountsFit.unconverged`. At the step limit or
-  with no step the rule names the quantities the fit was still moving, as in
-  "the fitter reached its step limit, still moving time background A":
-  `PoissonResult::moving` lists them.
+  with no step the rule names the quantities the fit was still moving and the
+  decrease still predicted, as in "the fitter reached its step limit, still
+  moving time background A with a further decrease of 3.10e-2 predicted", and
+  counts the rejected trial steps that predicted an impossible count or that
+  the model refused: `PoissonResult::moving`, `decrement` and `rejected`.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
   sample_run)` calibrates the pulse on a foil of measured density and
   temperature and writes the pulse calibration file that

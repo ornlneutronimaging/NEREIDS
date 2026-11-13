@@ -243,6 +243,11 @@ pub struct PoissonResult {
     /// holding most of the Newton decrement moves most, where the fit stopped
     /// at its step limit or with no step; empty otherwise.
     pub moving: Vec<usize>,
+    /// The Newton decrement where the fit last took its slopes: the decrease
+    /// the expected information predicts is left.  `None` before the first.
+    pub decrement: Option<f64>,
+    /// The trial steps the fit rejected.
+    pub rejected: Rejected,
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
     /// Covariance of the free parameters; the rows and columns of a
@@ -267,6 +272,20 @@ pub struct PoissonResult {
     /// parameter fails, or when a bin predicted zero adds slope to the
     /// gradient of a parameter on a bound.
     pub unbounded: Option<Unbounded>,
+}
+
+/// The trial steps [`poisson_fit`] rejected, counted by the reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rejected {
+    /// Trials the model refused, or predicted with another number of counts.
+    pub refused: usize,
+    /// Trials whose objective was not finite, as for a count predicted
+    /// negative, or zero where something was counted.
+    pub impossible: usize,
+    /// Trials whose objective was finite and not lower.
+    pub not_lower: usize,
+    /// The model's reason for the last trial it refused.
+    pub reason: Option<String>,
 }
 
 /// The rule that ended [`poisson_fit`].
@@ -901,6 +920,8 @@ pub fn poisson_fit(
     let mut at_minimum = None;
     let mut stop = Stop::Start;
     let mut moving = Vec::new();
+    let mut decrement = None;
+    let mut rejected = Rejected::default();
     let mut damping = INITIAL_DAMPING;
     while value.is_finite() {
         let linear = linearize(model, params, &free, priors, y_obs, &y_model)?;
@@ -921,7 +942,9 @@ pub fn poisson_fit(
             stop = Stop::Decomposition;
             break;
         };
-        if decomposition.newton_decrement(&linear) < NEWTON_DECREMENT_TOL {
+        let left = decomposition.newton_decrement(&linear);
+        decrement = Some(left);
+        if left < NEWTON_DECREMENT_TOL {
             at_minimum = Some(linear);
             stop = Stop::Minimum;
             break;
@@ -938,16 +961,23 @@ pub fn poisson_fit(
                 decomposition.step(decomposition.spanned(), &linear, free.len(), damping);
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
             params.set_free_values(&unprojected);
-            if let Some(trial_model) = model
-                .evaluate(&params.all_values())
-                .ok()
-                .filter(|trial| trial.len() == y_obs.len())
-            {
-                let trial_value = objective(y_obs, &trial_model, priors, params);
-                if trial_value < value {
-                    damping /= DAMPING_FACTOR;
-                    accepted = Some((trial_model, trial_value));
-                    break;
+            match model.evaluate(&params.all_values()) {
+                Ok(trial_model) if trial_model.len() == y_obs.len() => {
+                    let trial_value = objective(y_obs, &trial_model, priors, params);
+                    if trial_value < value {
+                        damping /= DAMPING_FACTOR;
+                        accepted = Some((trial_model, trial_value));
+                        break;
+                    }
+                    match trial_value.is_finite() {
+                        true => rejected.not_lower += 1,
+                        false => rejected.impossible += 1,
+                    }
+                }
+                Ok(_) => rejected.refused += 1,
+                Err(reason) => {
+                    rejected.refused += 1;
+                    rejected.reason = Some(reason.to_string());
                 }
             }
             params.set_free_values(&start);
@@ -989,6 +1019,8 @@ pub fn poisson_fit(
         converged: at_minimum.is_some(),
         stop,
         moving,
+        decrement,
+        rejected,
         params: params.all_values(),
         covariance,
         uncertainties,
@@ -1998,6 +2030,56 @@ mod tests {
         let result =
             poisson_fit(&both, &[1.0, 0.9], &[], &mut two_free(), &at_the_start()).unwrap();
         assert_eq!(result.moving, [0, 1]);
+    }
+
+    struct Reversed {
+        slope: f64,
+        floor: f64,
+    }
+
+    impl FitModel for Reversed {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            if params[0] < self.floor {
+                return Err(FittingError::EvaluationFailed("below the floor".into()));
+            }
+            Ok(vec![params[0]; 4])
+        }
+
+        fn analytical_jacobian(&self, _: &[f64], free: &[usize], _: &[f64]) -> Option<FlatMatrix> {
+            let mut slopes = FlatMatrix::zeros(4, free.len());
+            slopes.data.fill(-self.slope);
+            Some(slopes)
+        }
+    }
+
+    #[test]
+    fn a_fit_counts_the_trial_steps_it_rejected_by_the_reason() {
+        let fit = |slope: f64, floor: f64| {
+            let mut level = ParameterSet::new(vec![FitParameter::unbounded("level", 50.0)]);
+            let model = Reversed { slope, floor };
+            let config = PoissonConfig::default();
+            poisson_fit(&model, &[100.0; 4], &[], &mut level, &config).unwrap()
+        };
+        let impossible = |r: &PoissonResult| (r.rejected.refused, r.rejected.impossible);
+        let uphill = fit(1.0, f64::NEG_INFINITY);
+        assert_eq!(uphill.stop, Stop::NoStep);
+        assert_eq!(impossible(&uphill), (0, 0));
+        assert!(uphill.rejected.not_lower >= 60, "{uphill:?}");
+        assert!(
+            (uphill.decrement.unwrap() - 100.0).abs() < 1e-9,
+            "{uphill:?}"
+        );
+        assert_eq!(impossible(&fit(0.4, f64::NEG_INFINITY)), (0, 4));
+        let refused = fit(0.4, 45.0);
+        assert_eq!(impossible(&refused), (5, 0));
+        assert_eq!(
+            refused.rejected.reason.as_deref(),
+            Some("model evaluation failed: below the floor")
+        );
+        let observed = decay(1.0).evaluate(&[100.0, 1.5]).unwrap();
+        let unstarted = fit_decay(&decay(1.0), &observed, (0.0, 1.0), 200);
+        assert_eq!(unstarted.decrement, None);
+        assert_eq!(unstarted.rejected, Rejected::default());
     }
 
     #[test]

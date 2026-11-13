@@ -7,7 +7,7 @@ use std::sync::Arc;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, Stop, poisson_fit};
+use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, Rejected, Stop, poisson_fit};
 use nereids_physics::flight_time_grid::{FlightTimeGrid, FlightTimeGridError};
 use nereids_physics::ikeda_carpenter::{
     DETECTOR_TAIL_DECAY_US, DetectorPulse, DetectorTail, EnergyLaw, IkedaCarpenterParams,
@@ -616,10 +616,29 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
                 let names: Vec<&str> = (result.moving.iter())
                     .map(|&j| &*parameters.params[free[j]].name)
                     .collect();
-                Some(match names.is_empty() {
-                    true => stop.to_string(),
-                    false => format!("{stop}, still moving {}", names.join(", ")),
-                })
+                let mut rule = stop.to_string();
+                if let (false, Some(left)) = (names.is_empty(), result.decrement) {
+                    let names = names.join(", ");
+                    rule += &format!(
+                        ", still moving {names} with a further decrease of {left:.2e} predicted"
+                    );
+                }
+                let Rejected {
+                    refused,
+                    impossible,
+                    reason,
+                    ..
+                } = &result.rejected;
+                if refused + impossible > 0 {
+                    rule += &format!(
+                        "; {impossible} of its rejected trial steps predicted a negative count, \
+                         or zero where something was counted, and the model refused {refused}"
+                    );
+                    if let Some(reason) = reason {
+                        rule += &format!(": {reason}");
+                    }
+                }
+                Some(rule)
             }
         };
         let converged = unconverged.is_none();
@@ -871,7 +890,10 @@ pub(crate) mod tests {
         assert!(!fit.converged);
         assert_eq!(
             fit.unconverged.as_deref(),
-            Some("no step of the fitter lowers the objective, still moving level")
+            Some(
+                "no step of the fitter lowers the objective, still moving level with a further \
+                 decrease of 1.00e2 predicted"
+            )
         );
     }
 
