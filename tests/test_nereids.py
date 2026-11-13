@@ -918,7 +918,7 @@ class TestCountsApi:
         runs = {"foil": "foil-a", "open_run": "run-1", "sample_run": "run-2"}
         measured_foil = foil(counts, measured(5e-4, 5e-6), measured(300.0, 5.0))
         fit = nereids.calibrate_pulse(measured_foil, start, path, **runs)
-        assert fit.converged
+        assert fit.converged and fit.unconverged is None
         assert fit.alpha[0] == pytest.approx(0.5, rel=0.02)
         read = nereids.Calibration.from_pulse_calibration_file(path)
         assert read.pulse.has_prior

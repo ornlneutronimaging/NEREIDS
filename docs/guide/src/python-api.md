@@ -228,7 +228,9 @@ None without one), time_background and
 room_background are the shared fitted values; covariance is the fitted-quantity covariance (None when
 the fit did not converge), unbounded_mean and unbounded_covariance the same
 Gaussian without the bounds, on_bound the bounds flags, deviance the half
-Poisson deviance over the overdispersion, and converged the fit status.
+Poisson deviance over the overdispersion, converged the fit status, and
+unconverged the rule that ended a fit that did not converge (None when it
+did).
 measured_pulls and pulse_consistency are None when unavailable.
 
 #### Patch, MapMeasurement and CountsMap

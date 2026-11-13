@@ -237,6 +237,8 @@ pub struct PoissonResult {
     /// inside the bounds: within about 0.0014 standard errors of a minimum
     /// where the deviance is quadratic there; see [`poisson_fit`].
     pub converged: bool,
+    /// The rule that ended the fit.
+    pub stop: Stop,
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
     /// Covariance of the free parameters; the rows and columns of a
@@ -261,6 +263,40 @@ pub struct PoissonResult {
     /// parameter fails, or when a bin predicted zero adds slope to the
     /// gradient of a parameter on a bound.
     pub unbounded: Option<Unbounded>,
+}
+
+/// The rule that ended [`poisson_fit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// The Newton decrement fell below [`NEWTON_DECREMENT_TOL`].
+    Minimum,
+    /// The objective is not finite at the start, as when a count is predicted
+    /// negative, or zero where something was counted.
+    Start,
+    /// A slope of the predicted counts, weighted by its bin, is not finite.
+    Slope,
+    /// The singular value decomposition of the slopes failed.
+    Decomposition,
+    /// `max_iter` steps were taken.
+    StepLimit,
+    /// No step lowers the objective.
+    NoStep,
+}
+
+impl std::fmt::Display for Stop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Minimum => "the fitter reached a minimum",
+            Self::Start => {
+                "the objective is not finite at the start, as when a count is predicted \
+                 negative, or zero where something was counted"
+            }
+            Self::Slope => "a weighted slope of the predicted counts is not finite",
+            Self::Decomposition => "the decomposition of the slopes failed",
+            Self::StepLimit => "the fitter reached its step limit",
+            Self::NoStep => "no step of the fitter lowers the objective",
+        })
+    }
 }
 
 /// The expected-information (Fisher scoring) expansion of the objective at
@@ -770,8 +806,10 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// reported unconverged.
 ///
 /// It stops unconverged when no step lowers the objective, when the Jacobian
-/// is not finite, when the start predicts a negative count or zero where
-/// something was counted, or after `config.max_iter` steps.  A trial whose
+/// weighted by its bins is not finite or its decomposition fails, when the
+/// objective is not finite at the start, as for a negative count or zero where
+/// something was counted, or after `config.max_iter` steps;
+/// [`PoissonResult::stop`] says which.  A trial whose
 /// prediction has a different length from `y_obs` is rejected.
 ///
 /// # Errors
@@ -844,6 +882,7 @@ pub fn poisson_fit(
     let mut value = objective(y_obs, &y_model, priors, params);
     let mut iterations = 0;
     let mut at_minimum = None;
+    let mut stop = Stop::Start;
     let mut damping = INITIAL_DAMPING;
     while value.is_finite() {
         let linear = linearize(model, params, &free, priors, y_obs, &y_model)?;
@@ -854,19 +893,23 @@ pub fn poisson_fit(
             .chain(&linear.zero_slope)
             .all(|v| v.is_finite())
         {
+            stop = Stop::Slope;
             break;
         }
         let movable: Vec<usize> = (0..free.len())
             .filter(|&j| !held_by_bound(&params.params[free[j]], linear.gradient[j]))
             .collect();
         let Some(decomposition) = Decomposition::new(&linear.weighted, &movable) else {
+            stop = Stop::Decomposition;
             break;
         };
         if decomposition.newton_decrement(&linear) < NEWTON_DECREMENT_TOL {
             at_minimum = Some(linear);
+            stop = Stop::Minimum;
             break;
         }
         if iterations == config.max_iter {
+            stop = Stop::StepLimit;
             break;
         }
         let start = params.free_values();
@@ -892,6 +935,7 @@ pub fn poisson_fit(
             damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
         }
         let Some((trial_model, trial_value)) = accepted else {
+            stop = Stop::NoStep;
             break;
         };
         y_model = trial_model;
@@ -923,6 +967,7 @@ pub fn poisson_fit(
         deviance: deviance(y_obs, &y_model),
         iterations,
         converged: at_minimum.is_some(),
+        stop,
         params: params.all_values(),
         covariance,
         uncertainties,
@@ -1096,6 +1141,7 @@ mod tests {
         let observed = model.evaluate(&[100.0, 1.5]).unwrap();
         let result = fit_decay(&model, &observed, (0.0, 1.0), 200);
         assert!(!result.converged && result.iterations == 0, "{result:?}");
+        assert_eq!(result.stop, Stop::Start);
     }
 
     #[test]
@@ -1107,6 +1153,7 @@ mod tests {
             !result.converged && result.uncertainties.is_none(),
             "{result:?}"
         );
+        assert_eq!(result.stop, Stop::Slope);
     }
 
     #[test]
@@ -1118,6 +1165,7 @@ mod tests {
             !result.converged && result.iterations == 0 && result.uncertainties.is_none(),
             "{result:?}"
         );
+        assert_eq!(result.stop, Stop::NoStep);
     }
 
     #[test]
@@ -1143,8 +1191,13 @@ mod tests {
         let observed = model.evaluate(&[100.0, 1.5]).unwrap();
         let steps = fit_decay(&model, &observed, (20.0, 0.3), 200).iterations;
         assert!(steps > 1);
-        assert!(fit_decay(&model, &observed, (20.0, 0.3), steps).converged);
-        assert!(!fit_decay(&model, &observed, (20.0, 0.3), steps - 1).converged);
+        let last = fit_decay(&model, &observed, (20.0, 0.3), steps);
+        assert!(last.converged && last.stop == Stop::Minimum, "{last:?}");
+        let short = fit_decay(&model, &observed, (20.0, 0.3), steps - 1);
+        assert!(
+            !short.converged && short.stop == Stop::StepLimit,
+            "{short:?}"
+        );
     }
 
     struct Scaled {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, poisson_fit};
+use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, Stop, poisson_fit};
 use nereids_physics::flight_time_grid::{FlightTimeGrid, FlightTimeGridError};
 use nereids_physics::ikeda_carpenter::{
     DETECTOR_TAIL_DECAY_US, DetectorPulse, DetectorTail, EnergyLaw, IkedaCarpenterParams,
@@ -569,6 +569,7 @@ fn fit_beam(
 pub(crate) struct GridFit {
     pub(crate) result: PoissonResult,
     pub(crate) converged: bool,
+    pub(crate) unconverged: Option<String>,
     pub(crate) predicted: Vec<f64>,
     pub(crate) coarse: Arc<FlightTimeGrid>,
     pub(crate) fine: Arc<FlightTimeGrid>,
@@ -607,7 +608,12 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
             parameters,
             &PoissonConfig::default(),
         )?;
-        let converged = result.converged && result.params.iter().all(|p| p.is_finite());
+        let unconverged = match result.stop {
+            Stop::Minimum if result.params.iter().all(|p| p.is_finite()) => None,
+            Stop::Minimum => Some("a fitted number is not finite".to_string()),
+            stop => Some(stop.to_string()),
+        };
+        let converged = unconverged.is_none();
         let predicted = fine.evaluate(&result.params)?;
         let spread: f64 = predicted
             .iter()
@@ -622,6 +628,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
             return Ok(GridFit {
                 result,
                 converged,
+                unconverged,
                 predicted,
                 coarse: coarse_grid,
                 fine: Arc::clone(&grid),
@@ -821,6 +828,42 @@ pub(crate) mod tests {
             FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &pulse.detector_pulse())
                 .expect("grid"),
         )
+    }
+
+    struct Backwards;
+
+    impl FitModel for Backwards {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![params[0]; 4])
+        }
+
+        fn analytical_jacobian(&self, _: &[f64], free: &[usize], _: &[f64]) -> Option<FlatMatrix> {
+            let mut slopes = FlatMatrix::zeros(4, free.len());
+            for row in 0..4 {
+                *slopes.get_mut(row, 0) = -1.0;
+            }
+            Some(slopes)
+        }
+    }
+
+    #[test]
+    fn a_grid_fit_names_the_rule_that_ended_the_fitter() {
+        let mut level = ParameterSet::new(vec![FitParameter::unbounded("level", 50.0)]);
+        let fit = fit_on_halved_grids(
+            &grid(None),
+            &mut level,
+            &[100.0; 4],
+            &[1.0; 4],
+            &[],
+            |_| Ok(Backwards),
+            |_, _, _| Ok(true),
+        )
+        .expect("fit");
+        assert!(!fit.converged);
+        assert_eq!(
+            fit.unconverged.as_deref(),
+            Some("no step of the fitter lowers the objective")
+        );
     }
 
     #[test]

@@ -239,7 +239,11 @@ impl PulseCalibration {
     ) -> Result<Self, PipelineError> {
         let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
         if !fit.converged {
-            return invalid("a pulse calibration needs a converged fit".into());
+            let rule = fit
+                .unconverged
+                .as_ref()
+                .map_or(String::new(), |rule| format!(": {rule}"));
+            return invalid(format!("a pulse calibration needs a converged fit{rule}"));
         }
         let fitted: Vec<bool> = quantities(measurement, calibration)
             .map(|(_, value)| !matches!(value, Value::Known(_)))
@@ -1098,6 +1102,7 @@ mod tests {
             on_bound: vec![false; free],
             deviance: 0.0,
             converged: true,
+            unconverged: None,
             measured_pulls: None,
             pulse_consistency: None,
             step_us: 0.1,
@@ -1198,6 +1203,26 @@ mod tests {
             calibrated(&measurement(None), &c, singular),
             Err(PipelineError::Fitting(_))
         ));
+    }
+
+    #[test]
+    fn an_unconverged_fit_is_refused_with_the_rule_that_ended_it() {
+        let stopped = CountsFit {
+            converged: false,
+            unconverged: Some("no step of the fitter lowers the objective".into()),
+            ..fit(8)
+        };
+        let Err(PipelineError::InvalidParameter(message)) = calibrated(
+            &measurement(None),
+            &calibration(Value::Known(0.01)),
+            stopped,
+        ) else {
+            panic!("an unconverged fit is refused");
+        };
+        assert_eq!(
+            message,
+            "a pulse calibration needs a converged fit: no step of the fitter lowers the objective"
+        );
     }
 
     #[test]
