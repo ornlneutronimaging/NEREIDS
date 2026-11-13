@@ -977,6 +977,7 @@ mod tests {
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
             spread: None,
+            environment_scatter: None,
             regions: vec![Region {
                 open_counts: vec![100.0; bins],
                 sample_counts: vec![100.0; bins],
@@ -1091,6 +1092,7 @@ mod tests {
             time_background: [0.0, 0.0, 1.0, 0.0],
             room_background: 0.0,
             spread_share: 0.0,
+            scatter_fraction: 0.0,
             covariance: Some(covariance),
             unbounded: Some(unbounded),
             on_bound: vec![false; free],

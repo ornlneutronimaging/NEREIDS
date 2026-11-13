@@ -250,6 +250,7 @@ pub fn run_pixel_fit(request: &FitRequest) -> Result<PixelFitSummary, String> {
         time_background: NO_TIME_BACKGROUND,
         room_background: None,
         spread: None,
+        environment_scatter: None,
         regions: vec![region],
     };
     let fit =

@@ -147,6 +147,9 @@ pub struct Measurement {
     /// Counts the detector records in another region than the one they
     /// arrive in; `None` for none.
     pub spread: Option<Spread>,
+    /// Neutrons the sample environment scatters evenly over the detector;
+    /// `None` for none.
+    pub environment_scatter: Option<EnvironmentScatter>,
     /// The regions, separate sets of pixels timed by one clock.
     pub regions: Vec<Region>,
 }
@@ -193,6 +196,25 @@ pub struct Spread {
     /// Each region's cells as `[row, column]`, in the order of
     /// [`Measurement::regions`]; a cell is in one region at most.
     pub cells: Vec<Vec<[usize; 2]>>,
+}
+
+/// The fraction `s` of the neutrons leaving the sample position that the
+/// sample environment, such as a furnace, scatters evenly over the detector.
+///
+/// In each bin of each run a region of `P` pixels records `(1 − s)·μ + s·P·m`
+/// of its arriving counts `μ`.  An open-beam run with the environment in place
+/// does not cancel the sample run's term.
+///
+/// # References
+///
+/// P. Boillat et al., Opt. Express 26, 15769 (2018).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvironmentScatter {
+    /// `s`, within 0–1.
+    pub fraction: Value,
+    /// `m` of the open-beam run, then of the sample run: the mean counts
+    /// arriving per detector pixel in each bin, finite and 0 or more.
+    pub detector_mean: [Vec<f64>; 2],
 }
 
 /// The counts of a set of pixels in both runs, its background and the
@@ -333,6 +355,9 @@ pub struct CountsFit {
     pub room_background: f64,
     /// The spread's `h`: the known one, the fitted one, or 0 without one.
     pub spread_share: f64,
+    /// The environment scatter's `s`: the known one, the fitted one, or 0
+    /// without one.
+    pub scatter_fraction: f64,
     /// Covariance of the fitted quantities among, in this order, each region's
     /// densities, in the order given, temperature and thickness variance,
     /// region by region; the
@@ -341,7 +366,7 @@ pub struct CountsFit {
     /// capture gammas' `ε`, region by region; each region's in-scatter's `Ω`,
     /// region by region; each region's timing offset `δt`, region by region;
     /// the time background's `C`, `A`, `τ` and `D`; the room
-    /// background's `ρ`; the spread's `h`; `t0`; the
+    /// background's `ρ`; the spread's `h`; the environment scatter's `s`; `t0`; the
     /// flight path; `α₀`, `α₁`,
     /// `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
@@ -524,6 +549,10 @@ pub struct RegionFit {
 /// a material counts `c_q·a·(1 + b_r)` of its beam in the sample run, so it
 /// pins the normalization when its `b0` is known, as zero in the open-region
 /// normalization of imaging, and nothing about it when its `b0` is fitted.
+/// A measurement whose regions hold no material is fitted for an
+/// [`EnvironmentScatter`]'s fraction: open pixels alone measure it, with no
+/// cross section or temperature, where the ratio of the two runs' detector
+/// means changes from bin to bin.
 /// The regions must be separate pixels: the covariance takes every bin as
 /// independent.
 ///
@@ -602,11 +631,14 @@ pub struct RegionFit {
 /// other than known 0, a spread's kernel has a term whose weight or length is
 /// not finite and positive, its grid holds no cell or more than 2^20, it does
 /// not give each region one or more cells on the grid, or a cell is in two
-/// regions, a known, starting or measured value is
+/// regions, an environment scatter's detector means do not each hold one
+/// finite count of 0 or more per bin or it comes with a spread, a known,
+/// starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
-/// is not fitted or is measured, no region holds a material, a material has
+/// is not fitted or is measured, no region holds a material and no environment
+/// scatter's fraction is fitted, a material has
 /// no isotopes or lists one twice, an isotope's resonance data are not
 /// finite, an isotope not known to be absent has a resonance between the
 /// energies of the last and first time edges, at the starting `t0` and flight
@@ -621,8 +653,8 @@ pub struct RegionFit {
 /// grid's lowest energy and above the lowest energy a neutron scattered forward
 /// leaves with;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
-/// is predicted negative or non-finite counts, recorded or, under a spread,
-/// arriving, or, outside the bins left
+/// is predicted negative or non-finite counts, recorded or, under a spread
+/// or an environment scatter, arriving, or, outside the bins left
 /// out, holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
 /// [`PipelineError::InvalidParameter`] if a material's covariance names no
@@ -644,10 +676,15 @@ pub fn fit_counts(
     measurement: &Measurement,
     calibration: &Calibration,
 ) -> Result<CountsFit, PipelineError> {
-    if measurement
-        .regions
-        .iter()
-        .all(|region| region.material.is_none())
+    let scatter_fitted = measurement
+        .environment_scatter
+        .as_ref()
+        .is_some_and(|scatter| !matches!(scatter.fraction, Value::Known(_)));
+    if !scatter_fitted
+        && measurement
+            .regions
+            .iter()
+            .all(|region| region.material.is_none())
     {
         return Err(PipelineError::InvalidParameter(
             "no region of the measurement holds a material to fit".into(),
@@ -950,6 +987,24 @@ pub(crate) fn checked<'a>(
             return invalid(
                 "a detector spread needs every region's timing offset known and the same".into(),
             );
+        }
+    }
+    if let Some(scatter) = &measurement.environment_scatter {
+        if measurement.spread.is_some() {
+            return invalid(
+                "an environment scatter with a detector spread is not supported".into(),
+            );
+        }
+        let bins = time_edges_us.len().saturating_sub(1);
+        if !scatter
+            .detector_mean
+            .iter()
+            .all(|mean| mean.len() == bins && mean.iter().all(|m| m.is_finite() && *m >= 0.0))
+        {
+            return invalid(format!(
+                "the environment scatter's detector means must each hold {bins} finite counts of \
+                 0 or more"
+            ));
         }
     }
     let free = |value: &Value| matches!(value, Value::Fitted(_) | Value::Within { .. });
@@ -1452,6 +1507,20 @@ pub(crate) fn spread_shares(
     ))))
 }
 
+/// The environment scatter's `P·m` in each bin of each region's open-beam run
+/// then sample run, or `None` without one.
+fn scattered_counts(measurement: &Measurement) -> Option<Arc<Vec<f64>>> {
+    let scatter = measurement.environment_scatter.as_ref()?;
+    let means = || scatter.detector_mean.iter().flatten();
+    Some(Arc::new(
+        measurement
+            .regions
+            .iter()
+            .flat_map(|region| means().map(move |m| region.pixels * m))
+            .collect(),
+    ))
+}
+
 /// The fit of `measurement` from `beam_starts`, with the spread's shares
 /// `mixing` from [`spread_shares`].
 pub(crate) fn fit_counts_answer(
@@ -1480,6 +1549,7 @@ pub(crate) fn fit_counts_answer(
         mut base,
         mut resonances_in_span,
     } = checked(measurement, calibration)?;
+    let scattered = scattered_counts(measurement);
     let pulse = &calibration.pulse;
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
     let beam_origin_us = starts.map_or(start[0], |starts| starts.origin_us);
@@ -1713,7 +1783,8 @@ pub(crate) fn fit_counts_answer(
                         &layout,
                     )
                     .lattices(&lattices)
-                    .spread(mixing.clone()),
+                    .spread(mixing.clone())
+                    .environment(scattered.clone()),
                     live: &live,
                 })
             },
@@ -1861,7 +1932,8 @@ pub(crate) fn fit_counts_answer(
                 &layout,
             )
             .lattices(&lattices)
-            .spread(mixing.clone()),
+            .spread(mixing.clone())
+            .environment(scattered.clone()),
             live: &live,
         };
         nuclear_slopes(regions, &model, &dispersion, &parameters)?
@@ -2024,6 +2096,7 @@ pub(crate) fn fit_counts_answer(
         time_background: [0, 1, 2, 3].map(|i| params[layout.time_background + i]),
         room_background: params[layout.room_background],
         spread_share: params[layout.spread],
+        scatter_fraction: params[layout.environment],
         covariance,
         unbounded,
         on_bound,
@@ -2370,6 +2443,7 @@ pub(crate) enum Role {
     TimeBackground(usize),
     RoomBackground,
     SpreadShare,
+    ScatterFraction,
     T0,
     FlightPath,
     Pulse(usize),
@@ -2411,6 +2485,7 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
         .chain([
             Role::RoomBackground,
             Role::SpreadShare,
+            Role::ScatterFraction,
             Role::T0,
             Role::FlightPath,
         ])
@@ -2522,6 +2597,15 @@ fn quantity(
                 .as_ref()
                 .map_or(&Value::Known(0.0), |spread| &spread.share),
             "detector spread h".into(),
+            0.0..=1.0,
+            "within 0–1".into(),
+        ),
+        Role::ScatterFraction => (
+            measurement
+                .environment_scatter
+                .as_ref()
+                .map_or(&Value::Known(0.0), |scatter| &scatter.fraction),
+            "environment scatter fraction".into(),
             0.0..=1.0,
             "within 0–1".into(),
         ),
@@ -2674,6 +2758,7 @@ struct Layout {
     time_background: usize,
     room_background: usize,
     spread: usize,
+    environment: usize,
     t0: usize,
     flight_path: usize,
     pulse: usize,
@@ -2749,6 +2834,7 @@ impl Layout {
             time_background: at(Role::TimeBackground(0)),
             room_background: at(Role::RoomBackground),
             spread: at(Role::SpreadShare),
+            environment: at(Role::ScatterFraction),
             t0: at(Role::T0),
             flight_path: at(Role::FlightPath),
             pulse: at(Role::Pulse(0)),
@@ -2773,6 +2859,7 @@ struct RegionsModel {
     layout: Arc<Layout>,
     clocks: RefCell<Option<Clocks>>,
     mixing: Option<Arc<Vec<Vec<f64>>>>,
+    scattered: Option<Arc<Vec<f64>>>,
 }
 
 /// One [`Scale`] for each distinct `t0 + δt` of the regions, and each
@@ -2995,6 +3082,7 @@ impl RegionsModel {
                 beam_origin_us,
             ))),
             mixing: None,
+            scattered: None,
         }
     }
 
@@ -3010,6 +3098,12 @@ impl RegionsModel {
     /// The model with the spread's shares `F_rq` between the regions.
     fn spread(mut self, mixing: Option<Arc<Vec<Vec<f64>>>>) -> Self {
         self.mixing = mixing;
+        self
+    }
+
+    /// The model with the environment scatter's `P·m` of each region's runs.
+    fn environment(mut self, scattered: Option<Arc<Vec<f64>>>) -> Self {
+        self.scattered = scattered;
         self
     }
 
@@ -3286,8 +3380,10 @@ impl RegionsModel {
         let bins = folded.len();
         let mut arriving = vec![0.0; 2 * bins * self.layout.regions.len()];
         arriving[(2 * region + 1) * bins..(2 * region + 2) * bins].copy_from_slice(&folded);
+        let kept = 1.0 - params[self.layout.environment];
         Ok(match &self.mixing {
             Some(shares) => mixed(shares, params[self.layout.spread], &arriving),
+            None if self.scattered.is_some() => arriving.iter().map(|a| kept * a).collect(),
             None => arriving,
         })
     }
@@ -3369,14 +3465,20 @@ fn mixed(shares: &[Vec<f64>], h: f64, arriving: &[f64]) -> Vec<f64> {
 }
 
 impl FitModel for RegionsModel {
-    /// The counts each region records; under a spread, a bin whose arriving
-    /// counts are negative or not a number records them instead.
+    /// The counts each region records; under a spread or an environment
+    /// scatter, a bin whose arriving counts are negative or not a number
+    /// records them instead.
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         let arriving = self.arriving(params)?;
-        let Some(shares) = &self.mixing else {
-            return Ok(arriving);
+        let mut recorded = match (&self.mixing, &self.scattered) {
+            (Some(shares), _) => mixed(shares, params[self.layout.spread], &arriving),
+            (None, Some(scattered)) => {
+                let s = params[self.layout.environment];
+                let mix = |(a, m): (&f64, &f64)| (1.0 - s) * a + s * m;
+                arriving.iter().zip(scattered.iter()).map(mix).collect()
+            }
+            (None, None) => return Ok(arriving),
         };
-        let mut recorded = mixed(shares, params[self.layout.spread], &arriving);
         for (recorded, &arrived) in recorded.iter_mut().zip(&arriving) {
             if arrived.is_nan() || arrived < 0.0 {
                 *recorded = arrived;
@@ -3629,7 +3731,7 @@ impl FitModel for RegionsModel {
                         ]
                     })
                     .collect(),
-                Role::SpreadShare => vec![],
+                Role::SpreadShare | Role::ScatterFraction => vec![],
                 Role::RoomBackground => {
                     let [open_room, sample_room] = self.room_per_pixel();
                     (0..regions)
@@ -3748,23 +3850,25 @@ impl FitModel for RegionsModel {
                 }
             }
         }
-        let Some(shares) = &self.mixing else {
+        if self.mixing.is_none() && self.scattered.is_none() {
             return Some(jacobian);
-        };
-        let h = params[layout.spread];
+        }
+        let (h, s) = (params[layout.spread], params[layout.environment]);
         let arriving = self.arriving(params).ok()?;
-        let along_share: Vec<f64> = mixed(shares, 1.0, &arriving)
-            .iter()
-            .zip(&arriving)
-            .map(|(m, a)| m - a)
-            .collect();
+        let less_arriving = |moved: &[f64]| -> Vec<f64> {
+            moved.iter().zip(&arriving).map(|(m, a)| m - a).collect()
+        };
         let mut recorded = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
         for (col, &index) in free_param_indices.iter().enumerate() {
-            let column = if layout.roles[index] == Role::SpreadShare {
-                along_share.clone()
-            } else {
-                let slope: Vec<f64> = (0..y_current.len()).map(|i| jacobian.get(i, col)).collect();
-                mixed(shares, h, &slope)
+            let slope =
+                || -> Vec<f64> { (0..y_current.len()).map(|i| jacobian.get(i, col)).collect() };
+            let column = match (&self.mixing, &self.scattered, layout.roles[index]) {
+                (Some(shares), _, Role::SpreadShare) => {
+                    less_arriving(&mixed(shares, 1.0, &arriving))
+                }
+                (Some(shares), _, _) => mixed(shares, h, &slope()),
+                (None, Some(scattered), Role::ScatterFraction) => less_arriving(scattered),
+                (None, _, _) => slope().iter().map(|v| (1.0 - s) * v).collect(),
             };
             for (i, value) in column.into_iter().enumerate() {
                 *recorded.get_mut(i, col) = value;
@@ -3819,6 +3923,7 @@ mod tests {
                 time_background: NO_TIME_BACKGROUND,
                 room_background: None,
                 spread: None,
+                environment_scatter: None,
                 regions: temperatures.iter().map(|&t| region(t)).collect(),
             };
             started_hot(&measurement).map(|hot| {
@@ -3857,7 +3962,8 @@ mod tests {
             let lattice = channel_fwhm_us
                 .is_none()
                 .then(|| PhononSpectrum::debye(240.0, 200).expect("Debye"));
-            jacobian_against_central_differences(&grid(channel_fwhm_us), lattice);
+            let scattered = channel_fwhm_us.is_some();
+            jacobian_against_central_differences(&grid(channel_fwhm_us), lattice, scattered);
         }
         let bins = starts_and_widths_us(&[350.0, 351.0, 400.0, 470.0]);
         let span = span_us(&bins);
@@ -4010,6 +4116,7 @@ mod tests {
                 Role::TimeBackground(term) => [50.0, 300.0, 40.0, -20.0][term],
                 Role::RoomBackground => 2.0e-3,
                 Role::SpreadShare => 0.15,
+                Role::ScatterFraction => 0.0,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0, 0.5, 0.5][n],
@@ -4053,9 +4160,12 @@ mod tests {
         }
     }
 
+    /// Under a spread between the regions, or under an environment scatter
+    /// when `scattered`.
     fn jacobian_against_central_differences(
         grid: &Arc<FlightTimeGrid>,
         lattice: Option<PhononSpectrum>,
+        scattered: bool,
     ) {
         let (_, u_hi) = grid.range_us();
         let coarse = BeamSpline::constant(347.0, u_hi, 1.0e4);
@@ -4100,6 +4210,7 @@ mod tests {
                 Role::TimeBackground(term) => [50.0, 300.0, 40.0, -20.0][term],
                 Role::RoomBackground => 2.0e-3,
                 Role::SpreadShare => 0.15,
+                Role::ScatterFraction => 0.12,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [
@@ -4116,11 +4227,21 @@ mod tests {
             &layout,
         )
         .lattices(&[lattice, None, None])
-        .spread(Some(Arc::new(vec![
-            vec![0.8, 0.1, 0.05],
-            vec![0.1, 0.7, 0.1],
-            vec![0.05, 0.15, 0.8],
-        ])));
+        .spread((!scattered).then(|| {
+            Arc::new(vec![
+                vec![0.8, 0.1, 0.05],
+                vec![0.1, 0.7, 0.1],
+                vec![0.05, 0.15, 0.8],
+            ])
+        }))
+        .environment(scattered.then(|| {
+            let rows = 6 * (grid.time_edges_us().len() - 1);
+            Arc::new(
+                (0..rows)
+                    .map(|k| 40.0 + 5.0 * (0.7 * k as f64).cos())
+                    .collect(),
+            )
+        }));
         let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
             .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
             .collect();
@@ -4215,6 +4336,7 @@ mod tests {
                 Role::InScatter { .. } => 0.0,
                 Role::TimingOffset { .. } => 0.0,
                 Role::SpreadShare => 0.0,
+                Role::ScatterFraction => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0, 0.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -4241,6 +4363,7 @@ mod tests {
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
             spread: None,
+            environment_scatter: None,
             regions: materials
                 .into_iter()
                 .enumerate()
@@ -4435,6 +4558,7 @@ mod tests {
             ],
             room_background: None,
             spread: None,
+            environment_scatter: None,
             ..measurement
         };
         for (most_passes, settled) in [(1, false), (2, true)] {
@@ -4480,6 +4604,7 @@ mod tests {
                 Role::InScatter { .. } => 0.0,
                 Role::TimingOffset { .. } => 0.0,
                 Role::SpreadShare => 0.0,
+                Role::ScatterFraction => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0, 0.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -4591,6 +4716,7 @@ mod tests {
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
             spread: None,
+            environment_scatter: None,
             regions: vec![
                 region(0, Some(material), background),
                 region(1, None, [Value::Known(0.0); 5]),
@@ -4711,7 +4837,7 @@ mod tests {
                 .copied()
                 .chain([3.0e-4, 5.0e-4, 300.0, 0.0, normalization])
                 .chain(background)
-                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
                 .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5])
                 .collect();

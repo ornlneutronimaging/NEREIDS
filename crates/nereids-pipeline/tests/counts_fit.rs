@@ -21,8 +21,8 @@ use nereids_physics::lattice_doppler::{PhononSpectrum, broaden_in_lattice};
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
-    CountsFit, ExcludedRange, Material, Measurement, NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND,
-    Region, RegionFit, RoomBackground, Spread, Value, fit_counts,
+    CountsFit, EnvironmentScatter, ExcludedRange, Material, Measurement, NEGLIGIBLE_PREDICTION,
+    NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Spread, Value, fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map, region_live};
 use nereids_pipeline::error::PipelineError;
@@ -265,6 +265,7 @@ fn measurement(
         time_background: NO_TIME_BACKGROUND,
         room_background: None,
         spread: None,
+        environment_scatter: None,
         regions: vec![Region {
             open_counts: open,
             sample_counts: sample,
@@ -384,6 +385,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         time_background: numbers,
         room_background: None,
         spread: None,
+        environment_scatter: None,
         regions: (0..2)
             .map(|r| Region {
                 open_counts: rounded(&runs[r][0].0),
@@ -731,6 +733,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
             spread: None,
+            environment_scatter: None,
             regions: regions.to_vec(),
         };
         let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
@@ -1055,6 +1058,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
             spread: None,
+            environment_scatter: None,
             regions: (0..4)
                 .map(|j| {
                     region(
@@ -1134,6 +1138,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
             spread: None,
+            environment_scatter: None,
             regions: vec![Region {
                 open_counts,
                 sample_counts,
@@ -1320,6 +1325,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
             time_background: start,
             room_background: None,
             spread: None,
+            environment_scatter: None,
             regions: vec![
                 region(0..2, 0..2, Some(material.clone())),
                 region(0..2, 2..4, Some(material.clone())),
@@ -1493,6 +1499,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
                 time_background: time,
                 room_background,
                 spread: None,
+                environment_scatter: None,
                 regions: vec![
                     region(0..2, 0..2, Some(material.clone())),
                     region(0..2, 2..4, Some(material.clone())),
@@ -1989,6 +1996,7 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
             spread,
+            environment_scatter: None,
             regions,
         };
         fit_counts(&measurement, &calibration(&setup)).expect("fit")
@@ -2018,6 +2026,149 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
     );
     let recovered = without.converged && (t - TEMPERATURE_K).abs() <= 5.0 * sd;
     assert!(!recovered, "{t} ± {sd}");
+}
+
+/// The open-beam run's bins, then the sample run's.
+type Runs = [Vec<f64>; 2];
+
+/// Each part's pixels and both runs' recorded counts, then the detector's
+/// means, under an environment scatter of `fraction`.
+fn scattered(
+    setup: &Setup,
+    isotope: &ResonanceData,
+    density: f64,
+    fraction: f64,
+) -> (Vec<(f64, Runs)>, Runs) {
+    // A foil, open pixels, and a holder of black bars with gaps that no region models.
+    let parts = [
+        (400.0, Some(density)),
+        (300.0, None),
+        (900.0, Some(SATURATED)),
+        (400.0, None),
+    ];
+    let pixels: f64 = parts.iter().map(|(area, _)| area).sum();
+    let arriving: Vec<[Vec<f64>; 2]> = parts
+        .iter()
+        .map(|&(area, n)| {
+            let sample: Vec<(ResonanceData, f64)> =
+                n.map(|n| (isotope.clone(), n)).into_iter().collect();
+            [
+                run(setup, area, &beam(1.0e3), &[], TEMPERATURE_K),
+                run(
+                    setup,
+                    CHARGE_RATIO * area,
+                    &beam(1.0e3),
+                    &sample,
+                    TEMPERATURE_K,
+                ),
+            ]
+        })
+        .collect();
+    let bins = setup.edges.len() - 1;
+    let recorded: Vec<(f64, Runs)> = parts
+        .iter()
+        .zip(&arriving)
+        .map(|(&(area, _), own)| {
+            let counts = [0, 1].map(|run| {
+                (0..bins)
+                    .map(|k| {
+                        let all: f64 = arriving.iter().map(|part| part[run][k]).sum();
+                        ((1.0 - fraction) * own[run][k] + fraction * area * all / pixels).round()
+                    })
+                    .collect()
+            });
+            (area, counts)
+        })
+        .collect();
+    let detector_mean = [0, 1].map(|run| -> Vec<f64> {
+        (0..bins)
+            .map(|k| recorded.iter().map(|(_, part)| part[run][k]).sum::<f64>() / pixels)
+            .collect()
+    });
+    (recorded, detector_mean)
+}
+
+#[test]
+fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let (density, fraction) = (5.0e-3, 0.09);
+    let (recorded, detector_mean) = scattered(&setup, &isotope, density, fraction);
+    let fit_with = |environment_scatter: Option<EnvironmentScatter>| {
+        let mut m = fitted_from(
+            measurement(
+                &setup,
+                (Vec::new(), Vec::new()),
+                &[(isotope.clone(), density)],
+            ),
+            330.0,
+        );
+        let foil = m.regions.remove(0);
+        m.regions = (0..2)
+            .map(|r| Region {
+                open_counts: recorded[r].1[0].clone(),
+                sample_counts: recorded[r].1[1].clone(),
+                pixels: recorded[r].0,
+                material: foil.material.clone().filter(|_| r == 0),
+                ..foil.clone()
+            })
+            .collect();
+        m.environment_scatter = environment_scatter;
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let scatter = |fraction| EnvironmentScatter {
+        fraction,
+        detector_mean: detector_mean.clone(),
+    };
+    let fit = fit_with(Some(scatter(Value::Fitted(0.02))));
+    assert!(fit.converged);
+    let estimates = [
+        fit.regions[0].densities[0],
+        fit.temperature(),
+        fit.scatter_fraction,
+    ];
+    let truths = [density, TEMPERATURE_K, fraction];
+    let pulls: Vec<f64> = (0..3)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let without = fit_with(None);
+    let (t, sd) = (without.temperature(), error_bar(&without, 1));
+    let recovered = without.converged && (t - TEMPERATURE_K).abs() <= 5.0 * sd;
+    assert!(!recovered, "{t} ± {sd}");
+    let none = fit_with(Some(scatter(Value::Known(0.0))));
+    assert_eq!((none.temperature(), none.deviance), (t, without.deviance));
+}
+
+#[test]
+fn open_pixels_alone_measure_the_environment_scatter() {
+    let setup = standard();
+    let fraction = 0.09;
+    let (recorded, detector_mean) = scattered(&setup, &hafnium_like(20.0), 5.0e-3, fraction);
+    let (pixels, [open, sample]) = recorded[1].clone();
+    let mut m = measurement(&setup, (open, sample), &[]);
+    m.regions[0].pixels = pixels;
+    m.regions[0].material = None;
+    m.normalization = Value::Fitted(0.9);
+    m.environment_scatter = Some(EnvironmentScatter {
+        fraction: Value::Fitted(0.02),
+        detector_mean,
+    });
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged);
+    // Fitted quantities: the normalization, then the fraction.
+    let pulls = [
+        (fit.normalization - 1.0) / error_bar(&fit, 0),
+        (fit.scatter_fraction - fraction) / error_bar(&fit, 1),
+    ];
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    m.environment_scatter = None;
+    assert!(matches!(
+        fit_counts(&m, &calibration(&setup)),
+        Err(PipelineError::InvalidParameter(message)) if message.contains("holds a material")
+    ));
 }
 
 #[test]
@@ -3144,6 +3295,28 @@ fn measurements_the_fit_does_not_describe_are_refused() {
             });
         });
     }
+    let bins = setup.edges.len() - 1;
+    let scatter = |fraction: f64, mean: Vec<f64>| EnvironmentScatter {
+        fraction: Value::Known(fraction),
+        detector_mean: [vec![1.0; bins], mean],
+    };
+    for (fraction, mean) in [
+        (1.5, vec![1.0; bins]),
+        (0.1, vec![1.0; bins - 1]),
+        (0.1, vec![-1.0; bins]),
+        (0.1, vec![f64::NAN; bins]),
+    ] {
+        invalid(&|m| m.environment_scatter = Some(scatter(fraction, mean.clone())));
+    }
+    invalid(&|m| {
+        m.environment_scatter = Some(scatter(0.1, vec![1.0; bins]));
+        m.spread = Some(Spread {
+            share: Value::Known(0.1),
+            kernel: vec![(1.0, 1.0)],
+            grid: [1, 1],
+            cells: vec![vec![[0, 0]]],
+        });
+    });
     let mut trace = good.clone();
     (trace.regions[0].open_counts, trace.regions[0].sample_counts) = draws(&counts, 0, [1.0; 2]);
     let tungsten = synthetic_isotope(74, 182, 24.0, 0.01, 0.06);
@@ -5840,6 +6013,7 @@ mod maps {
                     time_background: NO_TIME_BACKGROUND,
                     room_background: None,
                     spread: None,
+                    environment_scatter: None,
                     regions,
                 },
                 calibration,
@@ -6105,6 +6279,7 @@ mod maps {
                 time_background: NO_TIME_BACKGROUND,
                 room_background: None,
                 spread: None,
+                environment_scatter: None,
                 regions: vec![tiled.region(&map, (0, 0))],
             },
             &Calibration {

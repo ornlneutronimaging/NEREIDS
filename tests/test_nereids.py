@@ -1147,6 +1147,17 @@ class TestCountsApi:
         )
         assert spread_measurement.spread.share.value == 0.1
         assert spread_measurement.spread.kernel == [(1.0, 2.5)]
+        assert measurement.environment_scatter is None
+        scattered = nereids.Measurement(
+            time_edges_us=[1.0, 2.0, 3.0, 4.0, 5.0],
+            charge_ratio=1.0,
+            normalization=nereids.Value.fitted(1.0),
+            regions=[region],
+            environment_scatter=nereids.EnvironmentScatter(
+                nereids.Value.fitted(0.09), [10.0] * 4, [6.0] * 4
+            ),
+        )
+        assert scattered.environment_scatter.fraction.value == 0.09
 
     def test_fit_counts_requires_a_material(self):
         measurement = nereids.Measurement(
