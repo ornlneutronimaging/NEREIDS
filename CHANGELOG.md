@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   of `P` pixels records `(1 − s)·μ + s·P·m` of its arriving counts `μ`, `m` the
   run's mean arriving counts per detector pixel, given as data. The scatter
   fills the resonance dips of the sample run, and an open-beam run with the
-  environment in place does not cancel it. A region of open pixels in the same
-  fit fixes `s`, which `CountsFit::scatter_fraction` returns. It is refused
+  environment in place does not cancel it. Open pixels alone measure `s`:
+  `fit_counts` takes a measurement whose regions hold no material when `s` is
+  fitted, and `CountsFit::scatter_fraction` returns it. The term is refused
   with a `Spread`. Python has `EnvironmentScatter` and
   `Measurement(environment_scatter=...)`.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,

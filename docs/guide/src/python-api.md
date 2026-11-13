@@ -165,8 +165,13 @@ None: in each bin of each run a region of P pixels records
 (1 - s)*mu + s*P*m of the counts mu arriving in it, s the fraction and m the
 run's mean in that bin. Compute each mean as the run's counts over the live
 fraction, averaged over every good pixel of the detector; the fit takes the
-means as exact. A region of open pixels in the same Measurement measures s
-when the sample darkens enough of the detector. A spread and an environment
+means as exact. Open pixels alone measure s: call fit_counts on a
+Measurement whose regions are open pixels with material None and b0 known 0,
+with s and the normalization fitted, and give the sample's Measurement that s
+and its standard deviation as Value.measured. No cross section or temperature
+enters s this way. It needs the ratio of sample_mean to open_mean to change
+from bin to bin, as resonances make it; under a grey shadow alone s and the
+normalization do not separate. A spread and an environment
 scatter together are refused.
 
 #### Pulse

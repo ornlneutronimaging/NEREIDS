@@ -2028,11 +2028,17 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
     assert!(!recovered, "{t} ± {sd}");
 }
 
-#[test]
-fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
-    let setup = standard();
-    let isotope = hafnium_like(20.0);
-    let (density, fraction) = (5.0e-3, 0.09);
+/// The open-beam run's bins, then the sample run's.
+type Runs = [Vec<f64>; 2];
+
+/// Each part's pixels and both runs' recorded counts, then the detector's
+/// means, under an environment scatter of `fraction`.
+fn scattered(
+    setup: &Setup,
+    isotope: &ResonanceData,
+    density: f64,
+    fraction: f64,
+) -> (Vec<(f64, Runs)>, Runs) {
     // A foil, open pixels, and a holder of black bars with gaps that no region models.
     let parts = [
         (400.0, Some(density)),
@@ -2047,9 +2053,9 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
             let sample: Vec<(ResonanceData, f64)> =
                 n.map(|n| (isotope.clone(), n)).into_iter().collect();
             [
-                run(&setup, area, &beam(1.0e3), &[], TEMPERATURE_K),
+                run(setup, area, &beam(1.0e3), &[], TEMPERATURE_K),
                 run(
-                    &setup,
+                    setup,
                     CHARGE_RATIO * area,
                     &beam(1.0e3),
                     &sample,
@@ -2059,25 +2065,35 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
         })
         .collect();
     let bins = setup.edges.len() - 1;
-    let recorded: Vec<[Vec<f64>; 2]> = parts
+    let recorded: Vec<(f64, Runs)> = parts
         .iter()
         .zip(&arriving)
         .map(|(&(area, _), own)| {
-            [0, 1].map(|run| {
+            let counts = [0, 1].map(|run| {
                 (0..bins)
                     .map(|k| {
                         let all: f64 = arriving.iter().map(|part| part[run][k]).sum();
                         ((1.0 - fraction) * own[run][k] + fraction * area * all / pixels).round()
                     })
                     .collect()
-            })
+            });
+            (area, counts)
         })
         .collect();
     let detector_mean = [0, 1].map(|run| -> Vec<f64> {
         (0..bins)
-            .map(|k| recorded.iter().map(|part| part[run][k]).sum::<f64>() / pixels)
+            .map(|k| recorded.iter().map(|(_, part)| part[run][k]).sum::<f64>() / pixels)
             .collect()
     });
+    (recorded, detector_mean)
+}
+
+#[test]
+fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let (density, fraction) = (5.0e-3, 0.09);
+    let (recorded, detector_mean) = scattered(&setup, &isotope, density, fraction);
     let fit_with = |environment_scatter: Option<EnvironmentScatter>| {
         let mut m = fitted_from(
             measurement(
@@ -2090,9 +2106,9 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
         let foil = m.regions.remove(0);
         m.regions = (0..2)
             .map(|r| Region {
-                open_counts: recorded[r][0].clone(),
-                sample_counts: recorded[r][1].clone(),
-                pixels: parts[r].0,
+                open_counts: recorded[r].1[0].clone(),
+                sample_counts: recorded[r].1[1].clone(),
+                pixels: recorded[r].0,
                 material: foil.material.clone().filter(|_| r == 0),
                 ..foil.clone()
             })
@@ -2123,6 +2139,36 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
     assert!(!recovered, "{t} ± {sd}");
     let none = fit_with(Some(scatter(Value::Known(0.0))));
     assert_eq!((none.temperature(), none.deviance), (t, without.deviance));
+}
+
+#[test]
+fn open_pixels_alone_measure_the_environment_scatter() {
+    let setup = standard();
+    let fraction = 0.09;
+    let (recorded, detector_mean) = scattered(&setup, &hafnium_like(20.0), 5.0e-3, fraction);
+    let (pixels, [open, sample]) = recorded[1].clone();
+    let mut m = measurement(&setup, (open, sample), &[]);
+    m.regions[0].pixels = pixels;
+    m.regions[0].material = None;
+    m.normalization = Value::Fitted(0.9);
+    m.environment_scatter = Some(EnvironmentScatter {
+        fraction: Value::Fitted(0.02),
+        detector_mean,
+    });
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged);
+    // Fitted quantities: the normalization, then the fraction.
+    let pulls = [
+        (fit.normalization - 1.0) / error_bar(&fit, 0),
+        (fit.scatter_fraction - fraction) / error_bar(&fit, 1),
+    ];
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    m.environment_scatter = None;
+    assert!(matches!(
+        fit_counts(&m, &calibration(&setup)),
+        Err(PipelineError::InvalidParameter(message)) if message.contains("holds a material")
+    ));
 }
 
 #[test]

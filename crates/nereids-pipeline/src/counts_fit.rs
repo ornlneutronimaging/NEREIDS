@@ -549,6 +549,10 @@ pub struct RegionFit {
 /// a material counts `c_q·a·(1 + b_r)` of its beam in the sample run, so it
 /// pins the normalization when its `b0` is known, as zero in the open-region
 /// normalization of imaging, and nothing about it when its `b0` is fitted.
+/// A measurement whose regions hold no material is fitted for an
+/// [`EnvironmentScatter`]'s fraction: open pixels alone measure it, with no
+/// cross section or temperature, where the ratio of the two runs' detector
+/// means changes from bin to bin.
 /// The regions must be separate pixels: the covariance takes every bin as
 /// independent.
 ///
@@ -633,7 +637,8 @@ pub struct RegionFit {
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
-/// is not fitted or is measured, no region holds a material, a material has
+/// is not fitted or is measured, no region holds a material and no environment
+/// scatter's fraction is fitted, a material has
 /// no isotopes or lists one twice, an isotope's resonance data are not
 /// finite, an isotope not known to be absent has a resonance between the
 /// energies of the last and first time edges, at the starting `t0` and flight
@@ -671,10 +676,15 @@ pub fn fit_counts(
     measurement: &Measurement,
     calibration: &Calibration,
 ) -> Result<CountsFit, PipelineError> {
-    if measurement
-        .regions
-        .iter()
-        .all(|region| region.material.is_none())
+    let scatter_fitted = measurement
+        .environment_scatter
+        .as_ref()
+        .is_some_and(|scatter| !matches!(scatter.fraction, Value::Known(_)));
+    if !scatter_fitted
+        && measurement
+            .regions
+            .iter()
+            .all(|region| region.material.is_none())
     {
         return Err(PipelineError::InvalidParameter(
             "no region of the measurement holds a material to fit".into(),
