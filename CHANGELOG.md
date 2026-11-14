@@ -198,13 +198,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- A fit that no step can lower has converged when no fitted quantity, the
-  others held, has 1e-6 of decrease left and its trial steps tested that:
-  one was evaluated that, as taken, was predicted to lower the objective
-  beyond its rounding, and none after it was refused or impossible. It ended
-  with "no step of the fitter lowers the objective" before, where the
-  predicted decrease stayed large along a direction the counts determine
-  weakly although no step delivered it.
+- A fit that none of its trial steps lowers has converged when no fitted
+  quantity, the others held, has 1e-6 of decrease left and those steps tested
+  that: the last rejected one predicted to lower the objective beyond its
+  rounding was evaluated, as taken still predicted so, and none after it was
+  refused or impossible. It ended with "no step of the fitter lowers the
+  objective" before, where the predicted decrease stayed large along a
+  direction the counts determine weakly although no step delivered it.
 - A time background's decay time `τ` that is not known is bounded below by the
   first bin's width, and a start or bound under it is refused. Far below a
   bin's width only `A·τ` shows in the counts, and a counts fit driven there

@@ -868,15 +868,16 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// decrease.  Where the deviance is quadratic near the minimum this puts the
 /// fit within about 0.0014 standard errors of it, and within 0.01 where the
 /// expected information overstates the curvature, as at one count per bin.
-/// The fit has also converged when no step lowers the objective and the
-/// decrement of each parameter with the others held, `½gⱼ²/Fⱼⱼ`, is below
-/// 1e-6, provided its trial steps tested that since it last moved beyond the
-/// objective's rounding, `ε·n·|objective|` over `n` counts: one was evaluated
-/// that, as taken after rounding and the bounds, was predicted to lower the
-/// objective beyond that rounding, and none after it was refused or
-/// impossible.  Along a weakly determined direction a slope error, or a
-/// curvature the expected information leaves out, can keep `½ gᵀF⁺g` large
-/// where no decrease is left.
+/// The fit has also converged when none of its trial steps lowers the
+/// objective and the decrement of each parameter with the others held,
+/// `½gⱼ²/Fⱼⱼ`, is below 1e-6, provided those steps tested that since the fit
+/// last moved beyond the objective's rounding, `ε·n·|objective|` over `n`
+/// counts: the last rejected one predicted to lower the objective beyond that
+/// rounding was evaluated and, as taken after rounding and the bounds, still
+/// predicted so, and none rejected after it was refused or impossible.  Along
+/// a weakly determined direction a slope error, or a curvature the expected
+/// information leaves out, can keep `½ gᵀF⁺g` large where no decrease is
+/// left.
 /// Where it is not quadratic — weakly determined parameters on a curved or
 /// flat likelihood ridge, a minimum at infinity, or a parameter that adds
 /// counts to a bin predicted near zero — the fit can stop short of the
@@ -1038,8 +1039,8 @@ pub fn poisson_fit(
                     false
                 }
             };
-            if !finite || linear.predicted(&taken) > resolved {
-                tested = finite;
+            if !finite || linear.predicted(&direction) > resolved {
+                tested = finite && linear.predicted(&taken) > resolved;
             }
             params.set_free_values(&start);
             damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
@@ -1209,6 +1210,33 @@ mod tests {
         }
     }
 
+    /// Two bins of `1e6 + 100(u + v) + 25((u − v)/2)² ± 0.01(u − v)`.
+    struct Valley;
+
+    impl FitModel for Valley {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let (sum, half) = (params[0] + params[1], 0.5 * (params[0] - params[1]));
+            let level = 1e6 + 100.0 * sum + 25.0 * half * half;
+            Ok(vec![level + 0.02 * half, level - 0.02 * half])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let half = 0.5 * (params[0] - params[1]);
+            let mut jacobian = FlatMatrix::zeros(2, free.len());
+            for (col, &index) in free.iter().enumerate() {
+                for (row, tilt) in [0.01, -0.01].into_iter().enumerate() {
+                    *jacobian.get_mut(row, col) = 100.0 + [1.0, -1.0][index] * (25.0 * half + tilt);
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
     /// `model` with its parameters counted from `origin`.
     struct Offset<M> {
         model: M,
@@ -1305,7 +1333,14 @@ mod tests {
                 .to_vec(),
         );
         let lost = poisson_fit(&model, &[9.9e7, 1.01e8], &[], &mut far, &config).unwrap();
-        for untested in [walled, unseen, hidden, lost] {
+        // The first step is taken and fails on the curve; every smaller one rounds away.
+        let model = Offset {
+            model: Valley,
+            origin: 1e16,
+        };
+        far.set_free_values(&[1e16; 2]);
+        let coarse = poisson_fit(&model, &[1.004e6, 9.96e5], &[], &mut far, &config).unwrap();
+        for untested in [walled, unseen, hidden, lost, coarse] {
             assert_eq!(untested.stop, Stop::NoStep, "{}", report(&untested));
             assert!(
                 untested.own.unwrap() < NEWTON_DECREMENT_TOL,
