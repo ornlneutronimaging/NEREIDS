@@ -617,13 +617,13 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
                     .map(|&j| &*parameters.params[free[j]].name)
                     .collect();
                 let mut rule = stop.to_string();
-                if let (false, Some(left), Some(kept)) =
-                    (names.is_empty(), result.decrement, result.determined)
+                if let (false, Some(left), Some(own)) =
+                    (names.is_empty(), result.decrement, result.own)
                 {
                     let names = names.join(", ");
                     rule += &format!(
                         ", still moving {names} with a further decrease of {left:.2e} predicted, \
-                         {kept:.2e} of it along directions the counts determine"
+                         {own:.2e} at most by one quantity with the others held"
                     );
                 }
                 let Rejected {
@@ -895,7 +895,7 @@ pub(crate) mod tests {
             fit.unconverged.as_deref(),
             Some(
                 "no step of the fitter lowers the objective, still moving level with a further \
-                 decrease of 1.00e2 predicted, 1.00e2 of it along directions the counts determine"
+                 decrease of 1.00e2 predicted, 1.00e2 at most by one quantity with the others held"
             )
         );
     }

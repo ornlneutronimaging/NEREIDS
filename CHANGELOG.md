@@ -35,9 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with no step the rule names the quantities the fit was still moving and the
   decrease still predicted, as in "the fitter reached its step limit, still
   moving time background A with a further decrease of 3.10e-2 predicted,
-  3.10e-2 of it along directions the counts determine", and counts the
+  2.40e-5 at most by one quantity with the others held", and counts the
   rejected trial steps that predicted an impossible count or that the model
-  refused: `PoissonResult::moving`, `decrement`, `determined` and `rejected`.
+  refused: `PoissonResult::moving`, `decrement`, `own` and `rejected`.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
   sample_run)` calibrates the pulse on a foil of measured density and
   temperature and writes the pulse calibration file that
@@ -198,11 +198,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- A fit that no step can lower has converged when the decrease still
-  predicted lies along directions the counts do not determine, those with
-  less than 1e-12 of one quantity's own information. It ended with "no step
-  of the fitter lowers the objective" before; the quantities along such a
-  direction have no error bar.
+- A fit that no step can lower has converged when no fitted quantity, the
+  others held, has 1e-6 of decrease left and its trial steps tested that:
+  one predicted to lower the objective beyond its rounding was evaluated,
+  and none after it was refused or impossible. It ended with "no step of the
+  fitter lowers the objective" before, where the predicted decrease stayed
+  large along a direction the counts determine weakly although no step
+  delivered it.
 - A time background's decay time `τ` that is not known is bounded below by the
   first bin's width, and a start or bound under it is refused. Far below a
   bin's width only `A·τ` shows in the counts, and a counts fit driven there
