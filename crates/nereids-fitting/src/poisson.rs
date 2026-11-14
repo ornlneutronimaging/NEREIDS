@@ -417,6 +417,23 @@ struct Linearization {
     gradient: Vec<f64>,
 }
 
+impl Linearization {
+    /// The decrease the expected information predicts for lowering the free
+    /// parameters by `step`.
+    fn predicted(&self, step: &[f64]) -> f64 {
+        let slope: f64 = self.gradient.iter().zip(step).map(|(g, d)| g * d).sum();
+        let change = |row: usize| -> f64 {
+            let moved = step.iter().enumerate();
+            moved.map(|(j, d)| self.weighted.get(row, j) * d).sum()
+        };
+        slope
+            - 0.5
+                * (0..self.weighted.nrows)
+                    .map(|row| change(row).powi(2))
+                    .sum::<f64>()
+    }
+}
+
 fn linearize(
     model: &dyn FitModel,
     params: &ParameterSet,
@@ -606,17 +623,6 @@ impl Decomposition {
         columns
             .map(|(i, &col)| 0.5 * self.unscale(i, linear.gradient[col]).powi(2))
             .fold(0.0, f64::max)
-    }
-
-    /// The decrease the expected information predicts for the step at
-    /// `damping`.
-    fn predicted(&self, linear: &Linearization, damping: f64) -> f64 {
-        let decreases = self.spanned().map(|k| {
-            let (along, s) = (self.along(k, linear), self.singular[k]);
-            let reached = along * s * s / (s * s + damping);
-            reached * (along - 0.5 * reached)
-        });
-        decreases.sum()
     }
 
     fn moving(&self, linear: &Linearization) -> Vec<usize> {
@@ -865,11 +871,12 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// The fit has also converged when no step lowers the objective and the
 /// decrement of each parameter with the others held, `½gⱼ²/Fⱼⱼ`, is below
 /// 1e-6, provided its trial steps tested that since it last moved beyond the
-/// objective's rounding, `ε·n·|objective|` over `n` counts: one predicted to
-/// lower the objective beyond that rounding was evaluated, and none after it
-/// was refused or impossible.  Along a weakly determined direction a slope
-/// error, or a curvature the expected information leaves out, can keep
-/// `½ gᵀF⁺g` large where no decrease is left.
+/// objective's rounding, `ε·n·|objective|` over `n` counts: one was evaluated
+/// that, as taken after rounding and the bounds, was predicted to lower the
+/// objective beyond that rounding, and none after it was refused or
+/// impossible.  Along a weakly determined direction a slope error, or a
+/// curvature the expected information leaves out, can keep `½ gᵀF⁺g` large
+/// where no decrease is left.
 /// Where it is not quadratic — weakly determined parameters on a curved or
 /// flat likelihood ridge, a minimum at infinity, or a parameter that adds
 /// counts to a bin predicted near zero — the fit can stop short of the
@@ -1003,6 +1010,9 @@ pub fn poisson_fit(
                 decomposition.step(decomposition.spanned(), &linear, free.len(), damping);
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
             params.set_free_values(&unprojected);
+            let taken: Vec<f64> = (start.iter().zip(params.free_values()))
+                .map(|(x, trial)| x - trial)
+                .collect();
             let finite = match model.evaluate(&params.all_values()) {
                 Ok(trial_model) if trial_model.len() == y_obs.len() => {
                     let trial_value = objective(y_obs, &trial_model, priors, params);
@@ -1028,7 +1038,7 @@ pub fn poisson_fit(
                     false
                 }
             };
-            if !finite || decomposition.predicted(&linear, damping) > resolved {
+            if !finite || linear.predicted(&taken) > resolved {
                 tested = finite;
             }
             params.set_free_values(&start);
@@ -1199,6 +1209,29 @@ mod tests {
         }
     }
 
+    /// `model` with its parameters counted from `origin`.
+    struct Offset<M> {
+        model: M,
+        origin: f64,
+    }
+
+    impl<M: FitModel> FitModel for Offset<M> {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let from: Vec<f64> = params.iter().map(|p| p - self.origin).collect();
+            self.model.evaluate(&from)
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free: &[usize],
+            y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let from: Vec<f64> = params.iter().map(|p| p - self.origin).collect();
+            self.model.analytical_jacobian(&from, free, y_current)
+        }
+    }
+
     #[test]
     fn a_fit_no_step_lowers_converges_with_no_decrease_left_to_a_parameter_on_its_own() {
         let x: Vec<f64> = (0..200).map(|i| f64::from(i) / 99.5 - 1.0).collect();
@@ -1258,7 +1291,21 @@ mod tests {
         let observed = [9.9e7, 1.01e8, 1e30];
         let config = PoissonConfig::default();
         let hidden = poisson_fit(&model, &observed, &[], &mut two_free(), &config).unwrap();
-        for untested in [walled, unseen, hidden] {
+        // Every step rounds away against parameters of 1e16.
+        let model = Offset {
+            model: Affine {
+                offset: vec![1e8; 2],
+                jacobian: vec![vec![1e8, 1e8], vec![1e8, 1.00001e8]],
+            },
+            origin: 1e16,
+        };
+        let mut far = ParameterSet::new(
+            ["a", "b"]
+                .map(|name| FitParameter::unbounded(name, 1e16))
+                .to_vec(),
+        );
+        let lost = poisson_fit(&model, &[9.9e7, 1.01e8], &[], &mut far, &config).unwrap();
+        for untested in [walled, unseen, hidden, lost] {
             assert_eq!(untested.stop, Stop::NoStep, "{}", report(&untested));
             assert!(
                 untested.own.unwrap() < NEWTON_DECREMENT_TOL,
