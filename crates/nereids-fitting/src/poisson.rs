@@ -235,7 +235,9 @@ pub struct PoissonResult {
     pub iterations: usize,
     /// Whether the expected-information Newton decrement fell below 1e-6
     /// inside the bounds: within about 0.0014 standard errors of a minimum
-    /// where the deviance is quadratic there; see [`poisson_fit`].
+    /// where the deviance is quadratic there; see [`poisson_fit`].  Also true
+    /// where no step lowered the objective with less than 1e-6 of
+    /// `determined` left.
     pub converged: bool,
     /// The rule that ended the fit.
     pub stop: Stop,
@@ -246,6 +248,9 @@ pub struct PoissonResult {
     /// The Newton decrement where the fit last took its slopes: the decrease
     /// the expected information predicts is left.  `None` before the first.
     pub decrement: Option<f64>,
+    /// The part of `decrement` along the directions the counts and priors
+    /// determine, those the error bars keep.
+    pub determined: Option<f64>,
     /// The trial steps the fit rejected.
     pub rejected: Rejected,
     /// Final parameter values (all parameters, including fixed).
@@ -291,7 +296,9 @@ pub struct Rejected {
 /// The rule that ended [`poisson_fit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    /// The Newton decrement fell below [`NEWTON_DECREMENT_TOL`].
+    /// The Newton decrement fell below [`NEWTON_DECREMENT_TOL`], or no step
+    /// lowers the objective and its part along the directions the counts and
+    /// priors determine is below it.
     Minimum,
     /// The objective is not finite at the start, as when a count is predicted
     /// negative, or zero where something was counted.
@@ -302,7 +309,8 @@ pub enum Stop {
     Decomposition,
     /// `max_iter` steps were taken.
     StepLimit,
-    /// No step lowers the objective.
+    /// No step lowers the objective, with [`NEWTON_DECREMENT_TOL`] or more
+    /// left along the directions the counts and priors determine.
     NoStep,
 }
 
@@ -584,16 +592,23 @@ impl Decomposition {
         residual_part + zero_part / self.singular[k]
     }
 
-    fn newton_decrement(&self, linear: &Linearization) -> f64 {
-        0.5 * self
-            .spanned()
+    fn newton_decrement(
+        &self,
+        directions: impl Iterator<Item = usize>,
+        linear: &Linearization,
+    ) -> f64 {
+        0.5 * directions
             .map(|k| self.along(k, linear).powi(2))
             .sum::<f64>()
     }
 
-    fn moving(&self, linear: &Linearization) -> Vec<usize> {
+    fn moving(
+        &self,
+        directions: impl Iterator<Item = usize>,
+        linear: &Linearization,
+    ) -> Vec<usize> {
         let share = |k: &usize| self.along(*k, linear).abs();
-        let Some(k) = self.spanned().max_by(|a, b| share(a).total_cmp(&share(b))) else {
+        let Some(k) = directions.max_by(|a, b| share(a).total_cmp(&share(b))) else {
             return Vec::new();
         };
         let weights = &self.right[k];
@@ -834,6 +849,10 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// decrease.  Where the deviance is quadratic near the minimum this puts the
 /// fit within about 0.0014 standard errors of it, and within 0.01 where the
 /// expected information overstates the curvature, as at one count per bin.
+/// The fit has also converged when no step lowers the objective and the part
+/// of that decrement along the directions the counts and priors determine,
+/// those with at least 1e-12 of one parameter's own information, is below
+/// 1e-6: the counts cannot tell the rest apart.
 /// Where it is not quadratic — weakly determined parameters on a curved or
 /// flat likelihood ridge, a minimum at infinity, or a parameter that adds
 /// counts to a bin predicted near zero — the fit can stop short of the
@@ -841,7 +860,8 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// errors.  A minimum where a bin's prediction reaches zero inside the box is
 /// reported unconverged.
 ///
-/// It stops unconverged when no step lowers the objective, when the Jacobian
+/// It stops unconverged when no step lowers the objective with more than that
+/// left along those directions, when the Jacobian
 /// weighted by its bins is not finite or its decomposition fails, when the
 /// objective is not finite at the start, as for a negative count or zero where
 /// something was counted, or after `config.max_iter` steps;
@@ -921,6 +941,7 @@ pub fn poisson_fit(
     let mut stop = Stop::Start;
     let mut moving = Vec::new();
     let mut decrement = None;
+    let mut determined = None;
     let mut rejected = Rejected::default();
     let mut damping = INITIAL_DAMPING;
     while value.is_finite() {
@@ -942,8 +963,10 @@ pub fn poisson_fit(
             stop = Stop::Decomposition;
             break;
         };
-        let left = decomposition.newton_decrement(&linear);
+        let left = decomposition.newton_decrement(decomposition.spanned(), &linear);
+        let kept = decomposition.newton_decrement(decomposition.determined(), &linear);
         decrement = Some(left);
+        determined = Some(kept);
         if left < NEWTON_DECREMENT_TOL {
             at_minimum = Some(linear);
             stop = Stop::Minimum;
@@ -951,7 +974,7 @@ pub fn poisson_fit(
         }
         if iterations == config.max_iter {
             stop = Stop::StepLimit;
-            moving = decomposition.moving(&linear);
+            moving = decomposition.moving(decomposition.spanned(), &linear);
             break;
         }
         let start = params.free_values();
@@ -984,8 +1007,13 @@ pub fn poisson_fit(
             damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
         }
         let Some((trial_model, trial_value)) = accepted else {
-            stop = Stop::NoStep;
-            moving = decomposition.moving(&linear);
+            if kept < NEWTON_DECREMENT_TOL {
+                at_minimum = Some(linear);
+                stop = Stop::Minimum;
+            } else {
+                stop = Stop::NoStep;
+                moving = decomposition.moving(decomposition.determined(), &linear);
+            }
             break;
         };
         y_model = trial_model;
@@ -1020,6 +1048,7 @@ pub fn poisson_fit(
         stop,
         moving,
         decrement,
+        determined,
         rejected,
         params: params.all_values(),
         covariance,
@@ -1103,6 +1132,72 @@ mod tests {
             }
             Some(jacobian)
         }
+    }
+
+    /// Counts `1e6·(a + b·(1 + tilt·x))`: only the tilt tells `a` from `b`.
+    struct Tilted {
+        x: Vec<f64>,
+        tilt: f64,
+    }
+
+    impl FitModel for Tilted {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(self
+                .x
+                .iter()
+                .map(|x| 1e6 * (params[0] + params[1] * (1.0 + self.tilt * x)))
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(self.x.len(), free.len());
+            for (row, x) in self.x.iter().enumerate() {
+                for (col, &index) in free.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = [1e6, 1e6 * (1.0 + self.tilt * x)][index];
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_fit_converges_along_the_directions_the_counts_determine() {
+        let model = Tilted {
+            x: (0..200).map(|i| f64::from(i) / 99.5 - 1.0).collect(),
+            tilt: 1e-12,
+        };
+        let observed: Vec<f64> = model.x.iter().map(|x| 2e6 * (1.0 + 0.01 * x)).collect();
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.3),
+            FitParameter::unbounded("b", 0.4),
+        ]);
+        let fit = poisson_fit(
+            &model,
+            &observed,
+            &[],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fit.stop,
+            Stop::Minimum,
+            "{:?} {:?}",
+            fit.decrement,
+            fit.rejected
+        );
+        assert!(
+            (fit.params[0] + fit.params[1] - 2.0).abs() < 1e-9,
+            "{:?}",
+            fit.params
+        );
+        assert!(fit.deviance > 1e3, "{}", fit.deviance);
+        assert_eq!(fit.uncertainties, Some(vec![None, None]));
     }
 
     fn decay(jacobian_factor: f64) -> Decay {
