@@ -209,10 +209,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A fit that none of its trial steps lowers has converged when no fitted
   quantity, the others held, has 1e-6 of decrease left and those steps tested
   that: the last rejected one predicted to lower the objective beyond its
-  rounding was evaluated, as taken still predicted so, and none after it was
-  refused or impossible. It ended with "no step of the fitter lowers the
-  objective" before, where the predicted decrease stayed large along a
-  direction the counts determine weakly although no step delivered it.
+  rounding was evaluated, as taken still predicted so, none after it was
+  refused or impossible, and accepted steps since have lowered the objective
+  by no more than its rounding in all. It ended with "no step of the fitter
+  lowers the objective" before, where the predicted decrease stayed large
+  along a direction the counts determine weakly although no step delivered
+  it.
 - A counts fit keeps each step within a trust radius (J. J. Moré, Lect. Notes
   Math. 630, 105–116, 1978) and follows a narrow curved valley to its minimum.
   Damping ten times more after each rejected step, never under 1e-3, reached

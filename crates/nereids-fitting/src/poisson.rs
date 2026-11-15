@@ -1015,6 +1015,8 @@ pub fn poisson_fit(
     let mut rejected = Rejected::default();
     let mut radius: Option<f64> = None;
     let mut last = None;
+    // The objective where `rejected.tested` was recorded.
+    let mut tested_at = value;
     while value.is_finite() {
         let linear = linearize(model, params, &free, priors, y_obs, &y_model)?;
         if !linear
@@ -1076,7 +1078,7 @@ pub fn poisson_fit(
                         } else {
                             length / 4.0
                         });
-                        if value - trial_value > resolved {
+                        if tested_at - trial_value > resolved {
                             (rejected.tested, last) = (None, None);
                         }
                         accepted = Some((trial_model, trial_value));
@@ -1104,6 +1106,7 @@ pub fn poisson_fit(
                     .filter(|_| as_taken > resolved)
                     .map(|rise| (as_taken, rise));
                 last = rejected.tested.map(|_| taken);
+                tested_at = value;
             }
             params.set_free_values(&start);
             radius = Some(length / 4.0);
@@ -2848,6 +2851,77 @@ mod tests {
                 "{a}, {b}"
             );
         }
+    }
+
+    /// Counts that follow `script` call by call whatever the parameters, with slopes nearly parallel in bins 0–2.
+    struct Scripted {
+        script: Vec<Vec<f64>>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl FitModel for Scripted {
+        fn evaluate(&self, _: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            Ok(self.script[call.min(self.script.len() - 1)].clone())
+        }
+
+        fn analytical_jacobian(&self, _: &[f64], free: &[usize], _: &[f64]) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(4, free.len());
+            for (row, slopes) in [[1e4, 1e4], [0.0, 300.0], [1e4, 1e4]].iter().enumerate() {
+                for (col, &index) in free.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = slopes[index];
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_failed_trial_is_no_test_once_accepted_steps_have_lowered_the_fit_past_rounding() {
+        // Bin 1 leaves a decrease along the weak direction only; bin 3 sets the objective's rounding.
+        let observed = [1e8, 1e8 + 316.0, 1e8, 1.1e4];
+        let at = |ulps: u64| vec![1e8, 1e8, 1e8, f64::from_bits(1e4_f64.to_bits() + ulps)];
+        let value = |ulps: u64| objective(&observed, &at(ulps), &[], &two_free());
+        let resolved = f64::EPSILON * (4.0 * value(0) + 1e3 + 316.0);
+        // Fifteen steps, each lowering the fit by under 0.9 of its rounding.
+        let mut steps = vec![0];
+        for ulps in 1..100 {
+            let last = value(*steps.last().unwrap());
+            if steps.len() < 16 && value(ulps) < last && last - value(ulps) < 0.9 * resolved {
+                steps.push(ulps);
+            }
+        }
+        assert!(
+            steps.len() == 16 && value(0) - value(steps[2]) > resolved,
+            "{steps:?}"
+        );
+        // A trial that rises, then those steps, then none lowers the fit.
+        let rise = [vec![9.9e7], at(0)[1..].to_vec()].concat();
+        let model = Scripted {
+            script: [
+                vec![at(0), rise],
+                steps[1..].iter().map(|&k| at(k)).collect(),
+            ]
+            .concat(),
+            calls: std::cell::Cell::new(0),
+        };
+        let fit = poisson_fit(
+            &model,
+            &observed,
+            &[],
+            &mut two_free(),
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(fit.stop, Stop::NoStep, "{:?} {:?}", fit.rejected, fit.own);
+        assert!(
+            fit.iterations == 15 && fit.own.unwrap().1 < NEWTON_DECREMENT_TOL,
+            "{:?} {:?}",
+            fit.iterations,
+            fit.own
+        );
+        assert!(fit.rejected.tested.is_none(), "{:?}", fit.rejected);
     }
 
     struct Shrinking;
