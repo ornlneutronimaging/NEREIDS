@@ -217,6 +217,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Math. 630, 105–116, 1978) and follows a narrow curved valley to its minimum.
   Damping ten times more after each rejected step, never under 1e-3, reached
   the step limit there.
+- A fitted beam's spline coefficients are bounded below at the beam that
+  records fewer than `NEGLIGIBLE_PREDICTION` counts in the whole open-beam run.
+  Inside a black line of the open beam, such as a cadmium filter's, they ran
+  off without limit: the beam got a cliff at a knot, the predicted counts
+  stepped when the timing offset or flight path moved a grid point across it,
+  and the fit ended with "no step of the fitter lowers the objective". An
+  open-beam fit refused the richer beam such a line needs.
 - A time background's decay time `τ` that is not known is bounded below by the
   first bin's width, and a start or bound under it is refused. Far below a
   bin's width only `A·τ` shows in the counts, and a counts fit driven there

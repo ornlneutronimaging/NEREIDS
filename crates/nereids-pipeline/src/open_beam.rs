@@ -14,7 +14,7 @@ use nereids_physics::ikeda_carpenter::{
 };
 
 use crate::beam::BeamSpline;
-use crate::counts_fit::Value;
+use crate::counts_fit::{NEGLIGIBLE_PREDICTION, Value};
 use crate::error::PipelineError;
 use crate::pulse_calibration::PulsePrior;
 
@@ -212,8 +212,8 @@ pub struct OpenBeamFit {
     pub converged: bool,
     /// Covariance of the beam's coefficients, scaled by `overdispersion`, or
     /// at the Poisson scale when that is `None`; rows and columns of a
-    /// coefficient the counts leave undetermined are NaN.  `None` when the
-    /// fit did not converge.
+    /// coefficient the counts leave undetermined, or hold at a negligible
+    /// beam, are NaN.  `None` when the fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Variance of the counts over their Poisson variance, at least 1: the
     /// richest fitted beam's Pearson χ² over the bins predicted at least one
@@ -347,13 +347,10 @@ pub(crate) fn open_beam_with_intervals(
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let recorded: f64 = per_unit_beam.iter().zip(&live).map(|(c, l)| l * c).sum();
     let per_us = open_counts.iter().sum::<f64>() / recorded;
-    let mut ladder = vec![fit_beam(
-        &grid,
-        &BeamSpline::constant(u_first, u_last, per_us),
-        open_counts,
-        &live,
-        &known,
-    )?];
+    // A weaker beam records fewer than NEGLIGIBLE_PREDICTION counts in the open-beam run.
+    let negligible = (NEGLIGIBLE_PREDICTION / recorded).ln();
+    let ladder_start = BeamSpline::constant(u_first, u_last, per_us).above(negligible);
+    let mut ladder = vec![fit_beam(&grid, &ladder_start, open_counts, &live, &known)?];
     while let Some(start) = ladder
         .last()
         .filter(|candidate| candidate.fit.converged && admits(2 * candidate.beam.intervals()))
@@ -542,7 +539,10 @@ fn fit_beam(
             .coefficients()
             .iter()
             .enumerate()
-            .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
+            .map(|(i, &c)| FitParameter {
+                lower: start.floor(),
+                ..FitParameter::unbounded(format!("beam {i}"), c)
+            })
             .collect(),
     );
     let dispersion = vec![1.0; open_counts.len()];

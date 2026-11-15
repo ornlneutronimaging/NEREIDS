@@ -1680,9 +1680,13 @@ pub(crate) fn fit_counts_answer(
             .iter()
             .enumerate()
             .flat_map(|(r, beam)| {
-                beam.coefficients().iter().enumerate().map(move |(i, &c)| {
-                    FitParameter::unbounded(format!("beam {i} of region {r}"), c)
-                })
+                beam.coefficients()
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, &c)| FitParameter {
+                        lower: beam.floor(),
+                        ..FitParameter::unbounded(format!("beam {i} of region {r}"), c)
+                    })
             })
             .chain(sample_parameters)
             .chain(instrument)

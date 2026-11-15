@@ -13,6 +13,7 @@ pub struct BeamSpline {
     x_low: f64,
     x_high: f64,
     coefficients: Vec<f64>,
+    floor: f64,
 }
 
 impl BeamSpline {
@@ -21,7 +22,18 @@ impl BeamSpline {
             x_low: u_low.ln(),
             x_high: u_high.ln(),
             coefficients: vec![per_us.ln(); 4],
+            floor: f64::NEG_INFINITY,
         }
+    }
+
+    /// The spline whose fitted coefficients stay at or above `floor`.
+    pub(crate) fn above(self, floor: f64) -> Self {
+        Self { floor, ..self }
+    }
+
+    /// The lowest value a fit lets a coefficient take.
+    pub(crate) fn floor(&self) -> f64 {
+        self.floor
     }
 
     pub(crate) fn with_coefficients(&self, coefficients: &[f64]) -> Self {
