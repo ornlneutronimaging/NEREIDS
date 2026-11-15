@@ -32,12 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   lowers the objective" or "the fitter reached its step limit", and a pulse
   calibration's refusal quotes it. `PoissonResult::stop` is the fitter's
   rule, a `Stop`. Python has `CountsFit.unconverged`. At the step limit or
-  with no step the rule names the quantities the fit was still moving and the
-  decrease still predicted, as in "the fitter reached its step limit, still
-  moving time background A with a further decrease of 3.10e-2 predicted,
-  2.40e-5 at most by one quantity with the others held", and counts the
-  rejected trial steps that predicted an impossible count or that the model
-  refused: `PoissonResult::moving`, `decrement`, `own` and `rejected`.
+  with no step the rule names the quantities the fit was still moving, the
+  decrease still predicted and the quantity with most of it left on its own,
+  as in "the fitter reached its step limit, still moving time background A
+  with a further decrease of 3.10e-2 predicted, 2.40e-5 at most by time
+  background τ with the others held". With no step it gives the rise of the
+  last trial step that could lower the objective beside the decrease predicted
+  for it, and the quantity whose change in that step raised the objective most
+  when made alone, which names the quantity the predicted counts jump in, and
+  says so if the model gives other counts when asked again at the same
+  quantities. For that quantity it gives the rise at half the change and at
+  the opposite change, how many predicted counts the change moves, and the
+  count it moves most. It counts the rejected trial steps that predicted an
+  impossible count or that the model refused: `PoissonResult::moving`,
+  `decrement`, `own` and `rejected`.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
   sample_run)` calibrates the pulse on a foil of measured density and
   temperature and writes the pulse calibration file that
@@ -205,6 +213,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   refused or impossible. It ended with "no step of the fitter lowers the
   objective" before, where the predicted decrease stayed large along a
   direction the counts determine weakly although no step delivered it.
+- A counts fit keeps each step within a trust radius (J. J. Moré, Lect. Notes
+  Math. 630, 105–116, 1978) and follows a narrow curved valley to its minimum.
+  Damping ten times more after each rejected step, never under 1e-3, reached
+  the step limit there.
 - A time background's decay time `τ` that is not known is bounded below by the
   first bin's width, and a start or bound under it is refused. Far below a
   bin's width only `A·τ` shows in the counts, and a counts fit driven there

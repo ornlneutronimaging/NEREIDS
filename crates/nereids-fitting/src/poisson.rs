@@ -248,9 +248,10 @@ pub struct PoissonResult {
     /// The Newton decrement where the fit last took its slopes: the decrease
     /// the expected information predicts is left.  `None` before the first.
     pub decrement: Option<f64>,
-    /// The largest Newton decrement of one parameter with the others held,
-    /// `½gⱼ²/Fⱼⱼ`, where the fit last took its slopes.
-    pub own: Option<f64>,
+    /// The free parameter with the largest Newton decrement of its own, the
+    /// others held, and that decrement `½gⱼ²/Fⱼⱼ`, where the fit last took
+    /// its slopes.
+    pub own: Option<(usize, f64)>,
     /// The trial steps the fit rejected.
     pub rejected: Rejected,
     /// Final parameter values (all parameters, including fixed).
@@ -280,7 +281,7 @@ pub struct PoissonResult {
 }
 
 /// The trial steps [`poisson_fit`] rejected, counted by the reason.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Rejected {
     /// Trials the model refused, or predicted with another number of counts.
     pub refused: usize,
@@ -291,6 +292,21 @@ pub struct Rejected {
     pub not_lower: usize,
     /// The model's reason for the last trial it refused.
     pub reason: Option<String>,
+    /// The decrease predicted for the last trial that tested the fit, as
+    /// taken, and the rise it gave; `None` where the trials are no test.
+    pub tested: Option<(f64, f64)>,
+    /// Where no step lowered the objective, the free parameter whose move in
+    /// that trial raised it most when made alone, with the move and the rise.
+    pub alone: Option<(usize, f64, f64)>,
+    /// Where no step lowered the objective, its value when the model is
+    /// evaluated there again, less the value the fit held.
+    pub again: Option<f64>,
+    /// The rises half the move of [`Self::alone`] and its opposite gave, unless a bound stops one.
+    pub around: Option<[f64; 2]>,
+    /// The count whose share of the objective that move changed most, its
+    /// prediction before and after, and how many predictions the move
+    /// changed by over 1e-6 of themselves.
+    pub most: Option<(usize, f64, f64, usize)>,
 }
 
 /// The rule that ended [`poisson_fit`].
@@ -356,8 +372,6 @@ const MAX_REJECTIONS: usize = 60;
 
 const INITIAL_DAMPING: f64 = 1e-3;
 
-const DAMPING_FACTOR: f64 = 10.0;
-
 /// `obs·ln(obs/mean) + mean − obs`, by C. Loader's `bd0` ("Fast and
 /// accurate computation of binomial probabilities", 2000): a series in
 /// `v = (obs − mean)/(obs + mean)` when `|obs − mean| < 0.1 (obs + mean)`.
@@ -387,17 +401,17 @@ pub fn half_deviance(obs: f64, mean: f64) -> f64 {
     }
 }
 
+fn share(obs: f64, mean: f64) -> f64 {
+    if mean > 0.0 || (mean == 0.0 && obs == 0.0) {
+        half_deviance(obs, mean)
+    } else {
+        f64::INFINITY
+    }
+}
+
 fn deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
-    y_obs
-        .iter()
-        .zip(y_model)
-        .map(|(&obs, &mean)| {
-            if mean > 0.0 || (mean == 0.0 && obs == 0.0) {
-                half_deviance(obs, mean)
-            } else {
-                f64::INFINITY
-            }
-        })
+    (y_obs.iter().zip(y_model))
+        .map(|(&obs, &mean)| share(obs, mean))
         .sum()
 }
 
@@ -616,13 +630,13 @@ impl Decomposition {
             .sum::<f64>()
     }
 
-    /// The largest Newton decrement of one column's parameter, the others
-    /// held: `½gⱼ²/Fⱼⱼ`.
-    fn own(&self, linear: &Linearization) -> f64 {
+    /// The column whose parameter has the largest Newton decrement with the
+    /// others held, and that decrement `½gⱼ²/Fⱼⱼ`.
+    fn own(&self, linear: &Linearization) -> Option<(usize, f64)> {
         let columns = self.columns.iter().enumerate();
         columns
-            .map(|(i, &col)| 0.5 * self.unscale(i, linear.gradient[col]).powi(2))
-            .fold(0.0, f64::max)
+            .map(|(i, &col)| (col, 0.5 * self.unscale(i, linear.gradient[col]).powi(2)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
     }
 
     fn moving(&self, linear: &Linearization) -> Vec<usize> {
@@ -662,6 +676,34 @@ impl Decomposition {
             }
         }
         direction
+    }
+
+    /// The length of the step at `damping` in the scaled coordinates, and
+    /// the slope of its square in `damping`, negated and halved.
+    fn reach(&self, linear: &Linearization, damping: f64) -> [f64; 2] {
+        let (mut square, mut slope) = (0.0, 0.0);
+        for k in self.spanned() {
+            let s = self.singular[k];
+            let coefficient = self.along(k, linear) * s / (s * s + damping);
+            square += coefficient.powi(2);
+            slope += coefficient.powi(2) / (s * s + damping);
+        }
+        [square.sqrt(), slope]
+    }
+
+    /// The damping whose step is `radius` long, 0 where the undamped step is
+    /// shorter (J. J. Moré, Lect. Notes Math. 630, 105–116, 1978, §5).
+    fn damping_within(&self, linear: &Linearization, radius: f64) -> f64 {
+        let mut damping = 0.0;
+        for _ in 0..100 {
+            let [length, slope] = self.reach(linear, damping);
+            let more = length.powi(2) / slope * (length - radius) / radius;
+            if length <= 1.1 * radius || !more.is_finite() {
+                break;
+            }
+            damping += more;
+        }
+        damping
     }
 
     fn leverage(&self, counts: usize) -> Vec<f64> {
@@ -853,12 +895,14 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// counted, is rejected; a bin predicted zero with no counts adds its slope
 /// to the gradient and nothing to the information.  Each step is the
 /// Levenberg–Marquardt step `(F + λI)⁻¹g` in coordinates scaled to unit
-/// Fisher information, projected onto the box;
-/// `λ` is divided by 10 after a step that lowers the objective, and
-/// multiplied by 10, to at least its starting 1e-3, before retrying one that
-/// does not (D. W. Marquardt, J. Soc. Indust. Appl. Math. 11, 431–441,
-/// 1963).  A free parameter on its bound whose gradient points out of the
-/// box is held there for the step and left out of the convergence test.
+/// Fisher information, projected onto the box, with `λ` 1e-3 at first and
+/// then that which keeps the step within a trust radius (J. J. Moré, Lect.
+/// Notes Math. 630, 105–116, 1978): twice the length of a step that
+/// delivers over three quarters of the decrease predicted for it as taken if
+/// that is longer, a quarter of the length of one that delivers under a
+/// quarter or does not lower the objective, which is then retried.  A free
+/// parameter on its bound whose gradient points out of the box is held there
+/// for the step and left out of the convergence test.
 ///
 /// The fit has converged when the Newton decrement `½ gᵀF⁺g` over the
 /// parameters not held by a bound (on it, gradient pointing out),
@@ -871,10 +915,11 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// The fit has also converged when none of its trial steps lowers the
 /// objective and the decrement of each parameter with the others held,
 /// `½gⱼ²/Fⱼⱼ`, is below 1e-6, provided those steps tested that since the fit
-/// last moved beyond the objective's rounding, `ε·n·|objective|` over `n`
-/// counts: the last rejected one predicted to lower the objective beyond that
-/// rounding was evaluated and, as taken after rounding and the bounds, still
-/// predicted so, and none rejected after it was refused or impossible.  Along
+/// last moved beyond the rounding of the objective and of the predicted
+/// counts, `ε·(n·|objective| + Σ|yᵢ − μᵢ|)` over `n` counts: the last
+/// rejected one predicted to lower the objective beyond that rounding was
+/// evaluated and, as taken after rounding and the bounds, still predicted so,
+/// and none rejected after it was refused or impossible.  Along
 /// a weakly determined direction a slope error, or a curvature the expected
 /// information leaves out, can keep `½ gᵀF⁺g` large where no decrease is
 /// left.
@@ -968,8 +1013,8 @@ pub fn poisson_fit(
     let mut decrement = None;
     let mut own = None;
     let mut rejected = Rejected::default();
-    let mut damping = INITIAL_DAMPING;
-    let mut tested = false;
+    let mut radius: Option<f64> = None;
+    let mut last = None;
     while value.is_finite() {
         let linear = linearize(model, params, &free, priors, y_obs, &y_model)?;
         if !linear
@@ -992,7 +1037,7 @@ pub fn poisson_fit(
         let left = decomposition.newton_decrement(&linear);
         let alone = decomposition.own(&linear);
         decrement = Some(left);
-        own = Some(alone);
+        own = alone;
         if left < NEWTON_DECREMENT_TOL {
             at_minimum = Some(linear);
             stop = Stop::Minimum;
@@ -1004,9 +1049,14 @@ pub fn poisson_fit(
             break;
         }
         let start = params.free_values();
-        let resolved = f64::EPSILON * y_obs.len() as f64 * value.abs();
+        let misfit: f64 = y_obs.iter().zip(&y_model).map(|(y, m)| (y - m).abs()).sum();
+        let resolved = f64::EPSILON * (y_obs.len() as f64 * value.abs() + misfit);
         let mut accepted = None;
         for _ in 0..MAX_REJECTIONS {
+            let damping = radius.map_or(INITIAL_DAMPING, |radius| {
+                decomposition.damping_within(&linear, radius)
+            });
+            let [length, _] = decomposition.reach(&linear, damping);
             let direction =
                 decomposition.step(decomposition.spanned(), &linear, free.len(), damping);
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
@@ -1014,12 +1064,21 @@ pub fn poisson_fit(
             let taken: Vec<f64> = (start.iter().zip(params.free_values()))
                 .map(|(x, trial)| x - trial)
                 .collect();
-            let finite = match model.evaluate(&params.all_values()) {
+            let rise = match model.evaluate(&params.all_values()) {
                 Ok(trial_model) if trial_model.len() == y_obs.len() => {
                     let trial_value = objective(y_obs, &trial_model, priors, params);
                     if trial_value < value {
-                        damping /= DAMPING_FACTOR;
-                        tested &= value - trial_value <= resolved;
+                        let gain = (value - trial_value) / linear.predicted(&taken);
+                        radius = Some(if gain > 0.75 {
+                            radius.map_or(2.0 * length, |radius| radius.max(2.0 * length))
+                        } else if gain >= 0.25 {
+                            radius.unwrap_or(length)
+                        } else {
+                            length / 4.0
+                        });
+                        if value - trial_value > resolved {
+                            (rejected.tested, last) = (None, None);
+                        }
                         accepted = Some((trial_model, trial_value));
                         break;
                     }
@@ -1027,31 +1086,81 @@ pub fn poisson_fit(
                         true => rejected.not_lower += 1,
                         false => rejected.impossible += 1,
                     }
-                    trial_value.is_finite()
+                    trial_value.is_finite().then_some(trial_value - value)
                 }
                 Ok(_) => {
                     rejected.refused += 1;
-                    false
+                    None
                 }
                 Err(reason) => {
                     rejected.refused += 1;
                     rejected.reason = Some(reason.to_string());
-                    false
+                    None
                 }
             };
-            if !finite || linear.predicted(&direction) > resolved {
-                tested = finite && linear.predicted(&taken) > resolved;
+            if rise.is_none() || linear.predicted(&direction) > resolved {
+                let as_taken = linear.predicted(&taken);
+                rejected.tested = rise
+                    .filter(|_| as_taken > resolved)
+                    .map(|rise| (as_taken, rise));
+                last = rejected.tested.map(|_| taken);
             }
             params.set_free_values(&start);
-            damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
+            radius = Some(length / 4.0);
         }
         let Some((trial_model, trial_value)) = accepted else {
-            if tested && alone < NEWTON_DECREMENT_TOL {
+            let alone = alone.map_or(0.0, |(_, left)| left);
+            if rejected.tested.is_some() && alone < NEWTON_DECREMENT_TOL {
                 at_minimum = Some(linear);
                 stop = Stop::Minimum;
             } else {
                 stop = Stop::NoStep;
                 moving = decomposition.moving(&linear);
+                let moves = last.iter().flatten().enumerate();
+                let alone = moves
+                    .filter(|(_, step)| **step != 0.0)
+                    .filter_map(|(j, step)| {
+                        let mut moved = start.clone();
+                        moved[j] -= step;
+                        params.set_free_values(&moved);
+                        let counts = model.evaluate(&params.all_values()).ok()?;
+                        (counts.len() == y_obs.len())
+                            .then(|| (j, -step, objective(y_obs, &counts, priors, params) - value))
+                    });
+                rejected.alone = alone.max_by(|a, b| a.2.total_cmp(&b.2));
+                if let Some((j, by, _)) = rejected.alone {
+                    let mut moved_by = |by: f64| {
+                        let mut moved = start.clone();
+                        moved[j] += by;
+                        params.set_free_values(&moved);
+                        if params.params[free[j]].value != moved[j] {
+                            return None;
+                        }
+                        let counts = model.evaluate(&params.all_values()).ok()?;
+                        (counts.len() == y_obs.len())
+                            .then(|| (objective(y_obs, &counts, priors, params) - value, counts))
+                    };
+                    rejected.around = (moved_by(0.5 * by).zip(moved_by(-by)))
+                        .map(|(half, opposite)| [half.0, opposite.0]);
+                    rejected.most = moved_by(by).and_then(|(_, counts)| {
+                        let changed = (y_model.iter().zip(&counts))
+                            .filter(|(before, after)| {
+                                (*after - *before).abs() > 1e-6 * before.abs()
+                            })
+                            .count();
+                        let change = |k: usize| {
+                            (share(y_obs[k], counts[k]) - share(y_obs[k], y_model[k])).abs()
+                        };
+                        (0..counts.len())
+                            .max_by(|&a, &b| change(a).total_cmp(&change(b)))
+                            .map(|k| (k, y_model[k], counts[k], changed))
+                    });
+                }
+                params.set_free_values(&start);
+                let again = model.evaluate(&params.all_values()).ok();
+                rejected.again = again
+                    .filter(|counts| counts.len() == y_obs.len())
+                    .map(|counts| objective(y_obs, &counts, priors, params) - value);
             }
             break;
         };
@@ -1306,6 +1415,13 @@ mod tests {
 
         let wrong = fit(1e-4, 1e-2, 2, [level, 0.0], None);
         assert_eq!(wrong.stop, Stop::NoStep, "{}", report(&wrong));
+        let (alone, left) = wrong.own.unwrap();
+        let (predicted, rise) = wrong.rejected.tested.unwrap();
+        assert!(
+            alone == 1 && left > NEWTON_DECREMENT_TOL && predicted > 0.0 && rise >= 0.0,
+            "{}",
+            report(&wrong)
+        );
 
         // Every step toward b = 0 lowers a, which the last bin forbids.
         let walled = fit(1e-4, 0.0, 2, [level + 1.0, -1.0], Some(level + 1.0));
@@ -1343,11 +1459,128 @@ mod tests {
         for untested in [walled, unseen, hidden, lost, coarse] {
             assert_eq!(untested.stop, Stop::NoStep, "{}", report(&untested));
             assert!(
-                untested.own.unwrap() < NEWTON_DECREMENT_TOL,
+                untested.own.unwrap().1 < NEWTON_DECREMENT_TOL
+                    && untested.rejected.tested.is_none(),
                 "{}",
                 report(&untested)
             );
         }
+    }
+
+    /// Ten bins `1e6 + 1e3·(a + b·x)`, the first with 5e4 more once `b ≥ 1`.
+    struct Jump;
+
+    impl FitModel for Jump {
+        fn evaluate(&self, p: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let step = |i: usize| if i == 0 && p[1] >= 1.0 { 5e4 } else { 0.0 };
+            Ok((0..10)
+                .map(|i| 1e6 + 1e3 * (p[0] + p[1] * (i as f64 / 9.0 - 0.5)) + step(i))
+                .collect())
+        }
+
+        fn analytical_jacobian(&self, _: &[f64], _: &[usize], _: &[f64]) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(10, 2);
+            for i in 0..10 {
+                *jacobian.get_mut(i, 0) = 1e3;
+                *jacobian.get_mut(i, 1) = 1e3 * (i as f64 / 9.0 - 0.5);
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_fit_stopped_at_a_jump_of_the_counts_names_the_quantity_that_jumps() {
+        let observed: Vec<f64> = (0..10)
+            .map(|i| 1e6 + 2e3 * (i as f64 / 9.0 - 0.5))
+            .collect();
+        let config = PoissonConfig::default();
+        let fit = poisson_fit(&Jump, &observed, &[], &mut two_free(), &config).unwrap();
+        assert_eq!(fit.stop, Stop::NoStep, "{fit:?}");
+        let (predicted, rise) = fit.rejected.tested.unwrap();
+        let (alone, moved, risen) = fit.rejected.alone.unwrap();
+        assert!(
+            rise > 1e3 && predicted < 1e-3 && alone == 1 && moved > 0.0 && risen > 1e3,
+            "{fit:?}"
+        );
+        assert_eq!(fit.rejected.again, Some(0.0));
+        let [half, opposite] = fit.rejected.around.unwrap();
+        let (most, before, after, changed) = fit.rejected.most.unwrap();
+        assert!(
+            half > 1e3 && opposite.abs() < 1.0 && (most, changed) == (0, 1) && after - before > 4e4,
+            "{fit:?}"
+        );
+        // On a lower bound just under the jump, the opposite move cannot be made.
+        let under = f64::from_bits(1.0_f64.to_bits() - 1);
+        let mut bounded = two_free();
+        bounded.params[1].value = under;
+        bounded.params[1].lower = under;
+        let fit = poisson_fit(&Jump, &observed, &[], &mut bounded, &config).unwrap();
+        assert_eq!(fit.stop, Stop::NoStep, "{fit:?}");
+        assert!(
+            fit.rejected.alone.is_some() && fit.rejected.around.is_none(),
+            "{fit:?}"
+        );
+    }
+
+    /// Two bins `1e6 ± 1e3·a`, halfway to 1.005e6 the first time they are asked for.
+    struct Fickle(std::cell::Cell<bool>);
+
+    impl FitModel for Fickle {
+        fn evaluate(&self, p: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let pull = if self.0.replace(false) { 0.5 } else { 0.0 };
+            Ok([1.0, -1.0]
+                .map(|sign| 1e6 + 1e3 * sign * p[0])
+                .map(|count| count + pull * (1.005e6 - count))
+                .to_vec())
+        }
+
+        fn analytical_jacobian(&self, _: &[f64], _: &[usize], _: &[f64]) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(2, 1);
+            jacobian.data = vec![1e3, -1e3];
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_model_that_changes_its_counts_at_the_same_parameters_is_reported() {
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("a", 3.0)]);
+        let model = Fickle(std::cell::Cell::new(true));
+        let config = PoissonConfig::default();
+        let fit = poisson_fit(&model, &[1.005e6; 2], &[], &mut params, &config).unwrap();
+        assert_eq!(fit.stop, Stop::NoStep, "{fit:?}");
+        assert!(fit.rejected.again.unwrap() > 20.0, "{fit:?}");
+    }
+
+    /// Two bins near 1e6 counts, half deviance about `½[(k(v − u²))² + (1 − u)²]`.
+    struct Curved(f64);
+
+    impl FitModel for Curved {
+        fn evaluate(&self, p: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![
+                1e6 + self.0 * 1e3 * (p[1] - p[0] * p[0]),
+                1e6 + 1e3 * (1.0 - p[0]),
+            ])
+        }
+
+        fn analytical_jacobian(&self, p: &[f64], _: &[usize], _: &[f64]) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(2, 2);
+            jacobian.data = vec![-2e3 * self.0 * p[0], 1e3 * self.0, -1e3, 0.0];
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_fit_follows_a_narrow_curved_valley_to_its_minimum() {
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("u", -1.2),
+            FitParameter::unbounded("v", 1.0),
+        ]);
+        let config = PoissonConfig::default();
+        let fit = poisson_fit(&Curved(300.0), &[1e6; 2], &[], &mut params, &config).unwrap();
+        assert!(
+            fit.converged && fit.params.iter().all(|p| (p - 1.0).abs() < 1e-5),
+            "{fit:?}"
+        );
     }
 
     fn decay(jacobian_factor: f64) -> Decay {
@@ -2314,9 +2547,9 @@ mod tests {
             (uphill.decrement.unwrap() - 100.0).abs() < 1e-9,
             "{uphill:?}"
         );
-        assert_eq!(impossible(&fit(0.4, f64::NEG_INFINITY)), (0, 4));
+        assert_eq!(impossible(&fit(0.4, f64::NEG_INFINITY)), (0, 1));
         let refused = fit(0.4, 45.0);
-        assert_eq!(impossible(&refused), (5, 0));
+        assert_eq!(impossible(&refused), (3, 0));
         assert_eq!(
             refused.rejected.reason.as_deref(),
             Some("model evaluation failed: below the floor")

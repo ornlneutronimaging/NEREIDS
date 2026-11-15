@@ -617,21 +617,68 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
                     .map(|&j| &*parameters.params[free[j]].name)
                     .collect();
                 let mut rule = stop.to_string();
-                if let (false, Some(left), Some(own)) =
+                if let (false, Some(left), Some((alone, own))) =
                     (names.is_empty(), result.decrement, result.own)
                 {
-                    let names = names.join(", ");
+                    let (names, alone) = (names.join(", "), &parameters.params[free[alone]].name);
                     rule += &format!(
                         ", still moving {names} with a further decrease of {left:.2e} predicted, \
-                         {own:.2e} at most by one quantity with the others held"
+                         {own:.2e} at most by {alone} with the others held"
                     );
                 }
                 let Rejected {
                     refused,
                     impossible,
                     reason,
+                    tested,
+                    alone,
+                    again,
+                    around,
+                    most,
                     ..
                 } = &result.rejected;
+                if let Some((predicted, rise)) = tested {
+                    rule += &format!(
+                        "; the last trial step that could lower the objective raised it by \
+                         {rise:.2e} where a decrease of {predicted:.2e} was predicted"
+                    );
+                }
+                if let Some((alone, moved, rise)) = *alone {
+                    let name = &parameters.params[free[alone]].name;
+                    rule += &format!(
+                        ", and its change of {name} by {moved:.2e} alone raised it by {rise:.2e}"
+                    );
+                }
+                if let Some([half, opposite]) = around {
+                    rule += &format!(
+                        "; half that change raised it by {half:.2e} and the opposite change by \
+                         {opposite:.2e}"
+                    );
+                }
+                if let Some((k, before, after, changed)) = *most {
+                    let edges = grid.time_edges_us();
+                    let (block, bin) = (k / (edges.len() - 1), k % (edges.len() - 1));
+                    let run = ["open-beam", "sample"][block % 2];
+                    let scale = Some(dispersion[k]).filter(|d| d.is_finite()).unwrap_or(1.0);
+                    // A negative prediction is passed to the fitter undivided.
+                    let raw = |count: f64| if count < 0.0 { count } else { scale * count };
+                    rule += &format!(
+                        "; it changed {changed} predicted counts by more than 1e-6 of themselves, \
+                         most the {run} count of region {} from {:.3} to {:.3} µs, from {:.6e} to \
+                         {:.6e}",
+                        block / 2,
+                        edges[bin],
+                        edges[bin + 1],
+                        raw(before),
+                        raw(after)
+                    );
+                }
+                if let Some(again) = again.filter(|again| *again != 0.0) {
+                    rule += &format!(
+                        "; evaluated again at the same quantities the objective differs by \
+                         {again:.2e}"
+                    );
+                }
                 if refused + impossible > 0 {
                     rule += &format!(
                         "; {impossible} of its rejected trial steps predicted a negative count, \
@@ -891,12 +938,16 @@ pub(crate) mod tests {
         )
         .expect("fit");
         assert!(!fit.converged);
+        let rule = fit.unconverged.expect("rule");
+        let (stall, trial) = rule.split_once("; ").expect("two clauses");
         assert_eq!(
-            fit.unconverged.as_deref(),
-            Some(
-                "no step of the fitter lowers the objective, still moving level with a further \
-                 decrease of 1.00e2 predicted, 1.00e2 at most by one quantity with the others held"
-            )
+            stall,
+            "no step of the fitter lowers the objective, still moving level with a further \
+             decrease of 1.00e2 predicted, 1.00e2 at most by level with the others held"
+        );
+        assert!(
+            trial.starts_with("the last trial step that could lower the objective raised it by "),
+            "{trial}"
         );
     }
 
