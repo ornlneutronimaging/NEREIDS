@@ -606,6 +606,29 @@ fn a_dip_finer_than_every_candidate_is_reported_at_the_limit() {
 }
 
 #[test]
+fn the_richest_beam_has_two_bins_in_each_interval() {
+    let pulse = &pulses()[0].1;
+    // 64 bins over a fivefold range of flight time: 16 intervals would start 1.6 bins long.
+    let edges: Vec<f64> = (0..=64)
+        .map(|i| T0_US + 250.0 + 15.625 * f64::from(i))
+        .collect();
+    let mut grid =
+        FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &pulse.detector_pulse()).expect("grid");
+    for _ in 0..4 {
+        grid = grid.halved().expect("halved");
+    }
+    let counts: Vec<f64> = (predicted(&grid, &dipped(290.0, 20.0)).iter())
+        .map(|mu| mu.round())
+        .collect();
+    let fit = fit_open_beam(&edges, &counts, &calibration(pulse)).expect("fit");
+    assert!(
+        fit.beam.intervals() == 8 && fit.at_limit,
+        "{} intervals",
+        fit.beam.intervals()
+    );
+}
+
+#[test]
 fn counts_that_cannot_determine_the_beam_are_reported_undetermined() {
     let pulse = &pulses()[0].1;
     for sparse in [&[(60, 1.0)][..], &[(119, 3.0)]] {

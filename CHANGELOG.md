@@ -224,6 +224,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stepped when the timing offset or flight path moved a grid point across it,
   and the fit ended with "no step of the fitter lowers the objective". An
   open-beam fit refused the richer beam such a line needs.
+- An open-beam fit admits a beam only while each of its spline intervals spans
+  two bins or more. The intervals are uniform in the logarithm of flight time,
+  so the shortest could span 1.3 bins while the coefficients numbered under
+  half the bins overall. Where the pulse is wider than such intervals the
+  counts leave combinations of the coefficients nearly undetermined, and a
+  counts fit ended with "the fitter reached its step limit".
 - A time background's decay time `τ` that is not known is bounded below by the
   first bin's width, and a start or bound under it is refused. Far below a
   bin's width only `A·τ` shows in the counts, and a counts fit driven there

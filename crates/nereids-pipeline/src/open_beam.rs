@@ -253,7 +253,8 @@ pub struct OpenBeamFit {
 /// chance, are left out.
 ///
 /// The number of spline intervals doubles from one while the coefficients
-/// number at most half the bins.  Each candidate is fitted on a grid halved,
+/// number at most half the bins and each interval spans two bins or more.
+/// Each candidate is fitted on a grid halved,
 /// and the beam refitted on each finer grid, until the refitted beam's
 /// predicted counts differ from the coarser grid's by at most [`BOUND`].  A
 /// candidate that does not converge, or needs more grid points than allowed,
@@ -331,7 +332,10 @@ pub(crate) fn open_beam_with_intervals(
     let known = validate_known(known, time_edges_us.len() - 1)?;
 
     let coefficients = |intervals: usize| intervals + 3;
-    let admits = |intervals: usize| 2 * coefficients(intervals) <= open_counts.len();
+    let admits = |intervals: usize| {
+        2 * coefficients(intervals) <= open_counts.len()
+            && spans_two_bins(time_edges_us, t0_us, intervals)
+    };
     if !admits(1) {
         return Err(PipelineError::InvalidParameter(format!(
             "the open-beam fit needs at least {} time bins, one interval's {} coefficients \
@@ -420,6 +424,25 @@ pub(crate) fn open_beam_with_intervals(
         points: fit.points,
         halvings: fit.halvings,
     })
+}
+
+/// Whether each of `intervals` equal steps of `ln u` across the bins spans two bins or more.
+fn spans_two_bins(time_edges_us: &[f64], t0_us: f64, intervals: usize) -> bool {
+    let last = time_edges_us.len() - 1;
+    let (low, high) = (time_edges_us[0] - t0_us, time_edges_us[last] - t0_us);
+    let bins_before = |knot: usize| {
+        if knot == intervals {
+            return last as f64;
+        }
+        let t = t0_us + low * (high / low).powf(knot as f64 / intervals as f64);
+        let bin = time_edges_us
+            .partition_point(|edge| *edge <= t)
+            .clamp(1, last)
+            - 1;
+        bin as f64 + (t - time_edges_us[bin]) / (time_edges_us[bin + 1] - time_edges_us[bin])
+    };
+    // 1e-9 of a bin is the rounding of an interval that spans two bins exactly.
+    (0..intervals).all(|k| bins_before(k + 1) - bins_before(k) >= 2.0 - 1e-9)
 }
 
 pub(crate) fn validate_counts(run: &str, counts: &[f64], bins: usize) -> Result<(), PipelineError> {
@@ -906,6 +929,24 @@ pub(crate) mod tests {
             FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &pulse.detector_pulse())
                 .expect("grid"),
         )
+    }
+
+    #[test]
+    fn a_beam_interval_spans_two_bins_or_more() {
+        // 0.16 µs bins from 127.84 µs: 512 intervals start 0.41 µs long, 1024 start 0.20.
+        let fine: Vec<f64> = (0..=3262).map(|i| 127.84 + 0.16 * f64::from(i)).collect();
+        assert!(spans_two_bins(&fine, 0.0, 512) && !spans_two_bins(&fine, 0.0, 1024));
+        // Bins uniform in ln u: 32 intervals span two each, 64 one.
+        let even: Vec<f64> = (0..=64).map(|i| 3.0 + 100.0 * 1.02_f64.powi(i)).collect();
+        assert!(spans_two_bins(&even, 3.0, 32) && !spans_two_bins(&even, 3.0, 64));
+        // The last knot, recomputed, rounds below this last edge, past a bin one ulp wide.
+        let (low, high) = (347.21427154527134_f64, 460.0701208068366_f64);
+        assert!(low * (high / low) < high);
+        assert!(spans_two_bins(
+            &[low, f64::from_bits(high.to_bits() - 1), high],
+            0.0,
+            1
+        ));
     }
 
     struct Backwards;
