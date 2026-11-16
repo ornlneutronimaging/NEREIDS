@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `Filter` on `Measurement::filter` puts a filter, such as a cadmium sheet,
+  in the beam ahead of every region: both runs arrive multiplied by
+  `exp(−N·Σ x·σ)`, `σ` each isotope's total cross section broadened by the
+  free gas at the filter's temperature and `x` its share of the atoms. The
+  counts fit holds the areal density `N` known, fits it or takes it measured
+  and reports it as `CountsFit::filter_density`; its open-beam fits hold `N`
+  at its start, and the filter's lines join the grid's fineness rule. Lines
+  narrower than the beam curve can follow pin `N`. Python:
+  `Measurement(filter=Filter(isotopes, areal_density, temperature_k))`.
 - A counts-fit `Material` gains `excluded_ranges`, a list of `ExcludedRange`: energy
   ranges where an isotope's evaluated cross section is wrong, each with the
   evidence as its reason. `fit_counts`, `fit_map` and a pulse calibration

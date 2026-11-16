@@ -152,8 +152,72 @@ pub struct Measurement {
     /// Neutrons the sample environment scatters evenly over the detector;
     /// `None` for none.
     pub environment_scatter: Option<EnvironmentScatter>,
+    /// A filter the beam crosses ahead of every region in both runs; `None`
+    /// for none.
+    pub filter: Option<Filter>,
     /// The regions, separate sets of pixels timed by one clock.
     pub regions: Vec<Region>,
+}
+
+/// A filter in the beam, such as a cadmium sheet, crossed by the neutrons of
+/// both runs before they reach any region.
+///
+/// Each run's arriving beam is `φ·exp(−N·Σ_i x_i σ_i)` at every flight time
+/// before the pulse, `σ_i` each isotope's total cross section broadened by the
+/// free gas at the filter's temperature.  The open-beam fits that start a
+/// counts fit hold `N` at its start.
+#[derive(Debug, Clone)]
+pub struct Filter {
+    /// Each isotope with its share `x_i` of the filter's atoms, finite and
+    /// positive.
+    pub isotopes: Vec<(ResonanceData, f64)>,
+    /// `N`, the filter's areal density in atoms/barn, known, fitted or
+    /// measured, at least 0.
+    pub areal_density: Value,
+    /// The filter's temperature in K, within 1–5000 K.
+    pub temperature_k: f64,
+}
+
+impl Filter {
+    /// `Σ_i x_i σ_i` in barns at `energies_ev`, ascending.
+    pub(crate) fn cross_section(&self, energies_ev: &[f64]) -> Result<Vec<f64>, PipelineError> {
+        let (low, high) = TEMPERATURE_BOUNDS_K;
+        if !(low..=high).contains(&self.temperature_k)
+            || self.isotopes.is_empty()
+            || !(self.isotopes.iter()).all(|(_, x)| x.is_finite() && *x > 0.0)
+        {
+            return Err(PipelineError::InvalidParameter(format!(
+                "a filter needs isotopes of finite, positive shares and a temperature within \
+                 {low}–{high} K, got shares {:?} at {} K",
+                self.isotopes.iter().map(|(_, x)| x).collect::<Vec<_>>(),
+                self.temperature_k
+            )));
+        }
+        let mut total = vec![0.0; energies_ev.len()];
+        for (isotope, share) in &self.isotopes {
+            let sigma = broadened(
+                energies_ev,
+                isotope,
+                self.temperature_k,
+                Channel::Total,
+                None,
+            )
+            .map_err(PipelineError::InvalidParameter)?;
+            for (t, s) in total.iter_mut().zip(&sigma.values) {
+                *t += share * s;
+            }
+        }
+        Ok(total)
+    }
+
+    /// The filter's cross section at `grid`'s points, in their order.
+    pub(crate) fn on_grid(&self, grid: &FlightTimeGrid) -> Result<Vec<f64>, PipelineError> {
+        let mut energies = grid.energies_ev();
+        energies.reverse();
+        let mut sigma = self.cross_section(&energies)?;
+        sigma.reverse();
+        Ok(sigma)
+    }
 }
 
 /// A [`Measurement::time_background`] of no counts.
@@ -360,6 +424,9 @@ pub struct CountsFit {
     /// The environment scatter's `s`: the known one, the fitted one, or 0
     /// without one.
     pub scatter_fraction: f64,
+    /// The filter's areal density `N` in atoms/barn: the known one, or the
+    /// fitted one; 0 without a filter.
+    pub filter_density: f64,
     /// Covariance of the fitted quantities among, in this order, each region's
     /// densities, in the order given, temperature and thickness variance,
     /// region by region; the
@@ -1638,6 +1705,8 @@ pub(crate) fn fit_counts_answer(
         live.extend(checked().map_err(|e| in_region(r, e))?.concat());
     }
 
+    let filter_start = starting(measurement, Role::Filter)?;
+    let filter = measurement.filter.as_ref().map(|f| (f, filter_start));
     let opens: Vec<BeamStart> = match beam_starts {
         BeamStarts::Given(starts) => starts.beams.clone(),
         BeamStarts::OpenFitsAt(numbers, ref intervals, ref offsets) => regions
@@ -1657,6 +1726,7 @@ pub(crate) fn fit_counts_answer(
                     Some(&live[2 * r * bins..(2 * r + 1) * bins]),
                     Some(&known),
                     intervals.as_ref().map(|chosen| chosen[r]),
+                    filter,
                 )
                 .map_err(|e| in_region(r, e))?;
                 Ok(BeamStart::from(open))
@@ -1749,6 +1819,21 @@ pub(crate) fn fit_counts_answer(
                 }
             }
         }
+        if let Some(filter) = &measurement.filter {
+            let energies = grid.energies_ev();
+            let span_ev = energies[energies.len() - 1]..=energies[0];
+            for (isotope, _) in &filter.isotopes {
+                let doppler = DopplerParams::new(filter.temperature_k, isotope.awr)
+                    .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
+                for energy in resonance_center_energies(&[isotope]) {
+                    if span_ev.contains(&energy) {
+                        let width_ev = half_maximum * doppler.doppler_width(energy);
+                        narrowest =
+                            narrowest.min(clock / energy.sqrt() * width_ev / (2.0 * energy));
+                    }
+                }
+            }
+        }
         Ok(narrowest)
     };
     let first_grid = |grid: &FlightTimeGrid,
@@ -1800,7 +1885,8 @@ pub(crate) fn fit_counts_answer(
                     )
                     .lattices(&lattices)
                     .spread(mixing.clone())
-                    .environment(scattered.clone()),
+                    .environment(scattered.clone())
+                    .filtered(measurement.filter.as_ref())?,
                     live: &live,
                 })
             },
@@ -1972,7 +2058,8 @@ pub(crate) fn fit_counts_answer(
             )
             .lattices(&lattices)
             .spread(mixing.clone())
-            .environment(scattered.clone()),
+            .environment(scattered.clone())
+            .filtered(measurement.filter.as_ref())?,
             live: &live,
         };
         nuclear_slopes(regions, &model, &dispersion, &parameters)?
@@ -2110,6 +2197,7 @@ pub(crate) fn fit_counts_answer(
         beams,
         resonances,
         lattices,
+        filter: measurement.filter.clone(),
         charge_ratio: *charge_ratio,
         frames,
         beam_origin_us,
@@ -2136,6 +2224,7 @@ pub(crate) fn fit_counts_answer(
         room_background: params[layout.room_background],
         spread_share: params[layout.spread],
         scatter_fraction: params[layout.environment],
+        filter_density: params[layout.filter],
         covariance,
         unbounded,
         on_bound,
@@ -2156,6 +2245,7 @@ pub(crate) struct Answer {
     beams: Vec<BeamSpline>,
     resonances: Vec<Arc<[ResonanceData]>>,
     lattices: Vec<Option<PhononSpectrum>>,
+    filter: Option<Filter>,
     charge_ratio: f64,
     frames: [f64; 2],
     beam_origin_us: f64,
@@ -2223,7 +2313,8 @@ impl Answer {
                 self.beam_origin_us,
                 &self.layout,
             )
-            .lattices(&self.lattices),
+            .lattices(&self.lattices)
+            .filtered(self.filter.as_ref())?,
             live: &self.live,
         };
         let predicted = model.evaluate(&self.params)?;
@@ -2484,6 +2575,7 @@ pub(crate) enum Role {
     RoomBackground,
     SpreadShare,
     ScatterFraction,
+    Filter,
     T0,
     FlightPath,
     Pulse(usize),
@@ -2526,6 +2618,7 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
             Role::RoomBackground,
             Role::SpreadShare,
             Role::ScatterFraction,
+            Role::Filter,
             Role::T0,
             Role::FlightPath,
         ])
@@ -2661,6 +2754,15 @@ fn quantity(
             "environment scatter fraction".into(),
             0.0..=1.0,
             "within 0–1".into(),
+        ),
+        Role::Filter => (
+            measurement
+                .filter
+                .as_ref()
+                .map_or(&Value::Known(0.0), |filter| &filter.areal_density),
+            "filter areal density".into(),
+            0.0..=f64::INFINITY,
+            "0 or more".into(),
         ),
         Role::Beam { .. } | Role::T0 | Role::FlightPath | Role::Pulse(_) => return None,
     })
@@ -2812,6 +2914,7 @@ struct Layout {
     room_background: usize,
     spread: usize,
     environment: usize,
+    filter: usize,
     t0: usize,
     flight_path: usize,
     pulse: usize,
@@ -2888,6 +2991,7 @@ impl Layout {
             room_background: at(Role::RoomBackground),
             spread: at(Role::SpreadShare),
             environment: at(Role::ScatterFraction),
+            filter: at(Role::Filter),
             t0: at(Role::T0),
             flight_path: at(Role::FlightPath),
             pulse: at(Role::Pulse(0)),
@@ -2913,6 +3017,7 @@ struct RegionsModel {
     clocks: RefCell<Option<Clocks>>,
     mixing: Option<Arc<Vec<Vec<f64>>>>,
     scattered: Option<Arc<Vec<f64>>>,
+    filter: Option<Vec<f64>>,
 }
 
 /// One [`Scale`] for each distinct `t0 + δt` of the regions, and each
@@ -3136,7 +3241,14 @@ impl RegionsModel {
             ))),
             mixing: None,
             scattered: None,
+            filter: None,
         }
+    }
+
+    /// The model with the beam crossing `filter` ahead of every region.
+    fn filtered(mut self, filter: Option<&Filter>) -> Result<Self, PipelineError> {
+        self.filter = filter.map(|f| f.on_grid(&self.grid)).transpose()?;
+        Ok(self)
     }
 
     /// The model with each region's material broadened by its lattice, or by
@@ -3256,10 +3368,16 @@ impl RegionsModel {
             .temperature
             .map(|t| self.at(region, params[t], TOTAL))
             .transpose()?;
-        let open: Vec<f64> = combined(&clocks.basis[region], &params[place.beam.clone()])
+        let mut open: Vec<f64> = combined(&clocks.basis[region], &params[place.beam.clone()])
             .into_iter()
             .map(f64::exp)
             .collect();
+        if let Some(sigma) = &self.filter {
+            let density = params[self.layout.filter];
+            for (phi, s) in open.iter_mut().zip(sigma) {
+                *phi *= (-density * s).exp();
+            }
+        }
         let normalized: Vec<f64> = open
             .iter()
             .map(|phi| self.charge_ratio * params[self.layout.normalization] * phi)
@@ -3785,6 +3903,21 @@ impl FitModel for RegionsModel {
                     })
                     .collect(),
                 Role::SpreadShare | Role::ScatterFraction => vec![],
+                Role::Filter => match &self.filter {
+                    Some(sigma) => (0..regions)
+                        .map(|r| {
+                            let less = |beam: &[f64]| -> Vec<f64> {
+                                beam.iter().zip(sigma).map(|(b, s)| -b * s).collect()
+                            };
+                            Some([
+                                (open_rows(r), counts(r, &less(&beams[r].open))?),
+                                (sample_rows(r), counts(r, &less(&beams[r].sample))?),
+                            ])
+                        })
+                        .collect::<Option<Vec<_>>>()?
+                        .concat(),
+                    None => vec![],
+                },
                 Role::RoomBackground => {
                     let [open_room, sample_room] = self.room_per_pixel();
                     (0..regions)
@@ -3977,6 +4110,7 @@ mod tests {
                 room_background: None,
                 spread: None,
                 environment_scatter: None,
+                filter: None,
                 regions: temperatures.iter().map(|&t| region(t)).collect(),
             };
             started_hot(&measurement).map(|hot| {
@@ -4170,6 +4304,7 @@ mod tests {
                 Role::RoomBackground => 2.0e-3,
                 Role::SpreadShare => 0.15,
                 Role::ScatterFraction => 0.0,
+                Role::Filter => 0.0,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0, 0.5, 0.5][n],
@@ -4264,6 +4399,7 @@ mod tests {
                 Role::RoomBackground => 2.0e-3,
                 Role::SpreadShare => 0.15,
                 Role::ScatterFraction => 0.12,
+                Role::Filter => 2.0e-4,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [
@@ -4280,6 +4416,12 @@ mod tests {
             &layout,
         )
         .lattices(&[lattice, None, None])
+        .filtered(Some(&Filter {
+            isotopes: vec![(synthetic_isotope(48, 113, 19.8, 0.01, 0.06), 1.0)],
+            areal_density: Value::Fitted(2.0e-4),
+            temperature_k: 295.0,
+        }))
+        .expect("filter")
         .spread((!scattered).then(|| {
             Arc::new(vec![
                 vec![0.8, 0.1, 0.05],
@@ -4390,6 +4532,7 @@ mod tests {
                 Role::TimingOffset { .. } => 0.0,
                 Role::SpreadShare => 0.0,
                 Role::ScatterFraction => 0.0,
+                Role::Filter => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0, 0.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -4417,6 +4560,7 @@ mod tests {
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             regions: materials
                 .into_iter()
                 .enumerate()
@@ -4612,6 +4756,7 @@ mod tests {
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             ..measurement
         };
         for (most_passes, settled) in [(1, false), (2, true)] {
@@ -4664,6 +4809,7 @@ mod tests {
                 Role::TimingOffset { .. } => 0.0,
                 Role::SpreadShare => 0.0,
                 Role::ScatterFraction => 0.0,
+                Role::Filter => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0, 0.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -4776,6 +4922,7 @@ mod tests {
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             regions: vec![
                 region(0, Some(material), background),
                 region(1, None, [Value::Known(0.0); 5]),
@@ -4896,7 +5043,7 @@ mod tests {
                 .copied()
                 .chain([3.0e-4, 5.0e-4, 300.0, 0.0, normalization])
                 .chain(background)
-                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
                 .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5])
                 .collect();

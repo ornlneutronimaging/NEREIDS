@@ -14,7 +14,7 @@ use nereids_physics::ikeda_carpenter::{
 };
 
 use crate::beam::BeamSpline;
-use crate::counts_fit::{NEGLIGIBLE_PREDICTION, Value};
+use crate::counts_fit::{Filter, NEGLIGIBLE_PREDICTION, Value};
 use crate::error::PipelineError;
 use crate::pulse_calibration::PulsePrior;
 
@@ -304,9 +304,12 @@ pub fn fit_open_beam(
         open_live,
         known,
         None,
+        None,
     )
 }
 
+/// The open-beam fit with `intervals` chosen, or by the ladder for `None`,
+/// through `filter` at its areal density, or through none.
 pub(crate) fn open_beam_with_intervals(
     time_edges_us: &[f64],
     open_counts: &[f64],
@@ -314,6 +317,7 @@ pub(crate) fn open_beam_with_intervals(
     open_live: Option<&[f64]>,
     known: Option<&[f64]>,
     intervals: Option<usize>,
+    filter: Option<(&Filter, f64)>,
 ) -> Result<OpenBeamFit, PipelineError> {
     let start: Vec<f64> = calibration
         .instrument()?
@@ -348,19 +352,22 @@ pub(crate) fn open_beam_with_intervals(
 
     let u_first = time_edges_us[0] - t0_us;
     let u_last = time_edges_us[time_edges_us.len() - 1] - t0_us;
-    let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
+    let constant = BeamSpline::constant(u_first, u_last, 1.0);
+    let unit = OpenBeamModel::new(&grid, &constant, &[]).filtered(filter)?;
+    let per_unit_beam = grid.predict(&unit.beam(constant.coefficients()))?;
     let recorded: f64 = per_unit_beam.iter().zip(&live).map(|(c, l)| l * c).sum();
     let per_us = open_counts.iter().sum::<f64>() / recorded;
     // A weaker beam records fewer than NEGLIGIBLE_PREDICTION counts in the open-beam run.
     let negligible = (NEGLIGIBLE_PREDICTION / recorded).ln();
     let ladder_start = BeamSpline::constant(u_first, u_last, per_us).above(negligible);
-    let mut ladder = vec![fit_beam(&grid, &ladder_start, open_counts, &live, &known)?];
+    let fit_beam = |start: &BeamSpline| fit_beam(&grid, start, open_counts, &live, &known, filter);
+    let mut ladder = vec![fit_beam(&ladder_start)?];
     while let Some(start) = ladder
         .last()
         .filter(|candidate| candidate.fit.converged && admits(2 * candidate.beam.intervals()))
         .map(|candidate| candidate.beam.refined())
     {
-        match fit_beam(&grid, &start, open_counts, &live, &known) {
+        match fit_beam(&start) {
             Ok(candidate) if candidate.fit.converged => ladder.push(candidate),
             Ok(_)
             | Err(PipelineError::FlightTimeGrid(FlightTimeGridError::TooManyPoints { .. })) => {
@@ -556,6 +563,7 @@ fn fit_beam(
     open_counts: &[f64],
     live: &[f64],
     known: &[f64],
+    filter: Option<(&Filter, f64)>,
 ) -> Result<Candidate, PipelineError> {
     let mut parameters = ParameterSet::new(
         start
@@ -577,7 +585,7 @@ fn fit_beam(
         &[],
         |grid| {
             Ok(Recorded {
-                model: OpenBeamModel::new(grid, start, known),
+                model: OpenBeamModel::new(grid, start, known).filtered(filter)?,
                 live,
             })
         },
@@ -827,6 +835,7 @@ pub(crate) struct OpenBeamModel {
     grid: Arc<FlightTimeGrid>,
     basis: Vec<[(usize, f64); 5]>,
     known: Vec<f64>,
+    transmission: Option<Vec<f64>>,
 }
 
 impl OpenBeamModel {
@@ -839,14 +848,32 @@ impl OpenBeamModel {
                 .map(|&u| beam.basis(u))
                 .collect(),
             known: known.to_vec(),
+            transmission: None,
         }
     }
 
+    /// The model with the beam crossing `filter` at its areal density.
+    pub(crate) fn filtered(
+        mut self,
+        filter: Option<(&Filter, f64)>,
+    ) -> Result<Self, PipelineError> {
+        self.transmission = filter
+            .map(|(filter, density)| {
+                let sigma = filter.on_grid(&self.grid)?;
+                Ok::<_, PipelineError>(sigma.iter().map(|s| (-density * s).exp()).collect())
+            })
+            .transpose()?;
+        Ok(self)
+    }
+
     pub(crate) fn beam(&self, coefficients: &[f64]) -> Vec<f64> {
-        combined(&self.basis, coefficients)
+        let beam = combined(&self.basis, coefficients)
             .into_iter()
-            .map(f64::exp)
-            .collect()
+            .map(f64::exp);
+        match &self.transmission {
+            Some(transmission) => beam.zip(transmission).map(|(phi, t)| phi * t).collect(),
+            None => beam.collect(),
+        }
     }
 
     pub(crate) fn log_slope(&self, index: usize) -> Vec<f64> {

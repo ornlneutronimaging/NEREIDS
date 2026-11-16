@@ -57,6 +57,7 @@ time-bin edges (microseconds), not an energy grid.
 | RoomBackground | Counts per microsecond per pixel per frame that follow each run's duration, and each run's frames. |
 | Spread | The share of each detector cell's counts recorded elsewhere, the spread kernel, and each region's cells. |
 | EnvironmentScatter | The fraction of the neutrons the sample environment scatters evenly over the detector, and the detector's mean counts per pixel in each bin of each run. |
+| Filter | A filter in the beam crossed by both runs: isotopes with their shares of its atoms, its areal density in atoms/barn, and its temperature in K. |
 | Measurement | The time-bin edges, charge ratio, normalization, time and room backgrounds and regions of one fit. |
 | Pulse | Ikeda-Carpenter pulse parameters and the energy span they hold over. |
 | Calibration | Timing offset t0 (microseconds), flight path (m), and Pulse. |
@@ -175,6 +176,13 @@ enters s this way. It needs the ratio of sample_mean to open_mean to change
 from bin to bin, as resonances make it; under a grey shadow alone s and the
 normalization do not separate. A spread and an environment
 scatter together are refused.
+filter is Filter(isotopes, areal_density, temperature_k) or None: both runs
+of every region arrive multiplied by exp(-N*sum(x_i*sigma_i)), sigma_i each
+isotope's total cross section broadened by the free gas at temperature_k and
+x_i its share of the filter's atoms. Give a filter whose lines are narrower
+than the beam curve can follow, such as a cadmium sheet; the fit then
+measures N, which CountsFit.filter_density reports. The open-beam fits that
+start the counts fit hold N at its start.
 
 #### Pulse
 

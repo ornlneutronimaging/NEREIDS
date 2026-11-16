@@ -21,8 +21,9 @@ use nereids_physics::lattice_doppler::{PhononSpectrum, broaden_in_lattice};
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
-    CountsFit, EnvironmentScatter, ExcludedRange, Material, Measurement, NEGLIGIBLE_PREDICTION,
-    NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Spread, Value, fit_counts,
+    CountsFit, EnvironmentScatter, ExcludedRange, Filter, Material, Measurement,
+    NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Spread, Value,
+    fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map, region_live};
 use nereids_pipeline::error::PipelineError;
@@ -266,6 +267,7 @@ fn measurement(
         room_background: None,
         spread: None,
         environment_scatter: None,
+        filter: None,
         regions: vec![Region {
             open_counts: open,
             sample_counts: sample,
@@ -386,6 +388,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         room_background: None,
         spread: None,
         environment_scatter: None,
+        filter: None,
         regions: (0..2)
             .map(|r| Region {
                 open_counts: rounded(&runs[r][0].0),
@@ -734,6 +737,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             regions: regions.to_vec(),
         };
         let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
@@ -1059,6 +1063,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             regions: (0..4)
                 .map(|j| {
                     region(
@@ -1139,6 +1144,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             regions: vec![Region {
                 open_counts,
                 sample_counts,
@@ -1326,6 +1332,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             regions: vec![
                 region(0..2, 0..2, Some(material.clone())),
                 region(0..2, 2..4, Some(material.clone())),
@@ -1500,6 +1507,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
                 room_background,
                 spread: None,
                 environment_scatter: None,
+                filter: None,
                 regions: vec![
                     region(0..2, 0..2, Some(material.clone())),
                     region(0..2, 2..4, Some(material.clone())),
@@ -1997,6 +2005,7 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
             room_background: None,
             spread,
             environment_scatter: None,
+            filter: None,
             regions,
         };
         fit_counts(&measurement, &calibration(&setup)).expect("fit")
@@ -2086,6 +2095,82 @@ fn scattered(
             .collect()
     });
     (recorded, detector_mean)
+}
+
+#[test]
+fn a_filter_in_the_beam_is_recovered_with_the_density_and_temperature() {
+    let setup = standard();
+    let (isotope, cadmium) = (
+        hafnium_like(20.0),
+        synthetic_isotope(48, 113, 24.0, 0.01, 0.06),
+    );
+    let (density, filter_density) = (5.0e-3, 1.0e-4);
+    let filtered = |sample: &[(ResonanceData, f64)]| {
+        let isotopes = [&[(cadmium.clone(), filter_density)][..], sample].concat();
+        move |energies: &[f64]| -> Vec<f64> {
+            let data: Vec<ResonanceData> = isotopes.iter().map(|(d, _)| d.clone()).collect();
+            let sigma = cross_sections(energies, &data, TEMPERATURE_K);
+            (0..energies.len())
+                .map(|j| {
+                    let depth: f64 = isotopes
+                        .iter()
+                        .zip(&sigma)
+                        .map(|((_, n), s)| n * s[j])
+                        .sum();
+                    (-depth).exp()
+                })
+                .collect()
+        }
+    };
+    let open = run_through(&setup, 1.0, &beam(1.0e3), &filtered(&[]));
+    let sample = run_through(
+        &setup,
+        CHARGE_RATIO,
+        &beam(1.0e3),
+        &filtered(&[(isotope.clone(), density)]),
+    );
+    let fit_with = |filter: Option<Filter>| {
+        let mut m = fitted_from(
+            measurement(
+                &setup,
+                (rounded(&open), rounded(&sample)),
+                &[(isotope.clone(), density)],
+            ),
+            330.0,
+        );
+        m.filter = filter;
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let filter = |areal_density| Filter {
+        isotopes: vec![(cadmium.clone(), 1.0)],
+        areal_density,
+        temperature_k: TEMPERATURE_K,
+    };
+    let fit = fit_with(Some(filter(Value::Fitted(5.0e-5))));
+    assert!(fit.converged, "{:?}", fit.unconverged);
+    let estimates = [
+        fit.regions[0].densities[0],
+        fit.temperature(),
+        fit.filter_density,
+    ];
+    let truths = [density, TEMPERATURE_K, filter_density];
+    let pulls: Vec<f64> = (0..3)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let none = fit_with(Some(filter(Value::Known(0.0))));
+    let without = fit_with(None);
+    assert_eq!(
+        (none.temperature(), none.deviance),
+        (without.temperature(), without.deviance)
+    );
+    assert!(
+        without.deviance > fit.deviance + 10.0,
+        "{} {}",
+        without.deviance,
+        fit.deviance
+    );
 }
 
 #[test]
@@ -6054,6 +6139,7 @@ mod maps {
                     room_background: None,
                     spread: None,
                     environment_scatter: None,
+                    filter: None,
                     regions,
                 },
                 calibration,
@@ -6321,6 +6407,7 @@ mod maps {
                 room_background: None,
                 spread: None,
                 environment_scatter: None,
+                filter: None,
                 regions: vec![tiled.region(&map, (0, 0))],
             },
             &Calibration {

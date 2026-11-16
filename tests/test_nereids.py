@@ -1158,6 +1158,18 @@ class TestCountsApi:
             ),
         )
         assert scattered.environment_scatter.fraction.value == 0.09
+        assert measurement.filter is None
+        filtered = nereids.Measurement(
+            time_edges_us=[1.0, 2.0, 3.0, 4.0, 5.0],
+            charge_ratio=1.0,
+            normalization=nereids.Value.fitted(1.0),
+            regions=[region],
+            filter=nereids.Filter(
+                [(_make_single_resonance(), 1.0)], nereids.Value.fitted(2e-4), 295.0
+            ),
+        )
+        assert filtered.filter.areal_density.value == 2e-4
+        assert filtered.filter.temperature_k == 295.0
 
     def test_fit_counts_requires_a_material(self):
         measurement = nereids.Measurement(
