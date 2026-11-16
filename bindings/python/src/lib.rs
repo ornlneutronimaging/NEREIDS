@@ -231,7 +231,13 @@ fn load_and_parse_endf(
                     PyErr::from(std::io::Error::new(io.kind(), message))
                 }
                 e if e.is_unavailable() => {
-                    pyo3::exceptions::PyConnectionError::new_err(format!("{prefix}{e}"))
+                    let path = retriever.cache_file_path(isotope, lib);
+                    pyo3::exceptions::PyConnectionError::new_err(format!(
+                        "{prefix}{e}\nFetch the file in a browser and pass the unzipped ENDF \
+                         file to load_endf_file, or save it as {}. NEREIDS_ENDF_CACHE sets \
+                         the cache folder.",
+                        path.display()
+                    ))
                 }
                 e => pyo3::exceptions::PyRuntimeError::new_err(format!("{prefix}{e}")),
             })?;
@@ -994,6 +1000,10 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 /// Load ENDF resonance data for an isotope, downloading the evaluation on
 /// first use and caching it in the user's cache directory.
 ///
+/// The environment variable NEREIDS_ENDF_CACHE, when set, names the cache
+/// folder instead; it holds one subfolder per library, such as
+/// JENDL-5/Ta-181.endf.
+///
 /// Mixed evaluations load with a UserWarning naming the
 /// parsed-but-not-evaluated spans.
 ///
@@ -1010,7 +1020,8 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 ///
 /// Raises:
 ///     ConnectionError: no download site could be reached, or one answered
-///         with an HTTP error other than 404 or refused the download.
+///         with an HTTP error other than 404 or refused the download. The
+///         message names the file's URL and its cache path.
 ///     OSError: the cache file named in the message could not be read or
 ///         written.
 ///     RuntimeError: the isotope is absent from the library (HTTP 404), or the

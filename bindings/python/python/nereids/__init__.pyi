@@ -447,12 +447,17 @@ def load_endf(
     """Load ENDF resonance data for an isotope, downloading the evaluation on
     first use and caching it in the user's cache directory.
 
+    The environment variable ``NEREIDS_ENDF_CACHE``, when set, names the cache
+    folder instead; it holds one subfolder per library, such as
+    ``JENDL-5/Ta-181.endf``.
+
     Mixed evaluations load with a ``UserWarning`` naming the
     parsed-but-not-evaluated spans.
 
     Raises:
         ConnectionError: no download site could be reached, or one answered
-            with an HTTP error other than 404 or refused the download.
+            with an HTTP error other than 404 or refused the download. The
+            message names the file's URL and its cache path.
         OSError: the cache file named in the message could not be read or
             written.
         RuntimeError: the isotope is absent from the library (HTTP 404), or

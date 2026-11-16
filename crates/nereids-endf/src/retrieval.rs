@@ -122,11 +122,21 @@ pub fn default_cache_file_path(isotope: &Isotope, library: EndfLibrary) -> PathB
     default_cache_dir(library).join(format!("{}-{}.endf", sym, isotope.a()))
 }
 
+// Lets a site share one pre-filled folder where downloads are blocked.
+const ENDF_CACHE_ENV: &str = "NEREIDS_ENDF_CACHE";
+
 fn default_cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("nereids")
-        .join("endf")
+    cache_root_from(std::env::var_os(ENDF_CACHE_ENV))
+}
+
+fn cache_root_from(env_root: Option<std::ffi::OsString>) -> PathBuf {
+    match env_root {
+        Some(root) if !root.is_empty() => PathBuf::from(root),
+        _ => dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("nereids")
+            .join("endf"),
+    }
 }
 
 /// ENDF file retrieval manager with local caching.
@@ -142,7 +152,7 @@ pub struct EndfRetriever {
 }
 
 impl EndfRetriever {
-    /// Create a new retriever with default cache location (~/.cache/nereids/endf/).
+    /// Create a new retriever with the cache root in `NEREIDS_ENDF_CACHE`, else `~/.cache/nereids/endf/`.
     pub fn new() -> Self {
         Self {
             cache_root: default_cache_root(),
@@ -848,6 +858,17 @@ mod tests {
                 retriever.cache_file_path(&w184, lib)
             );
         }
+    }
+
+    #[test]
+    fn cache_root_follows_env_value_unless_empty() {
+        assert_eq!(
+            cache_root_from(Some("/site/endf".into())),
+            PathBuf::from("/site/endf")
+        );
+        let user_root = cache_root_from(None);
+        assert!(user_root.ends_with("nereids/endf"));
+        assert_eq!(cache_root_from(Some("".into())), user_root);
     }
 
     #[test]
