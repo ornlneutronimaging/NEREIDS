@@ -399,6 +399,7 @@ class TestResonanceData:
         """The Fe-56 ENDF/B-VIII.1 cache file under ``tmp_path`` as HOME, on macOS and on Linux."""
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.delenv("NEREIDS_ENDF_CACHE", raising=False)
         return [
             tmp_path / root / "nereids" / "endf" / "ENDF-B-VIII.1" / "Fe-56.endf"
             for root in ("Library/Caches", ".")
@@ -412,8 +413,24 @@ class TestResonanceData:
             monkeypatch.setenv(name, "http://127.0.0.1:9")
         for name in ("NO_PROXY", "no_proxy"):
             monkeypatch.delenv(name, raising=False)
-        with pytest.raises(ConnectionError):
+        with pytest.raises(ConnectionError, match="load_endf_file") as raised:
             nereids.load_endf(26, 56)
+        assert "Fe-56.endf" in str(raised.value)
+
+    def test_cache_env_folder_is_read_without_network(self, tmp_path, monkeypatch):
+        """``NEREIDS_ENDF_CACHE`` names the folder a JENDL-5 file is read from."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "crates/nereids-endf/tests/data/u238_ex027.endf"), "rb") as f:
+            u238 = f.read()
+        cached = tmp_path / "JENDL-5" / "U-238.endf"
+        cached.parent.mkdir()
+        cached.write_bytes(u238)
+        monkeypatch.setenv("NEREIDS_ENDF_CACHE", str(tmp_path))
+        for name in ("HTTPS_PROXY", "https_proxy"):
+            monkeypatch.setenv(name, "http://127.0.0.1:9")
+        with pytest.warns(UserWarning, match="parsed but NOT evaluated"):
+            data = nereids.load_endf(92, 238, library="jendl5")
+        assert data.n_resonances == 1653
 
     @_CACHE_FOLLOWS_HOME
     def test_unreadable_cache_file_raises_os_error_naming_it(self, tmp_path, monkeypatch):

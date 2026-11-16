@@ -302,6 +302,14 @@ names include `endf8.0`, `endf8.1`, `jeff3.3`, `jendl5`, `tendl2023`, and
 afterwards. `load_endf_file(...)` parses a local ENDF file and does not
 download data.
 
+The cache is in the user's cache folder. Set the environment variable
+`NEREIDS_ENDF_CACHE` to use another folder, for example one folder that a
+site fills for all users where downloads are blocked. The folder holds one
+subfolder per library: `ENDF-B-VIII.0`, `ENDF-B-VIII.1`, `JEFF-3.3`,
+`JENDL-5`, `TENDL-2023`, or `CENDL-3.2`. Each file is named for its isotope,
+for example `JENDL-5/Ta-181.endf`. When a download fails, the
+`ConnectionError` gives the file's URL and its cache path.
+
 Both loaders evaluate resolved LRF=3 ranges, LRF=1/2 ranges without a
 competitive width (LRX=0), and LRF=7 ranges in the Reich-Moore form (KRM=3)
 without fission pairs. An LRF=7 range with an unsupported option raises
