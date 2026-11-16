@@ -590,6 +590,7 @@ pub fn fit_map<'a>(
         room_background: map.room_background,
         spread: None,
         environment_scatter: None,
+        filter: None,
         regions: Vec::new(),
     })?;
     let bins = starts_and_widths_us(&map.time_edges_us);
@@ -772,6 +773,7 @@ fn fit_map_from<'a>(
         room_background,
         spread: None,
         environment_scatter: None,
+        filter: None,
         regions,
     };
 
@@ -973,6 +975,7 @@ fn fit_map_from<'a>(
                     regions[r].open_live.as_deref(),
                     Some(&known),
                     intervals.and_then(|chosen| chosen[r]),
+                    None,
                 )
                 .map_err(|e| named(label, e))?
                 .into()

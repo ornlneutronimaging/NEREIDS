@@ -632,6 +632,7 @@ fn foil_alone(
         room_background: None,
         spread: None,
         environment_scatter: None,
+        filter: None,
         regions: vec![Region {
             open_counts: counts[0].to_vec(),
             sample_counts: counts[1].to_vec(),

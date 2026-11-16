@@ -25,8 +25,8 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::counts_fit::{
-    CountsFit, EnvironmentScatter, ExcludedRange, Material, Measurement, NO_TIME_BACKGROUND,
-    Region, RegionFit, RoomBackground, Spread, Value,
+    CountsFit, EnvironmentScatter, ExcludedRange, Filter, Material, Measurement,
+    NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Spread, Value,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, PatchCovariances};
 use nereids_pipeline::error::PipelineError;
@@ -3786,6 +3786,50 @@ impl PyEnvironmentScatter {
     }
 }
 
+/// A filter in the beam, such as a cadmium sheet, that the neutrons of both
+/// runs cross before every region: each isotope with its share of the filter's
+/// atoms, the areal density N in atoms/barn and the temperature in K.
+#[pyclass(name = "Filter", from_py_object)]
+#[derive(Clone)]
+struct PyFilter {
+    inner: Filter,
+}
+
+#[pymethods]
+impl PyFilter {
+    #[new]
+    fn new(
+        isotopes: Vec<(PyResonanceData, f64)>,
+        areal_density: PyValue,
+        temperature_k: f64,
+    ) -> Self {
+        Self {
+            inner: Filter {
+                isotopes: isotopes
+                    .into_iter()
+                    .map(|(data, share)| ((*data.inner).clone(), share))
+                    .collect(),
+                areal_density: areal_density.inner,
+                temperature_k,
+            },
+        }
+    }
+
+    /// The filter's areal density N in atoms/barn.
+    #[getter]
+    fn areal_density(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.areal_density,
+        }
+    }
+
+    /// The filter's temperature in K.
+    #[getter]
+    fn temperature_k(&self) -> f64 {
+        self.inner.temperature_k
+    }
+}
+
 /// An open-beam run and a sample run recorded in the same time bins, read in
 /// one or more regions of the detector.
 #[pyclass(name = "Measurement", from_py_object)]
@@ -3799,7 +3843,7 @@ impl PyMeasurement {
     /// time_edges_us are the time-bin edges in microseconds; charge_ratio is
     /// the sample run's proton charge over the open-beam run's.
     #[new]
-    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None, room_background=None, spread=None, environment_scatter=None))]
+    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None, room_background=None, spread=None, environment_scatter=None, filter=None))]
     fn new(
         time_edges_us: Vec<f64>,
         charge_ratio: f64,
@@ -3809,6 +3853,7 @@ impl PyMeasurement {
         room_background: Option<PyRoomBackground>,
         spread: Option<PySpread>,
         environment_scatter: Option<PyEnvironmentScatter>,
+        filter: Option<PyFilter>,
     ) -> PyResult<Self> {
         let time_background = match time_background {
             Some(values) => time_terms(values)?,
@@ -3823,6 +3868,7 @@ impl PyMeasurement {
                 room_background: room_background.map(|room| room.inner),
                 spread: spread.map(|spread| spread.inner),
                 environment_scatter: environment_scatter.map(|scatter| scatter.inner),
+                filter: filter.map(|filter| filter.inner),
                 regions: regions.into_iter().map(|region| region.inner).collect(),
             },
         })
@@ -3877,6 +3923,12 @@ impl PyMeasurement {
     fn environment_scatter(&self) -> Option<PyEnvironmentScatter> {
         let scatter = self.inner.environment_scatter.clone();
         scatter.map(|inner| PyEnvironmentScatter { inner })
+    }
+
+    /// The filter in the beam, or None.
+    #[getter]
+    fn filter(&self) -> Option<PyFilter> {
+        self.inner.filter.clone().map(|inner| PyFilter { inner })
     }
 
     /// The regions, in the order given.
@@ -4335,6 +4387,12 @@ impl PyCountsFit {
     #[getter]
     fn scatter_fraction(&self) -> f64 {
         self.inner.scatter_fraction
+    }
+
+    /// The filter's areal density N in atoms/barn, 0 without a filter.
+    #[getter]
+    fn filter_density(&self) -> f64 {
+        self.inner.filter_density
     }
 
     /// Covariance of the fitted quantities, or None when the fit did not
@@ -5130,6 +5188,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRoomBackground>()?;
     m.add_class::<PySpread>()?;
     m.add_class::<PyEnvironmentScatter>()?;
+    m.add_class::<PyFilter>()?;
     m.add_class::<PyMeasurement>()?;
     m.add_class::<PyPulse>()?;
     m.add_class::<PyCalibration>()?;

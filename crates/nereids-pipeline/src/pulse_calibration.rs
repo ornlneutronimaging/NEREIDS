@@ -982,6 +982,7 @@ mod tests {
             room_background: None,
             spread: None,
             environment_scatter: None,
+            filter: None,
             regions: vec![Region {
                 open_counts: vec![100.0; bins],
                 sample_counts: vec![100.0; bins],
@@ -1097,6 +1098,7 @@ mod tests {
             room_background: 0.0,
             spread_share: 0.0,
             scatter_fraction: 0.0,
+            filter_density: 0.0,
             covariance: Some(covariance),
             unbounded: Some(unbounded),
             on_bound: vec![false; free],

@@ -1272,6 +1272,25 @@ class EnvironmentScatter:
     @property
     def fraction(self) -> Value: ...
 
+class Filter:
+    """A filter in the beam, such as a cadmium sheet, crossed by both runs.
+
+    isotopes pairs each isotope with its share of the filter's atoms;
+    areal_density is N in atoms/barn and temperature_k the filter's
+    temperature.  Each run's beam is multiplied by exp(-N*sum(x_i*sigma_i)).
+    """
+
+    def __init__(
+        self,
+        isotopes: list[tuple[ResonanceData, float]],
+        areal_density: Value,
+        temperature_k: float,
+    ) -> None: ...
+    @property
+    def areal_density(self) -> Value: ...
+    @property
+    def temperature_k(self) -> float: ...
+
 class Measurement:
     """An open-beam run and a sample run recorded in the same time bins.
 
@@ -1280,7 +1299,8 @@ class Measurement:
     sample run normalization a.  time_background is [C, A, tau], [C, A, tau, D]
     (D the rise over the edges' span; a fitted D needs tau known or within an
     upper bound of half the span) or NO_TIME_BACKGROUND; room_background is a RoomBackground or None; spread
-    is a Spread or None; environment_scatter is an EnvironmentScatter or None.
+    is a Spread or None; environment_scatter is an EnvironmentScatter or None;
+    filter is a Filter or None.
     """
 
     def __init__(
@@ -1293,6 +1313,7 @@ class Measurement:
         room_background: RoomBackground | None = None,
         spread: Spread | None = None,
         environment_scatter: EnvironmentScatter | None = None,
+        filter: Filter | None = None,
     ) -> None: ...
     @property
     def time_edges_us(self) -> NDArray[np.float64]: ...
@@ -1308,6 +1329,8 @@ class Measurement:
     def spread(self) -> Spread | None: ...
     @property
     def environment_scatter(self) -> EnvironmentScatter | None: ...
+    @property
+    def filter(self) -> Filter | None: ...
     @property
     def regions(self) -> list[Region]: ...
 
@@ -1443,6 +1466,8 @@ class CountsFit:
     def spread_share(self) -> float: ...
     @property
     def scatter_fraction(self) -> float: ...
+    @property
+    def filter_density(self) -> float: ...
     @property
     def covariance(self) -> NDArray[np.float64] | None: ...
     @property
