@@ -194,7 +194,25 @@ impl Filter {
             )));
         }
         let mut total = vec![0.0; energies_ev.len()];
+        let (Some(&first), Some(&last)) = (energies_ev.first(), energies_ev.last()) else {
+            return Ok(total);
+        };
         for (isotope, share) in &self.isotopes {
+            let doppler = DopplerParams::new(self.temperature_k, isotope.awr)
+                .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
+            let read = (
+                (first.sqrt() - SUPPORT_X * doppler.u()).max(0.0).powi(2),
+                (last.sqrt() + SUPPORT_X * doppler.u()).powi(2),
+            );
+            if !isotope.ranges.iter().any(|range| {
+                range.is_evaluable() && range.energy_low <= read.0 && read.1 <= range.energy_high
+            }) {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "the Doppler-broadened cross section of the filter's {} reads {:.6e}–{:.6e} \
+                     eV, which no single one of its evaluated resolved ranges holds",
+                    isotope.isotope, read.0, read.1
+                )));
+            }
             let sigma = broadened(
                 energies_ev,
                 isotope,
@@ -435,7 +453,8 @@ pub struct CountsFit {
     /// capture gammas' `ε`, region by region; each region's in-scatter's `Ω`,
     /// region by region; each region's timing offset `δt`, region by region;
     /// the time background's `C`, `A`, `τ` and `D`; the room
-    /// background's `ρ`; the spread's `h`; the environment scatter's `s`; `t0`; the
+    /// background's `ρ`; the spread's `h`; the environment scatter's `s`; the
+    /// filter's `N`; `t0`; the
     /// flight path; `α₀`, `α₁`,
     /// `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
@@ -1197,6 +1216,18 @@ pub(crate) fn checked<'a>(
     }) {
         return invalid(
             "a resonance covariance is carried for an isotope another region also holds, whose \
+             counts it would leave out"
+                .into(),
+        );
+    }
+    if let Some(filter) = &measurement.filter
+        && filter
+            .isotopes
+            .iter()
+            .any(|(d, _)| carried.iter().any(|&(_, za)| za == d.za))
+    {
+        return invalid(
+            "a resonance covariance is carried for an isotope the filter also holds, whose \
              counts it would leave out"
                 .into(),
         );

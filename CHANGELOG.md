@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   counts fit holds the areal density `N` known, fits it or takes it measured
   and reports it as `CountsFit::filter_density`; its open-beam fits hold `N`
   at its start, and the filter's lines join the grid's fineness rule. Lines
-  narrower than the beam curve can follow pin `N`. Python:
+  narrower than the beam curve can follow pin `N`. A filter isotope that no
+  single evaluated resolved range holds over the broadened grid, or that a
+  carried resonance covariance names, is refused. Python:
   `Measurement(filter=Filter(isotopes, areal_density, temperature_k))`.
 - A counts-fit `Material` gains `excluded_ranges`, a list of `ExcludedRange`: energy
   ranges where an isotope's evaluated cross section is wrong, each with the

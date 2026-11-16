@@ -3344,6 +3344,18 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     for sd in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         invalid(&|m| m.material_mut().temperature_k = Value::Measured { value: 300.0, sd });
     }
+    let filter = |isotopes: Vec<(ResonanceData, f64)>| Filter {
+        isotopes,
+        areal_density: Value::Fitted(1.0e-4),
+        temperature_k: TEMPERATURE_K,
+    };
+    let mut short = synthetic_isotope(48, 113, 24.0, 0.01, 0.06);
+    short.ranges[0].energy_high = 15.0;
+    invalid(&|m| m.filter = Some(filter(vec![(short.clone(), 1.0)])));
+    invalid(&|m| {
+        m.material_mut().covariances = vec![(0, synthetic_covariance(&isotope, 0.01))];
+        m.filter = Some(filter(vec![(isotope.clone(), 1.0)]));
+    });
     let covariance = synthetic_covariance(&isotope, 0.01);
     let listing = |resonances: Vec<[usize; 3]>, covariance: &[f64]| {
         let covariance = covariance.into();
