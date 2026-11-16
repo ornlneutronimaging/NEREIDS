@@ -137,7 +137,9 @@ pub struct Measurement {
     /// at the open-beam run's proton charge that reach the detector without
     /// passing through the moderator pulse, at time `t` of the time edges'
     /// clock, `t₁` the first edge and `W` the edges' span: `C` and `A` 0 or
-    /// more, `τ` in µs positive, `D` the rise over the span, any real number.
+    /// more, `τ` in µs positive and, unless known, at least the first bin's
+    /// width, since far below it only `A·τ` shows in the counts, `D` the rise
+    /// over the span, any real number.
     /// A `D` not known needs `τ` known or within an upper bound of at most
     /// `W/2`. [`NO_TIME_BACKGROUND`] gives none.
     pub time_background: [Value; 4],
@@ -408,6 +410,10 @@ pub struct CountsFit {
     /// cover the fitted `t0`, flight path and pulse, and the bins left out at
     /// those are the ones the fit left out.
     pub converged: bool,
+    /// The rule that ended the fit unconverged, with the quantities the fitter
+    /// was still moving, the decrease still predicted and the impossible or
+    /// refused trial steps at its step limit or with no step; `None` when it converged.
+    pub unconverged: Option<String>,
     /// For each measured quantity, in the covariance's order, its value
     /// without the fit's bounds ([`Self::unbounded`]) less its measurement
     /// over the standard deviation of that difference, `√(sd² − variance + N)`,
@@ -603,7 +609,7 @@ pub struct RegionFit {
 /// finer of that pair's coarser grid and the rule's grid at the fitted
 /// temperatures, or, when the flight times miss, the rule's grid of a grid
 /// built at the fitted `t0`, `L` and pulse.  After twenty fits it is reported
-/// unconverged.
+/// unconverged; [`CountsFit::unconverged`] names the rule that ended a fit.
 ///
 /// The fitter finds a local minimum.  Where a temperature is fitted and the
 /// counts reject the fit, some region's sample-run overdispersion exceeding 1
@@ -816,6 +822,12 @@ fn fit_settled(
         if !fit.converged || spread <= BOUND || passes == most_passes {
             if spread > BOUND {
                 fit.converged = false;
+                fit.unconverged.get_or_insert_with(|| {
+                    format!(
+                        "the open-beam fits' time and room backgrounds did not settle in \
+                         {most_passes} fits"
+                    )
+                });
                 fit.covariance = None;
                 fit.unbounded = None;
                 fit.measured_pulls = None;
@@ -1668,9 +1680,13 @@ pub(crate) fn fit_counts_answer(
             .iter()
             .enumerate()
             .flat_map(|(r, beam)| {
-                beam.coefficients().iter().enumerate().map(move |(i, &c)| {
-                    FitParameter::unbounded(format!("beam {i} of region {r}"), c)
-                })
+                beam.coefficients()
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, &c)| FitParameter {
+                        lower: beam.floor(),
+                        ..FitParameter::unbounded(format!("beam {i} of region {r}"), c)
+                    })
             })
             .chain(sample_parameters)
             .chain(instrument)
@@ -1763,7 +1779,7 @@ pub(crate) fn fit_counts_answer(
     let mut sample_measured = vec![false; regions.len()];
     let mut noise_bins: Option<Vec<Vec<usize>>> = None;
     let mut passes = 0;
-    let (fit, rule_halvings, overdispersions, settled) = loop {
+    let (fit, rule_halvings, overdispersions, unsettled) = loop {
         passes += 1;
         let dispersion = dispersion_of(&excluded, &weights);
         let fit = fit_on_halved_grids(
@@ -1844,11 +1860,30 @@ pub(crate) fn fit_counts_answer(
             },
             |s| s.excluded.clone(),
         );
-        let settled = each_settled.iter().all(|&s| s) && at_fit == excluded;
         let resolved = 2.0 * fit.step_us
             <= 0.5 * narrowest_us(&base, &resonances_in_span, &fit.result.params)?;
         let covered = fit.converged && covering(&fit.coarse, &fit.result.params)?;
-        if !fit.converged || (settled && resolved && covered) || passes == MOST_PASSES {
+        let unsettled = [
+            (
+                each_settled.iter().all(|&s| s),
+                "a sample run's overdispersion still changes by more than 1%",
+            ),
+            (
+                at_fit == excluded,
+                "the bins left out at the fit are not the ones the fit left out",
+            ),
+            (
+                resolved,
+                "the grid is wider than its rule at the fitted temperatures",
+            ),
+            (
+                covered,
+                "the grid's flight times miss some that the fitted t0, flight path and pulse need",
+            ),
+        ]
+        .into_iter()
+        .find_map(|(met, rule)| (!met).then_some(rule));
+        if !fit.converged || unsettled.is_none() || passes == MOST_PASSES {
             let weighted: Vec<[Option<f64>; 2]> = (0..regions.len())
                 .map(|r| {
                     [
@@ -1858,7 +1893,7 @@ pub(crate) fn fit_counts_answer(
                     ]
                 })
                 .collect();
-            break (fit, first.1, weighted, settled && resolved && covered);
+            break (fit, first.1, weighted, unsettled);
         }
         if covered {
             let resumed = (Arc::clone(&fit.coarse), first.1 + fit.halvings - 1);
@@ -1886,7 +1921,11 @@ pub(crate) fn fit_counts_answer(
         excluded = at_fit;
     };
     let dispersion = dispersion_of(&excluded, &weights);
-    let converged = fit.converged && settled;
+    let unconverged = fit
+        .unconverged
+        .clone()
+        .or_else(|| unsettled.map(|rule| format!("after {MOST_PASSES} fits {rule}")));
+    let converged = unconverged.is_none();
     if converged {
         calibrated_lines(
             &lines,
@@ -2102,6 +2141,7 @@ pub(crate) fn fit_counts_answer(
         on_bound,
         deviance: fit.result.deviance,
         converged,
+        unconverged,
         measured_pulls,
         pulse_consistency,
         step_us: fit.step_us,
@@ -2569,17 +2609,30 @@ fn quantity(
             "within 0–1".into(),
         ),
         Role::TimeBackground(term) => {
-            let (name, low, allowed) = [
-                ("C", 0.0, "0 or more"),
-                ("A", 0.0, "0 or more"),
-                ("τ", f64::MIN_POSITIVE, "positive"),
-                ("D", f64::NEG_INFINITY, "any real number"),
-            ][term];
+            let value = &measurement.time_background[term];
+            let first_bin = match measurement.time_edges_us.as_slice() {
+                [first, second, ..] if second > first => Some(second - first),
+                _ => None,
+            };
+            let (name, low, allowed) = match term {
+                0 => ("C", 0.0, "0 or more".to_string()),
+                1 => ("A", 0.0, "0 or more".to_string()),
+                // Far below the first bin's width only A·τ shows in the counts.
+                2 => match first_bin.filter(|_| !matches!(value, Value::Known(_))) {
+                    Some(width) => (
+                        "τ",
+                        width,
+                        format!("at least the first bin's width of {width} µs"),
+                    ),
+                    None => ("τ", f64::MIN_POSITIVE, "positive".to_string()),
+                },
+                _ => ("D", f64::NEG_INFINITY, "any real number".to_string()),
+            };
             (
-                &measurement.time_background[term],
+                value,
                 format!("time background {name}"),
                 low..=f64::INFINITY,
-                allowed.into(),
+                allowed,
             )
         }
         Role::RoomBackground => (
@@ -4564,6 +4617,12 @@ mod tests {
         for (most_passes, settled) in [(1, false), (2, true)] {
             let fit = fit_settled(&drifting, &calibration, most_passes).expect("fit");
             assert_eq!(fit.converged, settled);
+            assert_eq!(
+                fit.unconverged.as_deref(),
+                (!settled).then_some(
+                    "the open-beam fits' time and room backgrounds did not settle in 1 fits"
+                )
+            );
             assert_eq!(fit.covariance.is_some(), settled);
             assert_eq!(fit.unbounded.is_some(), settled);
             assert_eq!(fit.measured_pulls.is_some(), settled);

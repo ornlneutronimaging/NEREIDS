@@ -6,7 +6,7 @@ use nereids_physics::ikeda_carpenter::{
 };
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_pipeline::beam::BeamSpline;
-use nereids_pipeline::counts_fit::Value;
+use nereids_pipeline::counts_fit::{NEGLIGIBLE_PREDICTION, Value};
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{self, BOUND, Calibration, OpenBeamFit, Pulse};
 use nereids_pipeline::reference::Instrument;
@@ -519,6 +519,34 @@ fn a_dip_the_candidates_can_follow_is_followed() {
 }
 
 #[test]
+fn a_black_line_is_followed_with_every_coefficient_above_a_negligible_beam() {
+    let pulse = &pulses()[0].1;
+    // No count where the pulse's tail still predicts some: the beam there wants to be 0.
+    let counts: Vec<f64> = (open_counts(pulse, &true_beam(1.0e6)).iter())
+        .zip(bin_centres())
+        .map(|(&count, u)| {
+            if (395.0..=420.0).contains(&u) {
+                0.0
+            } else {
+                count
+            }
+        })
+        .collect();
+    let fit = fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("fit");
+    let grid =
+        FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse.detector_pulse()).expect("grid");
+    let recorded: f64 = predicted(&grid, &|_| 1.0).iter().sum();
+    let negligible = (NEGLIGIBLE_PREDICTION / recorded).ln();
+    let lowest = (fit.beam.coefficients().iter()).fold(f64::INFINITY, |m, c| m.min(*c));
+    assert!(
+        fit.converged && !fit.at_limit && lowest >= negligible - 1e-9,
+        "{lowest} against {negligible} with {} intervals, at the limit: {}",
+        fit.beam.intervals(),
+        fit.at_limit
+    );
+}
+
+#[test]
 fn a_dip_at_the_first_edge_still_matches_the_counts() {
     let c = EnergyLaw::Const;
     for ic in [
@@ -578,6 +606,29 @@ fn a_dip_finer_than_every_candidate_is_reported_at_the_limit() {
 }
 
 #[test]
+fn the_richest_beam_has_two_bins_in_each_interval() {
+    let pulse = &pulses()[0].1;
+    // 64 bins over a fivefold range of flight time: 16 intervals would start 1.6 bins long.
+    let edges: Vec<f64> = (0..=64)
+        .map(|i| T0_US + 250.0 + 15.625 * f64::from(i))
+        .collect();
+    let mut grid =
+        FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &pulse.detector_pulse()).expect("grid");
+    for _ in 0..4 {
+        grid = grid.halved().expect("halved");
+    }
+    let counts: Vec<f64> = (predicted(&grid, &dipped(290.0, 20.0)).iter())
+        .map(|mu| mu.round())
+        .collect();
+    let fit = fit_open_beam(&edges, &counts, &calibration(pulse)).expect("fit");
+    assert!(
+        fit.beam.intervals() == 8 && fit.at_limit,
+        "{} intervals",
+        fit.beam.intervals()
+    );
+}
+
+#[test]
 fn counts_that_cannot_determine_the_beam_are_reported_undetermined() {
     let pulse = &pulses()[0].1;
     for sparse in [&[(60, 1.0)][..], &[(119, 3.0)]] {
@@ -605,8 +656,7 @@ fn a_richer_beam_the_counts_or_the_grid_cannot_resolve_ends_the_ladder() {
         }
         fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("fit")
     };
-    let unconverged_next = sparse(&[(30, 2.0), (90, 2.0), (100, 1.0)]);
-    assert!(unconverged_next.converged && unconverged_next.at_limit);
+    assert!(sparse(&[(30, 2.0), (90, 2.0), (100, 1.0)]).converged);
     assert!(sparse(&[(0, 1.0), (30, 1.0), (60, 1.0)]).converged);
     let infinite_next = draw(&simulated(pulse, &true_beam(0.5)), 20069, 1.0);
     assert!(

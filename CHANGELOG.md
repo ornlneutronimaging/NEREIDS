@@ -27,6 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fitted, and `CountsFit::scatter_fraction` returns it. The term is refused
   with a `Spread`. Python has `EnvironmentScatter` and
   `Measurement(environment_scatter=...)`.
+- A counts fit that does not converge says which rule ended it:
+  `CountsFit::unconverged` holds the rule, such as "no step of the fitter
+  lowers the objective" or "the fitter reached its step limit", and a pulse
+  calibration's refusal quotes it. `PoissonResult::stop` is the fitter's
+  rule, a `Stop`. Python has `CountsFit.unconverged`. At the step limit or
+  with no step the rule names the quantities the fit was still moving, the
+  decrease still predicted and the quantity with most of it left on its own,
+  as in "the fitter reached its step limit, still moving time background A
+  with a further decrease of 3.10e-2 predicted, 2.40e-5 at most by time
+  background τ with the others held". With no step it gives the rise of the
+  last trial step that could lower the objective beside the decrease predicted
+  for it, and the quantity whose change in that step raised the objective most
+  when made alone, which names the quantity the predicted counts jump in, and
+  says so if the model gives other counts when asked again at the same
+  quantities. For that quantity it gives the rise at half the change and at
+  the opposite change, how many predicted counts the change moves, and the
+  count it moves most. It counts the rejected trial steps that predicted an
+  impossible count or that the model refused: `PoissonResult::moving`,
+  `decrement`, `own` and `rejected`.
 - Python `calibrate_pulse(measurement, calibration, path, foil, open_run,
   sample_run)` calibrates the pulse on a foil of measured density and
   temperature and writes the pulse calibration file that
@@ -187,6 +206,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A fit that none of its trial steps lowers has converged when no fitted
+  quantity, the others held, has 1e-6 of decrease left and those steps tested
+  that: the last rejected one predicted to lower the objective beyond its
+  rounding was evaluated, as taken still predicted so, none after it was
+  refused or impossible, and accepted steps since have lowered the objective
+  by no more than its rounding in all. It ended with "no step of the fitter
+  lowers the objective" before, where the predicted decrease stayed large
+  along a direction the counts determine weakly although no step delivered
+  it.
+- A counts fit keeps each step within a trust radius (J. J. Moré, Lect. Notes
+  Math. 630, 105–116, 1978) and follows a narrow curved valley to its minimum.
+  Damping ten times more after each rejected step, never under 1e-3, reached
+  the step limit there.
+- A fitted beam's spline coefficients are bounded below at the beam that
+  records fewer than `NEGLIGIBLE_PREDICTION` counts in the whole open-beam run.
+  Inside a black line of the open beam, such as a cadmium filter's, they ran
+  off without limit: the beam got a cliff at a knot, the predicted counts
+  stepped when the timing offset or flight path moved a grid point across it,
+  and the fit ended with "no step of the fitter lowers the objective". An
+  open-beam fit refused the richer beam such a line needs.
+- An open-beam fit admits a beam only while each of its spline intervals spans
+  two bins or more. The intervals are uniform in the logarithm of flight time,
+  so the shortest could span 1.3 bins while the coefficients numbered under
+  half the bins overall. Where the pulse is wider than such intervals the
+  counts leave combinations of the coefficients nearly undetermined, and a
+  counts fit ended with "the fitter reached its step limit".
+- A time background's decay time `τ` that is not known is bounded below by the
+  first bin's width, and a start or bound under it is refused. Far below a
+  bin's width only `A·τ` shows in the counts, and a counts fit driven there
+  stopped at `τ` near zero with "no step of the fitter lowers the objective".
+  A decay the bins do not resolve is given as known.
 - NNDC file names pad the mass number to three digits, so ENDF/B-VIII.0 and
   VIII.1 isotopes with A < 100 download from NNDC again instead of only from
   IAEA.

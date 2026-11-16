@@ -4385,6 +4385,12 @@ impl PyCountsFit {
         self.inner.converged
     }
 
+    /// The rule that ended the fit unconverged, or None.
+    #[getter]
+    fn unconverged(&self) -> Option<String> {
+        self.inner.unconverged.clone()
+    }
+
     /// For each measured quantity, its pull; None when the fitter reports none.
     #[getter]
     fn measured_pulls(&self) -> Option<Vec<f64>> {

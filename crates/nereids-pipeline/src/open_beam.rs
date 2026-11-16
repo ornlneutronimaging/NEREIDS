@@ -7,14 +7,14 @@ use std::sync::Arc;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, poisson_fit};
+use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, Rejected, Stop, poisson_fit};
 use nereids_physics::flight_time_grid::{FlightTimeGrid, FlightTimeGridError};
 use nereids_physics::ikeda_carpenter::{
     DETECTOR_TAIL_DECAY_US, DetectorPulse, DetectorTail, EnergyLaw, IkedaCarpenterParams,
 };
 
 use crate::beam::BeamSpline;
-use crate::counts_fit::Value;
+use crate::counts_fit::{NEGLIGIBLE_PREDICTION, Value};
 use crate::error::PipelineError;
 use crate::pulse_calibration::PulsePrior;
 
@@ -212,8 +212,8 @@ pub struct OpenBeamFit {
     pub converged: bool,
     /// Covariance of the beam's coefficients, scaled by `overdispersion`, or
     /// at the Poisson scale when that is `None`; rows and columns of a
-    /// coefficient the counts leave undetermined are NaN.  `None` when the
-    /// fit did not converge.
+    /// coefficient the counts leave undetermined, or hold at a negligible
+    /// beam, are NaN.  `None` when the fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Variance of the counts over their Poisson variance, at least 1: the
     /// richest fitted beam's Pearson χ² over the bins predicted at least one
@@ -253,7 +253,8 @@ pub struct OpenBeamFit {
 /// chance, are left out.
 ///
 /// The number of spline intervals doubles from one while the coefficients
-/// number at most half the bins.  Each candidate is fitted on a grid halved,
+/// number at most half the bins and each interval spans two bins or more.
+/// Each candidate is fitted on a grid halved,
 /// and the beam refitted on each finer grid, until the refitted beam's
 /// predicted counts differ from the coarser grid's by at most [`BOUND`].  A
 /// candidate that does not converge, or needs more grid points than allowed,
@@ -331,7 +332,10 @@ pub(crate) fn open_beam_with_intervals(
     let known = validate_known(known, time_edges_us.len() - 1)?;
 
     let coefficients = |intervals: usize| intervals + 3;
-    let admits = |intervals: usize| 2 * coefficients(intervals) <= open_counts.len();
+    let admits = |intervals: usize| {
+        2 * coefficients(intervals) <= open_counts.len()
+            && spans_two_bins(time_edges_us, t0_us, intervals)
+    };
     if !admits(1) {
         return Err(PipelineError::InvalidParameter(format!(
             "the open-beam fit needs at least {} time bins, one interval's {} coefficients \
@@ -347,13 +351,10 @@ pub(crate) fn open_beam_with_intervals(
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let recorded: f64 = per_unit_beam.iter().zip(&live).map(|(c, l)| l * c).sum();
     let per_us = open_counts.iter().sum::<f64>() / recorded;
-    let mut ladder = vec![fit_beam(
-        &grid,
-        &BeamSpline::constant(u_first, u_last, per_us),
-        open_counts,
-        &live,
-        &known,
-    )?];
+    // A weaker beam records fewer than NEGLIGIBLE_PREDICTION counts in the open-beam run.
+    let negligible = (NEGLIGIBLE_PREDICTION / recorded).ln();
+    let ladder_start = BeamSpline::constant(u_first, u_last, per_us).above(negligible);
+    let mut ladder = vec![fit_beam(&grid, &ladder_start, open_counts, &live, &known)?];
     while let Some(start) = ladder
         .last()
         .filter(|candidate| candidate.fit.converged && admits(2 * candidate.beam.intervals()))
@@ -423,6 +424,25 @@ pub(crate) fn open_beam_with_intervals(
         points: fit.points,
         halvings: fit.halvings,
     })
+}
+
+/// Whether each of `intervals` equal steps of `ln u` across the bins spans two bins or more.
+fn spans_two_bins(time_edges_us: &[f64], t0_us: f64, intervals: usize) -> bool {
+    let last = time_edges_us.len() - 1;
+    let (low, high) = (time_edges_us[0] - t0_us, time_edges_us[last] - t0_us);
+    let bins_before = |knot: usize| {
+        if knot == intervals {
+            return last as f64;
+        }
+        let t = t0_us + low * (high / low).powf(knot as f64 / intervals as f64);
+        let bin = time_edges_us
+            .partition_point(|edge| *edge <= t)
+            .clamp(1, last)
+            - 1;
+        bin as f64 + (t - time_edges_us[bin]) / (time_edges_us[bin + 1] - time_edges_us[bin])
+    };
+    // 1e-9 of a bin is the rounding of an interval that spans two bins exactly.
+    (0..intervals).all(|k| bins_before(k + 1) - bins_before(k) >= 2.0 - 1e-9)
 }
 
 pub(crate) fn validate_counts(run: &str, counts: &[f64], bins: usize) -> Result<(), PipelineError> {
@@ -542,7 +562,10 @@ fn fit_beam(
             .coefficients()
             .iter()
             .enumerate()
-            .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
+            .map(|(i, &c)| FitParameter {
+                lower: start.floor(),
+                ..FitParameter::unbounded(format!("beam {i}"), c)
+            })
             .collect(),
     );
     let dispersion = vec![1.0; open_counts.len()];
@@ -569,6 +592,7 @@ fn fit_beam(
 pub(crate) struct GridFit {
     pub(crate) result: PoissonResult,
     pub(crate) converged: bool,
+    pub(crate) unconverged: Option<String>,
     pub(crate) predicted: Vec<f64>,
     pub(crate) coarse: Arc<FlightTimeGrid>,
     pub(crate) fine: Arc<FlightTimeGrid>,
@@ -607,7 +631,90 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
             parameters,
             &PoissonConfig::default(),
         )?;
-        let converged = result.converged && result.params.iter().all(|p| p.is_finite());
+        let unconverged = match result.stop {
+            Stop::Minimum if result.params.iter().all(|p| p.is_finite()) => None,
+            Stop::Minimum => Some("a fitted number is not finite".to_string()),
+            stop => {
+                let free = parameters.free_indices();
+                let names: Vec<&str> = (result.moving.iter())
+                    .map(|&j| &*parameters.params[free[j]].name)
+                    .collect();
+                let mut rule = stop.to_string();
+                if let (false, Some(left), Some((alone, own))) =
+                    (names.is_empty(), result.decrement, result.own)
+                {
+                    let (names, alone) = (names.join(", "), &parameters.params[free[alone]].name);
+                    rule += &format!(
+                        ", still moving {names} with a further decrease of {left:.2e} predicted, \
+                         {own:.2e} at most by {alone} with the others held"
+                    );
+                }
+                let Rejected {
+                    refused,
+                    impossible,
+                    reason,
+                    tested,
+                    alone,
+                    again,
+                    around,
+                    most,
+                    ..
+                } = &result.rejected;
+                if let Some((predicted, rise)) = tested {
+                    rule += &format!(
+                        "; the last trial step that could lower the objective raised it by \
+                         {rise:.2e} where a decrease of {predicted:.2e} was predicted"
+                    );
+                }
+                if let Some((alone, moved, rise)) = *alone {
+                    let name = &parameters.params[free[alone]].name;
+                    rule += &format!(
+                        ", and its change of {name} by {moved:.2e} alone raised it by {rise:.2e}"
+                    );
+                }
+                if let Some([half, opposite]) = around {
+                    rule += &format!(
+                        "; half that change raised it by {half:.2e} and the opposite change by \
+                         {opposite:.2e}"
+                    );
+                }
+                if let Some((k, before, after, changed)) = *most {
+                    let edges = grid.time_edges_us();
+                    let (block, bin) = (k / (edges.len() - 1), k % (edges.len() - 1));
+                    let run = ["open-beam", "sample"][block % 2];
+                    let scale = Some(dispersion[k]).filter(|d| d.is_finite()).unwrap_or(1.0);
+                    // A negative prediction is passed to the fitter undivided.
+                    let raw = |count: f64| if count < 0.0 { count } else { scale * count };
+                    rule += &format!(
+                        "; it changed {changed} predicted counts by more than 1e-6 of themselves, \
+                         most the {run} count of region {} from {:.3} to {:.3} µs, from {:.6e} to \
+                         {:.6e}",
+                        block / 2,
+                        edges[bin],
+                        edges[bin + 1],
+                        raw(before),
+                        raw(after)
+                    );
+                }
+                if let Some(again) = again.filter(|again| *again != 0.0) {
+                    rule += &format!(
+                        "; evaluated again at the same quantities the objective differs by \
+                         {again:.2e}"
+                    );
+                }
+                if refused + impossible > 0 {
+                    rule += &format!(
+                        "; {impossible} of its rejected trial steps predicted a negative count, \
+                         or zero where something was counted, and the model refused {refused}"
+                    );
+                    if let Some(reason) = reason {
+                        rule += &format!(": {reason}");
+                    }
+                }
+                Some(rule)
+            }
+        };
+        let converged = unconverged.is_none();
         let predicted = fine.evaluate(&result.params)?;
         let spread: f64 = predicted
             .iter()
@@ -622,6 +729,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
             return Ok(GridFit {
                 result,
                 converged,
+                unconverged,
                 predicted,
                 coarse: coarse_grid,
                 fine: Arc::clone(&grid),
@@ -821,6 +929,67 @@ pub(crate) mod tests {
             FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &pulse.detector_pulse())
                 .expect("grid"),
         )
+    }
+
+    #[test]
+    fn a_beam_interval_spans_two_bins_or_more() {
+        // 0.16 µs bins from 127.84 µs: 512 intervals start 0.41 µs long, 1024 start 0.20.
+        let fine: Vec<f64> = (0..=3262).map(|i| 127.84 + 0.16 * f64::from(i)).collect();
+        assert!(spans_two_bins(&fine, 0.0, 512) && !spans_two_bins(&fine, 0.0, 1024));
+        // Bins uniform in ln u: 32 intervals span two each, 64 one.
+        let even: Vec<f64> = (0..=64).map(|i| 3.0 + 100.0 * 1.02_f64.powi(i)).collect();
+        assert!(spans_two_bins(&even, 3.0, 32) && !spans_two_bins(&even, 3.0, 64));
+        // The last knot, recomputed, rounds below this last edge, past a bin one ulp wide.
+        let (low, high) = (347.21427154527134_f64, 460.0701208068366_f64);
+        assert!(low * (high / low) < high);
+        assert!(spans_two_bins(
+            &[low, f64::from_bits(high.to_bits() - 1), high],
+            0.0,
+            1
+        ));
+    }
+
+    struct Backwards;
+
+    impl FitModel for Backwards {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![params[0]; 4])
+        }
+
+        fn analytical_jacobian(&self, _: &[f64], free: &[usize], _: &[f64]) -> Option<FlatMatrix> {
+            let mut slopes = FlatMatrix::zeros(4, free.len());
+            for row in 0..4 {
+                *slopes.get_mut(row, 0) = -1.0;
+            }
+            Some(slopes)
+        }
+    }
+
+    #[test]
+    fn a_grid_fit_names_the_rule_that_ended_the_fitter() {
+        let mut level = ParameterSet::new(vec![FitParameter::unbounded("level", 50.0)]);
+        let fit = fit_on_halved_grids(
+            &grid(None),
+            &mut level,
+            &[100.0; 4],
+            &[1.0; 4],
+            &[],
+            |_| Ok(Backwards),
+            |_, _, _| Ok(true),
+        )
+        .expect("fit");
+        assert!(!fit.converged);
+        let rule = fit.unconverged.expect("rule");
+        let (stall, trial) = rule.split_once("; ").expect("two clauses");
+        assert_eq!(
+            stall,
+            "no step of the fitter lowers the objective, still moving level with a further \
+             decrease of 1.00e2 predicted, 1.00e2 at most by level with the others held"
+        );
+        assert!(
+            trial.starts_with("the last trial step that could lower the objective raised it by "),
+            "{trial}"
+        );
     }
 
     #[test]
