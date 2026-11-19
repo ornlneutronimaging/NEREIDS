@@ -1668,9 +1668,10 @@ pub(crate) fn spread_shares(
 }
 
 fn measurement_has_photons(m: &Measurement) -> bool {
-    [0, 1, 3]
+    m.time_background
         .iter()
-        .any(|&i| m.time_background[i] != Value::Known(0.0))
+        .enumerate()
+        .any(|(i, value)| Role::TimeBackground(i).photon_amplitude() && *value != Value::Known(0.0))
         || m.regions
             .iter()
             .any(|r| r.capture_gammas != Value::Known(0.0))
@@ -1707,12 +1708,7 @@ impl Furnace {
                             .map(move |(k, t)| t - photons.as_ref().map_or(0.0, |p| p[run][k]))
                     })
                     .collect();
-                NeutronSource::Measured(
-                    m.regions
-                        .iter()
-                        .flat_map(|r| mean.iter().map(move |v| r.pixels * v))
-                        .collect(),
-                )
+                NeutronSource::Measured(mean)
             }
         };
         Some(Arc::new(Self {
@@ -1722,7 +1718,7 @@ impl Furnace {
     }
 
     /// Gain minus loss for a unit scattered fraction, or its slope for a fixed measured mean.
-    fn change(&self, local: &[f64], derivative: bool) -> Vec<f64> {
+    fn change(&self, local: &[f64], derivative: bool, regions: &[Place]) -> Vec<f64> {
         match &self.source {
             NeutronSource::AreaFractions(areas) => {
                 let bins = local.len() / areas.len();
@@ -1740,9 +1736,15 @@ impl Furnace {
                     })
                     .collect()
             }
-            NeutronSource::Measured(mean) if !derivative => {
-                mean.iter().zip(local).map(|(m, v)| m - v).collect()
-            }
+            NeutronSource::Measured(mean) if !derivative => regions
+                .iter()
+                .zip(local.chunks_exact(mean.len()))
+                .flat_map(|(region, bins)| {
+                    mean.iter()
+                        .zip(bins)
+                        .map(move |(m, v)| region.pixels * m - v)
+                })
+                .collect(),
             NeutronSource::Measured(_) => local.iter().map(|v| -v).collect(),
         }
     }
@@ -3674,7 +3676,7 @@ impl RegionsModel {
         Ok(add_scaled(
             total,
             params[self.layout.environment],
-            furnace.change(&local, true),
+            furnace.change(&local, true, &self.layout.regions),
         ))
     }
 
@@ -3771,10 +3773,25 @@ impl RegionsModel {
 }
 
 impl RegionsModel {
-    fn arriving(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+    fn arriving(&self, params: &[f64], check_neutrons: bool) -> Result<Vec<f64>, FittingError> {
         let clocks = self.clocks(params)?;
         let [open_room, sample_room] = self.room_per_pixel();
         let rate = params[self.layout.room_background];
+        if check_neutrons
+            && let Some(NeutronSource::Measured(mean)) = self.scattered.as_ref().map(|f| &f.source)
+            && let Some(k) = mean
+                .iter()
+                .zip(open_room.iter().chain(&sample_room))
+                .position(|(m, exposure)| {
+                    let neutrons = m - rate * exposure;
+                    !neutrons.is_finite() || neutrons < 0.0
+                })
+        {
+            let (run, bin) = (["open", "sample"][k / open_room.len()], k % open_room.len());
+            return Err(FittingError::EvaluationFailed(format!(
+                "invalid detector neutron counts after room subtraction in {run} bin {bin}"
+            )));
+        }
         let mut counts = Vec::new();
         for region in 0..self.absorbers.len() {
             let scale = clocks.of(region);
@@ -3782,15 +3799,25 @@ impl RegionsModel {
             let Beams { open, sample, .. } = self.beams(params, &clocks, region)?;
             let pixels = self.layout.regions[region].pixels;
             let sample_scale = self.sample_time_scale(params, region);
+            let open = predicted(&scale.rows, &open)?;
+            let sample = predicted(&scale.rows, &sample)?;
+            if check_neutrons {
+                for (run, folded) in [("open", &open), ("sample", &sample)] {
+                    if let Some(bin) = folded.iter().position(|v| !v.is_finite() || *v < 0.0) {
+                        return Err(FittingError::EvaluationFailed(format!(
+                            "invalid local neutron counts in region {region}, {run} bin {bin}"
+                        )));
+                    }
+                }
+            }
             counts.extend(
-                predicted(&scale.rows, &open)?
-                    .iter()
+                open.iter()
                     .zip(&background)
                     .zip(&open_room)
                     .map(|((c, g), f)| c + pixels * (g + rate * f)),
             );
             counts.extend(
-                predicted(&scale.rows, &sample)?
+                sample
                     .iter()
                     .zip(&background)
                     .zip(&sample_room)
@@ -3852,19 +3879,22 @@ impl FitModel for RegionsModel {
     /// scatter, a bin whose arriving counts are negative or not a number
     /// records them instead.
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
-        let arriving = self.arriving(params)?;
+        let arriving = self.arriving(
+            params,
+            self.scattered.as_ref().is_some_and(|f| !f.local_photons),
+        )?;
         let mut recorded = match (&self.mixing, &self.scattered) {
             (Some(shares), _) => mixed(shares, params[self.layout.spread], &arriving),
             (None, Some(furnace)) => {
                 let local = if furnace.local_photons {
-                    self.arriving(&self.without_photons(params))?
+                    self.arriving(&self.without_photons(params), true)?
                 } else {
                     arriving.clone()
                 };
                 add_scaled(
                     arriving.clone(),
                     params[self.layout.environment],
-                    furnace.change(&local, false),
+                    furnace.change(&local, false, &self.layout.regions),
                 )
             }
             (None, None) => return Ok(arriving),
@@ -3886,7 +3916,7 @@ impl FitModel for RegionsModel {
         let mut jacobian = self.arrival_jacobian(params, free_param_indices, y_current)?;
         let Some(furnace) = &self.scattered else {
             if let Some(shares) = &self.mixing {
-                let arriving = self.arriving(params).ok()?;
+                let arriving = self.arriving(params, false).ok()?;
                 for (col, &index) in free_param_indices.iter().enumerate() {
                     let values = if index == self.layout.spread {
                         mixed(shares, 1.0, &arriving)
@@ -3915,9 +3945,9 @@ impl FitModel for RegionsModel {
         for (col, &index) in free_param_indices.iter().enumerate() {
             let delta = if index == self.layout.environment {
                 let local = self
-                    .arriving(local_params.as_deref().unwrap_or(params))
+                    .arriving(local_params.as_deref().unwrap_or(params), true)
                     .ok()?;
-                furnace.change(&local, false)
+                furnace.change(&local, false, &self.layout.regions)
             } else {
                 if self.layout.roles[index].photon_amplitude() {
                     continue;
@@ -3925,7 +3955,7 @@ impl FitModel for RegionsModel {
                 let source = local_jacobian.as_ref().unwrap_or(&jacobian);
                 let local: Vec<_> = (0..y_current.len()).map(|i| source.get(i, col)).collect();
                 furnace
-                    .change(&local, true)
+                    .change(&local, true, &self.layout.regions)
                     .into_iter()
                     .map(|v| v * params[self.layout.environment])
                     .collect()
@@ -4408,9 +4438,9 @@ mod tests {
                 .then(|| PhononSpectrum::debye(240.0, 200).expect("Debye"));
             let grid = grid(channel_fwhm_us);
             if channel_fwhm_us.is_some() {
-                let rows = 6 * (grid.time_edges_us().len() - 1);
+                let rows = 2 * (grid.time_edges_us().len() - 1);
                 let measured = (0..rows)
-                    .map(|k| 40.0 + 5.0 * (0.7 * k as f64).cos())
+                    .map(|k| 1000.0 + 5.0 * (0.7 * k as f64).cos())
                     .collect();
                 for source in [
                     NeutronSource::Measured(measured),
@@ -4533,7 +4563,7 @@ mod tests {
             &layout,
         )
         .spread(Some(Arc::new(vec![vec![0.9, 0.1], vec![0.1, 0.9]])));
-        let arriving = model.arriving(&params).expect("arriving");
+        let arriving = model.arriving(&params, false).expect("arriving");
         let recorded = model.evaluate(&params).expect("recorded");
         let negative: Vec<usize> = (0..arriving.len()).filter(|&k| arriving[k] < 0.0).collect();
         assert!(!negative.is_empty());
@@ -4569,11 +4599,11 @@ mod tests {
                 Role::GammaTransmission { region } => [0.8, 1.0][region],
                 Role::CaptureGammas { region } => [0.05, 0.0][region],
                 Role::InScatter { region } => [0.3, 0.0][region],
-                Role::TimingOffset { region } => [0.02, -0.01][region],
+                Role::TimingOffset { .. } => 0.02,
                 Role::TimeBackground(term) => [50.0, 300.0, 40.0, -20.0][term],
                 Role::RoomBackground => 2.0e-3,
                 Role::SpreadShare => 0.15,
-                Role::ScatterFraction => 0.0,
+                Role::ScatterFraction => 0.25,
                 Role::Filter => 0.0,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
@@ -4581,17 +4611,20 @@ mod tests {
             })
             .collect();
         let data = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
-        let model = |data: &ResonanceData| {
+        let model = |data: &ResonanceData, furnace: Option<&Arc<Furnace>>| {
             let isotopes: [Arc<[ResonanceData]>; 2] = [Arc::new([data.clone()]), Arc::new([])];
-            RegionsModel::new(
+            let model = RegionsModel::new(
                 &grid,
                 &beams,
                 &isotopes,
                 (1.2, [3.0e4, 2.5e4]),
                 T0_US,
                 &layout,
-            )
-            .spread(Some(Arc::new(vec![vec![0.9, 0.1], vec![0.2, 0.8]])))
+            );
+            match furnace {
+                Some(f) => model.environment(Some(f.clone())),
+                None => model.spread(Some(Arc::new(vec![vec![0.9, 0.1], vec![0.2, 0.8]]))),
+            }
         };
         let h = 1e-4 * data.ranges[0].l_groups[0].resonances[0].gg;
         let moved = |by: f64| {
@@ -4600,21 +4633,39 @@ mod tests {
             copy
         };
         let (up, down) = (moved(h), moved(-h));
-        let slope = model(&data)
-            .resonance_slope(&params, 0, 0, [&up, &down], h)
-            .expect("slope");
-        let counts = |data| model(data).evaluate(&params).expect("counts");
-        let differences: Vec<f64> = counts(&up)
-            .iter()
-            .zip(&counts(&down))
-            .map(|(u, d)| (u - d) / (2.0 * h))
-            .collect();
-        let column = differences.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
-        for (k, (&analytic, &difference)) in slope.iter().zip(&differences).enumerate() {
-            assert!(
-                (analytic - difference).abs() <= 1e-6 * column,
-                "{k}: {analytic} vs {difference}"
-            );
+        let bins = grid.time_edges_us().len() - 1;
+        let measured = vec![2000.0; 2 * bins];
+        for source in [
+            None,
+            Some(NeutronSource::AreaFractions(vec![4.0 / 13.0, 9.0 / 13.0])),
+            Some(NeutronSource::Measured(measured)),
+        ] {
+            let furnace = source.map(|source| {
+                Arc::new(Furnace {
+                    source,
+                    local_photons: true,
+                })
+            });
+            let slope = model(&data, furnace.as_ref())
+                .resonance_slope(&params, 0, 0, [&up, &down], h)
+                .expect("slope");
+            let counts = |data| {
+                model(data, furnace.as_ref())
+                    .evaluate(&params)
+                    .expect("counts")
+            };
+            let differences: Vec<f64> = counts(&up)
+                .iter()
+                .zip(&counts(&down))
+                .map(|(u, d)| (u - d) / (2.0 * h))
+                .collect();
+            let column = differences.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+            for (k, (&analytic, &difference)) in slope.iter().zip(&differences).enumerate() {
+                assert!(
+                    (analytic - difference).abs() <= 1e-6 * column,
+                    "{k}: {analytic} vs {difference}"
+                );
+            }
         }
     }
 

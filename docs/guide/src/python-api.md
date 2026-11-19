@@ -179,7 +179,8 @@ pixels, bins and exposure scale, excluding room background. Supply all means
 on the recorded clock of the region. Multiple regions sharing a spectrum
 need the same known timing offset. Supply the photon means when
 photon counts contribute to either run. A fit with active photon terms and
-scatter requires these arrays. The fit treats measured means as exact.
+scatter requires these arrays. In each bin, the total must cover the measured
+photons and the modeled room counts. The fit treats measured means as exact.
 
 Open pixels alone measure s: call fit_counts on a
 Measurement whose regions are open pixels with material None and b0 known 0,

@@ -2272,6 +2272,82 @@ fn furnace_neutron_scatter_preserves_the_local_photon_background() {
 }
 
 #[test]
+fn furnace_scatter_requires_nonnegative_local_neutrons_before_backgrounds() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    for photon_rate in [0.0, 100.0] {
+        let mut m = measurement(
+            &setup,
+            (vec![200.0; bins], vec![87.0; bins]),
+            &[(hafnium_like(20.0), 0.0)],
+        );
+        m.charge_ratio = 1.0;
+        m.material_mut().isotopes[0].1 = Value::Known(0.0);
+        m.time_background[0] = Value::Known(photon_rate);
+        m.room_background = Some(RoomBackground {
+            rate: Value::Known(100.0 - photon_rate),
+            frames: [1.0; 2],
+        });
+        m.regions.push(Region {
+            sample_counts: vec![163.0; bins],
+            material: None,
+            ..m.regions[0].clone()
+        });
+        for source in [
+            ScatterSource::FullDetector,
+            ScatterSource::Measured {
+                total: [vec![200.0; bins], vec![125.0; bins]],
+                photons: Some([vec![photon_rate; bins], vec![photon_rate; bins]]),
+            },
+        ] {
+            m.environment_scatter = Some(EnvironmentScatter {
+                fraction: Value::Known(0.5),
+                source,
+            });
+            m.regions[0].background[0] = Value::Known(-1.5);
+            let err = fit_counts(&m, &calibration(&setup)).unwrap_err();
+            assert!(err.to_string().contains("local neutron"), "{err}");
+            m.regions[0].background[0] = Value::Known(-1.0);
+            fit_counts(&m, &calibration(&setup)).expect("zero local neutron source");
+        }
+    }
+}
+
+#[test]
+fn furnace_scatter_requires_nonnegative_measured_neutrons_after_room_subtraction() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![200.0; bins], vec![225.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.charge_ratio = 1.0;
+    m.material_mut().isotopes[0].1 = Value::Known(0.0);
+    m.time_background[0] = Value::Known(75.0);
+    m.room_background = Some(RoomBackground {
+        rate: Value::Known(25.0),
+        frames: [1.0, 2.0],
+    });
+    for (sample_mean, valid) in [(125.0, true), (124.0, false)] {
+        m.environment_scatter = Some(EnvironmentScatter {
+            fraction: Value::Known(0.25),
+            source: ScatterSource::Measured {
+                total: [vec![100.0; bins], vec![sample_mean; bins]],
+                photons: Some([vec![75.0; bins], vec![75.0; bins]]),
+            },
+        });
+        let fit = fit_counts(&m, &calibration(&setup));
+        if valid {
+            fit.expect("zero measured neutron source");
+        } else {
+            let err = fit.unwrap_err();
+            assert!(err.to_string().contains("detector neutron"), "{err}");
+        }
+    }
+}
+
+#[test]
 fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
     let setup = standard();
     let isotope = hafnium_like(20.0);
