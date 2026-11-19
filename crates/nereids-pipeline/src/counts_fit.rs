@@ -304,7 +304,7 @@ pub struct EnvironmentScatter {
 pub enum ScatterSource {
     /// The regions partition all illuminated detector pixels on the same clock.
     FullDetector,
-    /// Detector-wide mean counts per pixel before live losses, open then sample.
+    /// Detector-wide mean counts per pixel before live losses on the regions’ clock, open then sample.
     Measured {
         /// Total counts per pixel in each bin of each run.
         total: [Vec<f64>; 2],
@@ -1106,16 +1106,21 @@ pub(crate) fn checked<'a>(
             );
         }
         let active = scatter.fraction != Value::Known(0.0);
+        if active
+            && regions.len() > 1
+            && !regions.iter().all(|r| {
+                matches!(r.timing_offset_us, Value::Known(_))
+                    && r.timing_offset_us == regions[0].timing_offset_us
+            })
+        {
+            return invalid(
+                "environment scatter needs one common known region timing offset".into(),
+            );
+        }
         match &scatter.source {
-            ScatterSource::FullDetector if active && regions.len() > 1 => {
+            ScatterSource::FullDetector if active => {
                 if !regions.iter().map(|r| r.pixels).sum::<f64>().is_finite() {
                     return invalid("the full detector area must be finite".into());
-                }
-                if !regions.iter().all(|r| {
-                    matches!(r.timing_offset_us, Value::Known(_))
-                        && r.timing_offset_us == regions[0].timing_offset_us
-                }) {
-                    return invalid("full-detector environment scatter needs one common known region timing offset".into());
                 }
             }
             ScatterSource::Measured { total, photons } => {
@@ -3413,7 +3418,6 @@ impl RegionsModel {
         self
     }
 
-    /// The model with the environment scatter's `P·m` of each region's runs.
     fn environment(mut self, scattered: Option<Arc<Furnace>>) -> Self {
         self.scattered = scattered;
         self

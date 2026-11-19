@@ -2174,6 +2174,46 @@ fn a_filter_in_the_beam_is_recovered_with_the_density_and_temperature() {
 }
 
 #[test]
+fn furnace_scatter_requires_spectra_on_a_common_region_clock() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![100.0; bins], vec![100.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.regions.push(m.regions[0].clone());
+    for source in [
+        ScatterSource::Measured {
+            total: [vec![100.0; bins], vec![100.0; bins]],
+            photons: None,
+        },
+        ScatterSource::FullDetector,
+    ] {
+        m.environment_scatter = Some(EnvironmentScatter {
+            fraction: Value::Known(0.1),
+            source,
+        });
+        for offset in [Value::Known(1.0), Value::Fitted(0.0)] {
+            m.regions[1].timing_offset_us = offset;
+            let error = fit_counts(&m, &calibration(&setup)).expect_err("region clocks");
+            assert!(
+                error
+                    .to_string()
+                    .contains("common known region timing offset"),
+                "{error}"
+            );
+        }
+    }
+    m.regions[1].timing_offset_us = Value::Known(0.0);
+    for r in &mut m.regions {
+        r.pixels = f64::MAX;
+    }
+    let error = fit_counts(&m, &calibration(&setup)).expect_err("area overflow");
+    assert!(error.to_string().contains("area must be finite"), "{error}");
+}
+
+#[test]
 fn furnace_neutron_scatter_preserves_the_local_photon_background() {
     let setup = standard();
     let bins = setup.edges.len() - 1;
