@@ -2328,6 +2328,53 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
 }
 
 #[test]
+fn a_single_full_detector_region_cannot_measure_the_scatter_fraction() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![100.0; bins], vec![100.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.charge_ratio = 1.0;
+    m.material_mut().isotopes[0].1 = Value::Known(0.0);
+    let mut fit = |fraction| {
+        m.environment_scatter = Some(EnvironmentScatter {
+            fraction,
+            source: ScatterSource::FullDetector,
+        });
+        fit_counts(&m, &calibration(&setup))
+    };
+    for fraction in [
+        Value::Fitted(0.2),
+        Value::Within {
+            start: 0.8,
+            lower: 0.1,
+            upper: 1.0,
+        },
+    ] {
+        let error = fit(fraction).expect_err("unidentifiable fraction");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot measure the scatter fraction"),
+            "{error}"
+        );
+    }
+    for fraction in [
+        Value::Known(0.2),
+        Value::Measured {
+            value: 0.2,
+            sd: 0.05,
+        },
+    ] {
+        let result = fit(fraction).expect("independent fraction");
+        assert!(result.converged);
+        assert!((result.scatter_fraction - 0.2).abs() < 1e-12);
+    }
+}
+
+#[test]
 fn the_full_detector_measures_scatter_from_all_its_regions() {
     let setup = standard();
     let isotope = hafnium_like(20.0);

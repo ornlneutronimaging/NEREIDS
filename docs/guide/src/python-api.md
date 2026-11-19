@@ -167,7 +167,9 @@ The `environment_scatter` argument defaults to `None`.
 Use `EnvironmentScatter.full_detector(fraction)` when the regions partition all
 illuminated detector pixels on one clock. Each bin redistributes a fraction
 of its predicted neutron counts in proportion to region area. Photon counts
-stay local, including time background and sample capture gammas.
+stay local, including time background and sample capture gammas. A single
+region covering the whole detector can use a known fraction or an independent
+measurement. Estimating it from the counts requires spatial contrast.
 
 For partial coverage, use `EnvironmentScatter(fraction, open_mean, sample_mean,
 photon_mean=(open_photons, sample_photons))`. The first two arrays are total

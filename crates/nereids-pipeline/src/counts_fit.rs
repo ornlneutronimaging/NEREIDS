@@ -1099,6 +1099,7 @@ pub(crate) fn checked<'a>(
             );
         }
     }
+    let free = |value: &Value| matches!(value, Value::Fitted(_) | Value::Within { .. });
     if let Some(scatter) = &measurement.environment_scatter {
         if measurement.spread.is_some() {
             return invalid(
@@ -1119,6 +1120,11 @@ pub(crate) fn checked<'a>(
         }
         match &scatter.source {
             ScatterSource::FullDetector if active => {
+                if regions.len() == 1 && free(&scatter.fraction) {
+                    return invalid(
+                        "one full-detector region cannot measure the scatter fraction".into(),
+                    );
+                }
                 if !regions.iter().map(|r| r.pixels).sum::<f64>().is_finite() {
                     return invalid("the full detector area must be finite".into());
                 }
@@ -1150,7 +1156,6 @@ pub(crate) fn checked<'a>(
             ScatterSource::FullDetector => {}
         }
     }
-    let free = |value: &Value| matches!(value, Value::Fitted(_) | Value::Within { .. });
     if free(&calibration.t0_us)
         && !regions.is_empty()
         && regions.iter().all(|region| free(&region.timing_offset_us))

@@ -31,7 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   With full coverage, the fit predicts the detector mean from the regions.
   A partial-detector fit with photon backgrounds takes independently
   measured detector-wide mean photon counts in both runs. Open pixels can
-  measure the scatter fraction through `fit_counts`.
+  measure the scatter fraction through `fit_counts`. Read the fraction from
+  `CountsFit::scatter_fraction`. The fit rejects a simultaneous `Spread`.
+  In Rust, `EnvironmentScatter::source` replaces `detector_mean` and takes a
+  `ScatterSource`. In Python, use `EnvironmentScatter.full_detector` or pass
+  `photon_mean` to `EnvironmentScatter`.
 - A counts fit that does not converge says which rule ended it:
   `CountsFit::unconverged` holds the rule, such as "no step of the fitter
   lowers the objective" or "the fitter reached its step limit", and a pulse
