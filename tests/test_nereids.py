@@ -1175,6 +1175,11 @@ class TestCountsApi:
             ),
         )
         assert scattered.environment_scatter.fraction.value == 0.09
+        assert nereids.EnvironmentScatter.full_detector(nereids.Value.known(0.1)).fraction.value == 0.1
+        measured = nereids.EnvironmentScatter(
+            nereids.Value.known(0.1), [4.0], [3.0], photon_mean=([0.5], [0.25])
+        )
+        assert measured.fraction.value == 0.1
         assert measurement.filter is None
         filtered = nereids.Measurement(
             time_edges_us=[1.0, 2.0, 3.0, 4.0, 5.0],
@@ -1187,6 +1192,61 @@ class TestCountsApi:
         )
         assert filtered.filter.areal_density.value == 2e-4
         assert filtered.filter.temperature_k == 295.0
+
+    def test_furnace_scatter_moves_only_neutrons_in_both_coverage_modes(self, u238_data):
+        known = nereids.Value.known
+        bins = 50
+        fraction = known(0.2)
+        material = nereids.Material(
+            isotopes=[(u238_data, known(0.0))], temperature_k=known(300.0)
+        )
+        # Neutrons per bin before scatter: open (240, 560), sample (360, 560).
+        # Local photons per bin: open (200, 200), sample (100, 200).
+        observed = [(472, 480), (728, 740)]
+        regions = [
+            nereids.Region(
+                open_counts=[open_counts] * bins,
+                sample_counts=[sample_counts] * bins,
+                pixels=1.0,
+                background=[known(b0), known(0.0), known(0.0)],
+                gamma_transmission=known(gamma),
+                material=absorber,
+            )
+            for (open_counts, sample_counts), b0, gamma, absorber in zip(
+                observed, [0.5, 0.0], [0.5, 1.0], [material, None]
+            )
+        ]
+
+        def fit(coverage, source):
+            return nereids.fit_counts(
+                nereids.Measurement(
+                    time_edges_us=np.arange(650.0, 651.0 + bins),
+                    charge_ratio=1.0,
+                    normalization=known(1.0),
+                    time_background=[known(200.0), known(0.0), known(1.0)],
+                    regions=coverage,
+                    environment_scatter=source,
+                ),
+                self._calibration(),
+            )
+
+        def measured(photons=None):
+            return nereids.EnvironmentScatter(
+                fraction, [600.0] * bins, [610.0] * bins, photon_mean=photons
+            )
+
+        full = fit(regions, nereids.EnvironmentScatter.full_detector(fraction))
+        partial = fit(regions[:1], measured(([200.0] * bins, [150.0] * bins)))
+        for result in [full, partial]:
+            assert result.converged
+            for region, (open_counts, sample_counts) in zip(result.regions, observed):
+                np.testing.assert_array_equal(np.rint(region.predicted_open), open_counts)
+                np.testing.assert_array_equal(np.rint(region.predicted_sample), sample_counts)
+
+        with pytest.raises(ValueError, match="mean photon counts"):
+            fit(regions[:1], measured())
+        with pytest.raises(ValueError, match="photon counts exceed"):
+            fit(regions[:1], measured(([200.0] * bins, [611.0] * bins)))
 
     def test_fit_counts_requires_a_material(self):
         measurement = nereids.Measurement(

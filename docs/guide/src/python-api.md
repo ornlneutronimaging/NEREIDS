@@ -163,12 +163,26 @@ Spread(share, kernel, grid, cells) or None: region r records
 F_rq the share of region q's spread counts recorded in region r's cells, for
 the kernel's (weight, length in cells) terms
 sum(w*exp(-r/s)/(2*pi*s**2)) on a grid of (rows, columns) cells.
-environment_scatter is EnvironmentScatter(fraction, open_mean, sample_mean) or
-None: in each bin of each run a region of P pixels records
-(1 - s)*mu + s*P*m of the counts mu arriving in it, s the fraction and m the
-run's mean in that bin. Compute each mean as the run's counts over the live
-fraction, averaged over every good pixel of the detector; the fit takes the
-means as exact. Open pixels alone measure s: call fit_counts on a
+The `environment_scatter` argument defaults to `None`.
+Use `EnvironmentScatter.full_detector(fraction)` when the regions partition all
+illuminated detector pixels on one clock. Each bin redistributes a fraction
+of its predicted neutron counts in proportion to region area. Photon counts
+stay local, including time background and sample capture gammas. A single
+region covering the whole detector can use a known fraction or an independent
+measurement. Estimating it from the counts requires spatial contrast.
+
+For partial coverage, use `EnvironmentScatter(fraction, open_mean, sample_mean,
+photon_mean=(open_photons, sample_photons))`. The first two arrays are total
+counts per pixel before live losses, averaged over the good detector pixels.
+The photon arrays are independently measured mean photon counts on the same
+pixels, bins and exposure scale, excluding room background. Supply all means
+on the recorded clock of the region. Multiple regions sharing a spectrum
+need the same known timing offset. Supply the photon means when
+photon counts contribute to either run. A fit with active photon terms and
+scatter requires these arrays. In each bin, the total must cover the measured
+photons and the modeled room counts. The fit treats measured means as exact.
+
+Open pixels alone measure s: call fit_counts on a
 Measurement whose regions are open pixels with material None and b0 known 0,
 with s and the normalization fitted, and give the sample's Measurement that s
 and its standard deviation as Value.measured. No cross section or temperature

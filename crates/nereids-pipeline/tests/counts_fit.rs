@@ -22,8 +22,8 @@ use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
     CountsFit, EnvironmentScatter, ExcludedRange, Filter, Material, Measurement,
-    NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Spread, Value,
-    fit_counts,
+    NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, ScatterSource,
+    Spread, Value, fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map, region_live};
 use nereids_pipeline::error::PipelineError;
@@ -2174,6 +2174,180 @@ fn a_filter_in_the_beam_is_recovered_with_the_density_and_temperature() {
 }
 
 #[test]
+fn furnace_scatter_requires_spectra_on_a_common_region_clock() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![100.0; bins], vec![100.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.regions.push(m.regions[0].clone());
+    for source in [
+        ScatterSource::Measured {
+            total: [vec![100.0; bins], vec![100.0; bins]],
+            photons: None,
+        },
+        ScatterSource::FullDetector,
+    ] {
+        m.environment_scatter = Some(EnvironmentScatter {
+            fraction: Value::Known(0.1),
+            source,
+        });
+        for offset in [Value::Known(1.0), Value::Fitted(0.0)] {
+            m.regions[1].timing_offset_us = offset;
+            let error = fit_counts(&m, &calibration(&setup)).expect_err("region clocks");
+            assert!(
+                error
+                    .to_string()
+                    .contains("common known region timing offset"),
+                "{error}"
+            );
+        }
+    }
+    m.regions[1].timing_offset_us = Value::Known(0.0);
+    for r in &mut m.regions {
+        r.pixels = f64::MAX;
+    }
+    let error = fit_counts(&m, &calibration(&setup)).expect_err("area overflow");
+    assert!(error.to_string().contains("area must be finite"), "{error}");
+}
+
+#[test]
+fn furnace_neutron_scatter_preserves_the_local_photon_background() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![1000.0; bins], vec![500.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.charge_ratio = 1.0;
+    m.material_mut().isotopes[0].1 = Value::Known(0.0);
+    m.regions[0].gamma_transmission = Value::Known(0.5);
+    m.regions.push(Region {
+        sample_counts: vec![1000.0; bins],
+        gamma_transmission: Value::Known(1.0),
+        material: None,
+        ..m.regions[0].clone()
+    });
+    m.time_background[0] = Value::Known(1000.0);
+    let observed = [vec![1000.0; bins], vec![750.0; bins]];
+    let scatter = |source| {
+        Some(EnvironmentScatter {
+            fraction: Value::Known(0.1),
+            source,
+        })
+    };
+    m.environment_scatter = scatter(ScatterSource::FullDetector);
+    let full = fit_counts(&m, &calibration(&setup)).expect("full detector");
+    m.regions.pop();
+    m.environment_scatter = scatter(ScatterSource::Measured {
+        total: observed.clone(),
+        photons: None,
+    });
+    assert!(
+        fit_counts(&m, &calibration(&setup))
+            .unwrap_err()
+            .to_string()
+            .contains("photon counts")
+    );
+    m.environment_scatter = scatter(ScatterSource::Measured {
+        total: observed.clone(),
+        photons: Some(observed),
+    });
+    let partial = fit_counts(&m, &calibration(&setup)).expect("partial detector");
+    for fit in [full, partial] {
+        assert!(fit.converged, "{:?}", fit.unconverged);
+        for (region, expected) in fit.regions.iter().zip([500.0, 1000.0]) {
+            for &prediction in &region.predicted[1] {
+                assert_eq!(
+                    prediction.round(),
+                    expected,
+                    "predicted {prediction} counts"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn furnace_scatter_requires_nonnegative_local_neutrons_before_backgrounds() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    for photon_rate in [0.0, 100.0] {
+        let mut m = measurement(
+            &setup,
+            (vec![200.0; bins], vec![87.0; bins]),
+            &[(hafnium_like(20.0), 0.0)],
+        );
+        m.charge_ratio = 1.0;
+        m.material_mut().isotopes[0].1 = Value::Known(0.0);
+        m.time_background[0] = Value::Known(photon_rate);
+        m.room_background = Some(RoomBackground {
+            rate: Value::Known(100.0 - photon_rate),
+            frames: [1.0; 2],
+        });
+        m.regions.push(Region {
+            sample_counts: vec![163.0; bins],
+            material: None,
+            ..m.regions[0].clone()
+        });
+        for source in [
+            ScatterSource::FullDetector,
+            ScatterSource::Measured {
+                total: [vec![200.0; bins], vec![125.0; bins]],
+                photons: Some([vec![photon_rate; bins], vec![photon_rate; bins]]),
+            },
+        ] {
+            m.environment_scatter = Some(EnvironmentScatter {
+                fraction: Value::Known(0.5),
+                source,
+            });
+            m.regions[0].background[0] = Value::Known(-1.5);
+            let err = fit_counts(&m, &calibration(&setup)).unwrap_err();
+            assert!(err.to_string().contains("local neutron"), "{err}");
+            m.regions[0].background[0] = Value::Known(-1.0);
+            fit_counts(&m, &calibration(&setup)).expect("zero local neutron source");
+        }
+    }
+}
+
+#[test]
+fn furnace_scatter_requires_nonnegative_measured_neutrons_after_room_subtraction() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![200.0; bins], vec![225.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.charge_ratio = 1.0;
+    m.material_mut().isotopes[0].1 = Value::Known(0.0);
+    m.time_background[0] = Value::Known(75.0);
+    m.room_background = Some(RoomBackground {
+        rate: Value::Known(25.0),
+        frames: [1.0, 2.0],
+    });
+    for (sample_mean, valid) in [(125.0, true), (124.0, false)] {
+        m.environment_scatter = Some(EnvironmentScatter {
+            fraction: Value::Known(0.25),
+            source: ScatterSource::Measured {
+                total: [vec![100.0; bins], vec![sample_mean; bins]],
+                photons: Some([vec![75.0; bins], vec![75.0; bins]]),
+            },
+        });
+        let fit = fit_counts(&m, &calibration(&setup));
+        if valid {
+            fit.expect("zero measured neutron source");
+        } else {
+            let err = fit.unwrap_err();
+            assert!(err.to_string().contains("detector neutron"), "{err}");
+        }
+    }
+}
+
+#[test]
 fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
     let setup = standard();
     let isotope = hafnium_like(20.0);
@@ -2203,7 +2377,10 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
     };
     let scatter = |fraction| EnvironmentScatter {
         fraction,
-        detector_mean: detector_mean.clone(),
+        source: ScatterSource::Measured {
+            total: detector_mean.clone(),
+            photons: None,
+        },
     };
     let fit = fit_with(Some(scatter(Value::Fitted(0.02))));
     assert!(fit.converged);
@@ -2227,6 +2404,89 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
 }
 
 #[test]
+fn a_single_full_detector_region_cannot_measure_the_scatter_fraction() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![100.0; bins], vec![100.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.charge_ratio = 1.0;
+    m.material_mut().isotopes[0].1 = Value::Known(0.0);
+    let mut fit = |fraction| {
+        m.environment_scatter = Some(EnvironmentScatter {
+            fraction,
+            source: ScatterSource::FullDetector,
+        });
+        fit_counts(&m, &calibration(&setup))
+    };
+    for fraction in [
+        Value::Fitted(0.2),
+        Value::Within {
+            start: 0.8,
+            lower: 0.1,
+            upper: 1.0,
+        },
+    ] {
+        let error = fit(fraction).expect_err("unidentifiable fraction");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot measure the scatter fraction"),
+            "{error}"
+        );
+    }
+    for fraction in [
+        Value::Known(0.2),
+        Value::Measured {
+            value: 0.2,
+            sd: 0.05,
+        },
+    ] {
+        let result = fit(fraction).expect("independent fraction");
+        assert!(result.converged);
+        assert!((result.scatter_fraction - 0.2).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn the_full_detector_measures_scatter_from_all_its_regions() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let density = 5.0e-3;
+    let fraction = 0.09;
+    let (recorded, _) = scattered(&setup, &isotope, density, fraction);
+    let mut m = measurement(&setup, (Vec::new(), Vec::new()), &[(isotope, density)]);
+    let template = m.regions.pop().unwrap();
+    m.regions = recorded
+        .into_iter()
+        .zip([Some(density), None, Some(SATURATED), None])
+        .map(|((pixels, [open_counts, sample_counts]), n)| {
+            let material = n.map(|d| {
+                let mut material = template.material.clone().unwrap();
+                material.isotopes[0].1 = Value::Known(d);
+                material
+            });
+            Region {
+                pixels,
+                open_counts,
+                sample_counts,
+                material,
+                ..template.clone()
+            }
+        })
+        .collect();
+    m.environment_scatter = Some(EnvironmentScatter {
+        fraction: Value::Fitted(0.02),
+        source: ScatterSource::FullDetector,
+    });
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged, "{:?}", fit.unconverged);
+    assert!((fit.scatter_fraction - fraction).abs() <= BOUND.sqrt() * error_bar(&fit, 0));
+}
+
+#[test]
 fn open_pixels_alone_measure_the_environment_scatter() {
     let setup = standard();
     let fraction = 0.09;
@@ -2238,7 +2498,10 @@ fn open_pixels_alone_measure_the_environment_scatter() {
     m.normalization = Value::Fitted(0.9);
     m.environment_scatter = Some(EnvironmentScatter {
         fraction: Value::Fitted(0.02),
-        detector_mean,
+        source: ScatterSource::Measured {
+            total: detector_mean,
+            photons: None,
+        },
     });
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
     assert!(fit.converged);
@@ -3435,7 +3698,10 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     let bins = setup.edges.len() - 1;
     let scatter = |fraction: f64, mean: Vec<f64>| EnvironmentScatter {
         fraction: Value::Known(fraction),
-        detector_mean: [vec![1.0; bins], mean],
+        source: ScatterSource::Measured {
+            total: [vec![1.0; bins], mean],
+            photons: None,
+        },
     };
     for (fraction, mean) in [
         (1.5, vec![1.0; bins]),
@@ -3444,6 +3710,22 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         (0.1, vec![f64::NAN; bins]),
     ] {
         invalid(&|m| m.environment_scatter = Some(scatter(fraction, mean.clone())));
+    }
+    for photons in [
+        vec![0.0; bins - 1],
+        vec![-1.0; bins],
+        vec![f64::NAN; bins],
+        vec![2.0; bins],
+    ] {
+        invalid(&|m| {
+            m.environment_scatter = Some(EnvironmentScatter {
+                fraction: Value::Known(0.1),
+                source: ScatterSource::Measured {
+                    total: [vec![1.0; bins], vec![1.0; bins]],
+                    photons: Some([vec![0.0; bins], photons.clone()]),
+                },
+            })
+        });
     }
     invalid(&|m| {
         m.environment_scatter = Some(scatter(0.1, vec![1.0; bins]));

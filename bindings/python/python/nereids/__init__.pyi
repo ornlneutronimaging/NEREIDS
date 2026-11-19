@@ -1264,8 +1264,9 @@ class Spread:
 class EnvironmentScatter:
     """Neutrons the sample environment scatters evenly over the detector.
 
-    fraction is s; open_mean and sample_mean are the detector's mean arriving
-    counts per pixel in each bin of the open-beam run and of the sample run.
+    open_mean and sample_mean are total counts per pixel before live losses.
+    photon_mean gives independent photon counts per pixel for both runs on
+    the same bins and exposure scale. The fit treats these means as exact.
     """
 
     def __init__(
@@ -1273,7 +1274,13 @@ class EnvironmentScatter:
         fraction: Value,
         open_mean: list[float],
         sample_mean: list[float],
+        *,
+        photon_mean: tuple[list[float], list[float]] | None = None,
     ) -> None: ...
+    @staticmethod
+    def full_detector(fraction: Value) -> EnvironmentScatter:
+        """Use regions that partition the entire illuminated detector."""
+        ...
     @property
     def fraction(self) -> Value: ...
 

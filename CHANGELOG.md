@@ -27,17 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   flight path and pulse; `RegionFit.excluded_bins` lists them, and the pulse
   calibration file records the ranges. Nothing is left out unless stated.
   Python: `Material(excluded_ranges=[(low_ev, high_ev, reason)])`.
-- `EnvironmentScatter` on `Measurement::environment_scatter` gives the counts
-  fit the fraction `s` of the neutrons that a sample environment, such as a
-  furnace, scatters evenly over the detector: in each bin of each run a region
-  of `P` pixels records `(1 − s)·μ + s·P·m` of its arriving counts `μ`, `m` the
-  run's mean arriving counts per detector pixel, given as data. The scatter
-  fills the resonance dips of the sample run, and an open-beam run with the
-  environment in place does not cancel it. Open pixels alone measure `s`:
-  `fit_counts` takes a measurement whose regions hold no material when `s` is
-  fitted, and `CountsFit::scatter_fraction` returns it. The term is refused
-  with a `Spread`. Python has `EnvironmentScatter` and
-  `Measurement(environment_scatter=...)`.
+- Furnace scatter redistributes neutron counts across detector regions.
+  With full coverage, the fit predicts the detector mean from the regions.
+  A partial-detector fit with photon backgrounds takes independently
+  measured detector-wide mean photon counts in both runs. Open pixels can
+  measure the scatter fraction through `fit_counts`. Read the fraction from
+  `CountsFit::scatter_fraction`. The fit rejects a simultaneous `Spread`.
+  In Rust, `EnvironmentScatter::source` replaces `detector_mean` and takes a
+  `ScatterSource`. In Python, use `EnvironmentScatter.full_detector` or pass
+  `photon_mean` to `EnvironmentScatter`.
 - A counts fit that does not converge says which rule ended it:
   `CountsFit::unconverged` holds the rule, such as "no step of the fitter
   lowers the objective" or "the fitter reached its step limit", and a pulse
