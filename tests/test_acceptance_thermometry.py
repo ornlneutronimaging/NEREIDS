@@ -30,7 +30,7 @@ SAMPLES = {
     "300C": (19391, 19392, 606.26),
     "400C": (19393, 19394, 708.30),
     "600C": (19395, 19396, 901.67),
-    # Mean of three foil thermocouples; the floating left one is excluded.
+    # Frame-thermocouple mean without the floating left thermocouple.
     "800C": (19397, 19398, 1093.0),
 }
 
