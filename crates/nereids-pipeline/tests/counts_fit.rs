@@ -22,8 +22,8 @@ use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
     CountsFit, EnvironmentScatter, ExcludedRange, Filter, Material, Measurement,
-    NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Spread, Value,
-    fit_counts,
+    NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, ScatterSource,
+    Spread, Value, fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map, region_live};
 use nereids_pipeline::error::PipelineError;
@@ -2174,6 +2174,64 @@ fn a_filter_in_the_beam_is_recovered_with_the_density_and_temperature() {
 }
 
 #[test]
+fn furnace_neutron_scatter_preserves_the_local_photon_background() {
+    let setup = standard();
+    let bins = setup.edges.len() - 1;
+    let mut m = measurement(
+        &setup,
+        (vec![1000.0; bins], vec![500.0; bins]),
+        &[(hafnium_like(20.0), 0.0)],
+    );
+    m.charge_ratio = 1.0;
+    m.material_mut().isotopes[0].1 = Value::Known(0.0);
+    m.regions[0].gamma_transmission = Value::Known(0.5);
+    m.regions.push(Region {
+        sample_counts: vec![1000.0; bins],
+        gamma_transmission: Value::Known(1.0),
+        material: None,
+        ..m.regions[0].clone()
+    });
+    m.time_background[0] = Value::Known(1000.0);
+    let observed = [vec![1000.0; bins], vec![750.0; bins]];
+    let scatter = |source| {
+        Some(EnvironmentScatter {
+            fraction: Value::Known(0.1),
+            source,
+        })
+    };
+    m.environment_scatter = scatter(ScatterSource::FullDetector);
+    let full = fit_counts(&m, &calibration(&setup)).expect("full detector");
+    m.regions.pop();
+    m.environment_scatter = scatter(ScatterSource::Measured {
+        total: observed.clone(),
+        photons: None,
+    });
+    assert!(
+        fit_counts(&m, &calibration(&setup))
+            .unwrap_err()
+            .to_string()
+            .contains("photon counts")
+    );
+    m.environment_scatter = scatter(ScatterSource::Measured {
+        total: observed.clone(),
+        photons: Some(observed),
+    });
+    let partial = fit_counts(&m, &calibration(&setup)).expect("partial detector");
+    for fit in [full, partial] {
+        assert!(fit.converged, "{:?}", fit.unconverged);
+        for (region, expected) in fit.regions.iter().zip([500.0, 1000.0]) {
+            for &prediction in &region.predicted[1] {
+                assert_eq!(
+                    prediction.round(),
+                    expected,
+                    "predicted {prediction} counts"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
     let setup = standard();
     let isotope = hafnium_like(20.0);
@@ -2203,7 +2261,10 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
     };
     let scatter = |fraction| EnvironmentScatter {
         fraction,
-        detector_mean: detector_mean.clone(),
+        source: ScatterSource::Measured {
+            total: detector_mean.clone(),
+            photons: None,
+        },
     };
     let fit = fit_with(Some(scatter(Value::Fitted(0.02))));
     assert!(fit.converged);
@@ -2227,6 +2288,42 @@ fn the_environment_scatter_is_recovered_with_the_density_and_temperature() {
 }
 
 #[test]
+fn the_full_detector_measures_scatter_from_all_its_regions() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let density = 5.0e-3;
+    let fraction = 0.09;
+    let (recorded, _) = scattered(&setup, &isotope, density, fraction);
+    let mut m = measurement(&setup, (Vec::new(), Vec::new()), &[(isotope, density)]);
+    let template = m.regions.pop().unwrap();
+    m.regions = recorded
+        .into_iter()
+        .zip([Some(density), None, Some(SATURATED), None])
+        .map(|((pixels, [open_counts, sample_counts]), n)| {
+            let material = n.map(|d| {
+                let mut material = template.material.clone().unwrap();
+                material.isotopes[0].1 = Value::Known(d);
+                material
+            });
+            Region {
+                pixels,
+                open_counts,
+                sample_counts,
+                material,
+                ..template.clone()
+            }
+        })
+        .collect();
+    m.environment_scatter = Some(EnvironmentScatter {
+        fraction: Value::Fitted(0.02),
+        source: ScatterSource::FullDetector,
+    });
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged, "{:?}", fit.unconverged);
+    assert!((fit.scatter_fraction - fraction).abs() <= BOUND.sqrt() * error_bar(&fit, 0));
+}
+
+#[test]
 fn open_pixels_alone_measure_the_environment_scatter() {
     let setup = standard();
     let fraction = 0.09;
@@ -2238,7 +2335,10 @@ fn open_pixels_alone_measure_the_environment_scatter() {
     m.normalization = Value::Fitted(0.9);
     m.environment_scatter = Some(EnvironmentScatter {
         fraction: Value::Fitted(0.02),
-        detector_mean,
+        source: ScatterSource::Measured {
+            total: detector_mean,
+            photons: None,
+        },
     });
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
     assert!(fit.converged);
@@ -3435,7 +3535,10 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     let bins = setup.edges.len() - 1;
     let scatter = |fraction: f64, mean: Vec<f64>| EnvironmentScatter {
         fraction: Value::Known(fraction),
-        detector_mean: [vec![1.0; bins], mean],
+        source: ScatterSource::Measured {
+            total: [vec![1.0; bins], mean],
+            photons: None,
+        },
     };
     for (fraction, mean) in [
         (1.5, vec![1.0; bins]),
@@ -3444,6 +3547,22 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         (0.1, vec![f64::NAN; bins]),
     ] {
         invalid(&|m| m.environment_scatter = Some(scatter(fraction, mean.clone())));
+    }
+    for photons in [
+        vec![0.0; bins - 1],
+        vec![-1.0; bins],
+        vec![f64::NAN; bins],
+        vec![2.0; bins],
+    ] {
+        invalid(&|m| {
+            m.environment_scatter = Some(EnvironmentScatter {
+                fraction: Value::Known(0.1),
+                source: ScatterSource::Measured {
+                    total: [vec![1.0; bins], vec![1.0; bins]],
+                    photons: Some([vec![0.0; bins], photons.clone()]),
+                },
+            })
+        });
     }
     invalid(&|m| {
         m.environment_scatter = Some(scatter(0.1, vec![1.0; bins]));

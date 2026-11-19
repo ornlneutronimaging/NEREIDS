@@ -1175,6 +1175,11 @@ class TestCountsApi:
             ),
         )
         assert scattered.environment_scatter.fraction.value == 0.09
+        assert nereids.EnvironmentScatter.full_detector(nereids.Value.known(0.1)).fraction.value == 0.1
+        measured = nereids.EnvironmentScatter(
+            nereids.Value.known(0.1), [4.0], [3.0], photon_mean=([0.5], [0.25])
+        )
+        assert measured.fraction.value == 0.1
         assert measurement.filter is None
         filtered = nereids.Measurement(
             time_edges_us=[1.0, 2.0, 3.0, 4.0, 5.0],

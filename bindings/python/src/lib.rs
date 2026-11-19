@@ -26,7 +26,7 @@ use nereids_physics::resolution::{
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::counts_fit::{
     CountsFit, EnvironmentScatter, ExcludedRange, Filter, Material, Measurement,
-    NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Spread, Value,
+    NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, ScatterSource, Spread, Value,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, PatchCovariances};
 use nereids_pipeline::error::PipelineError;
@@ -3779,11 +3779,31 @@ struct PyEnvironmentScatter {
 #[pymethods]
 impl PyEnvironmentScatter {
     #[new]
-    fn new(fraction: PyValue, open_mean: Vec<f64>, sample_mean: Vec<f64>) -> Self {
+    #[pyo3(signature = (fraction, open_mean, sample_mean, *, photon_mean=None))]
+    fn new(
+        fraction: PyValue,
+        open_mean: Vec<f64>,
+        sample_mean: Vec<f64>,
+        photon_mean: Option<[Vec<f64>; 2]>,
+    ) -> Self {
         Self {
             inner: EnvironmentScatter {
                 fraction: fraction.inner,
-                detector_mean: [open_mean, sample_mean],
+                source: ScatterSource::Measured {
+                    total: [open_mean, sample_mean],
+                    photons: photon_mean,
+                },
+            },
+        }
+    }
+
+    /// Use regions that partition the entire illuminated detector.
+    #[staticmethod]
+    fn full_detector(fraction: PyValue) -> Self {
+        Self {
+            inner: EnvironmentScatter {
+                fraction: fraction.inner,
+                source: ScatterSource::FullDetector,
             },
         }
     }

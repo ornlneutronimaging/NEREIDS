@@ -285,20 +285,32 @@ pub struct Spread {
 /// The fraction `s` of the neutrons leaving the sample position that the
 /// sample environment, such as a furnace, scatters evenly over the detector.
 ///
-/// In each bin of each run a region of `P` pixels records `(1 − s)·μ + s·P·m`
-/// of its arriving counts `μ`.  An open-beam run with the environment in place
-/// does not cancel the sample run's term.
+/// A region of `P` pixels gains `s(P·m − N)` neutron counts per bin, with local
+/// neutron counts `N` and detector mean `m` per pixel. Photons keep their local
+/// counts. An open-beam run does not cancel the sample run's scatter.
 ///
 /// # References
-///
 /// P. Boillat et al., Opt. Express 26, 15769 (2018).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnvironmentScatter {
-    /// `s`, within 0–1.
+    /// Fraction of the neutrons redistributed, within 0–1.
     pub fraction: Value,
-    /// `m` of the open-beam run, then of the sample run: the mean counts
-    /// arriving per detector pixel in each bin, finite and 0 or more.
-    pub detector_mean: [Vec<f64>; 2],
+    /// Source of the detector-wide mean in each bin.
+    pub source: ScatterSource,
+}
+
+/// Detector coverage for the environment's scattered neutrons.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScatterSource {
+    /// The regions partition all illuminated detector pixels on the same clock.
+    FullDetector,
+    /// Detector-wide mean counts per pixel before live losses, open then sample.
+    Measured {
+        /// Total counts per pixel in each bin of each run.
+        total: [Vec<f64>; 2],
+        /// Independently measured photon counts per pixel on the same exposure scale.
+        photons: Option<[Vec<f64>; 2]>,
+    },
 }
 
 /// The counts of a set of pixels in both runs, its background and the
@@ -1093,16 +1105,44 @@ pub(crate) fn checked<'a>(
                 "an environment scatter with a detector spread is not supported".into(),
             );
         }
-        let bins = time_edges_us.len().saturating_sub(1);
-        if !scatter
-            .detector_mean
-            .iter()
-            .all(|mean| mean.len() == bins && mean.iter().all(|m| m.is_finite() && *m >= 0.0))
-        {
-            return invalid(format!(
-                "the environment scatter's detector means must each hold {bins} finite counts of \
-                 0 or more"
-            ));
+        let active = scatter.fraction != Value::Known(0.0);
+        match &scatter.source {
+            ScatterSource::FullDetector if active && regions.len() > 1 => {
+                if !regions.iter().map(|r| r.pixels).sum::<f64>().is_finite() {
+                    return invalid("the full detector area must be finite".into());
+                }
+                if !regions.iter().all(|r| {
+                    matches!(r.timing_offset_us, Value::Known(_))
+                        && r.timing_offset_us == regions[0].timing_offset_us
+                }) {
+                    return invalid("full-detector environment scatter needs one common known region timing offset".into());
+                }
+            }
+            ScatterSource::Measured { total, photons } => {
+                let bins = time_edges_us.len().saturating_sub(1);
+                for mean in total.iter().chain(photons.iter().flatten()) {
+                    if mean.len() != bins || !mean.iter().all(|v| v.is_finite() && *v >= 0.0) {
+                        return invalid(format!(
+                            "an environment scatter mean needs {bins} finite counts per pixel of 0 or more"
+                        ));
+                    }
+                }
+                if let Some(photons) = photons {
+                    if photons
+                        .iter()
+                        .flatten()
+                        .zip(total.iter().flatten())
+                        .any(|(p, t)| p > t)
+                    {
+                        return invalid(
+                            "the detector mean photon counts exceed its total counts".into(),
+                        );
+                    }
+                } else if active && measurement_has_photons(measurement) {
+                    return invalid("partial-detector environment scatter with a photon background needs detector-wide mean photon counts".into());
+                }
+            }
+            ScatterSource::FullDetector => {}
         }
     }
     let free = |value: &Value| matches!(value, Value::Fitted(_) | Value::Within { .. });
@@ -1617,18 +1657,85 @@ pub(crate) fn spread_shares(
     ))))
 }
 
-/// The environment scatter's `P·m` in each bin of each region's open-beam run
-/// then sample run, or `None` without one.
-fn scattered_counts(measurement: &Measurement) -> Option<Arc<Vec<f64>>> {
-    let scatter = measurement.environment_scatter.as_ref()?;
-    let means = || scatter.detector_mean.iter().flatten();
-    Some(Arc::new(
-        measurement
-            .regions
+fn measurement_has_photons(m: &Measurement) -> bool {
+    [0, 1, 3]
+        .iter()
+        .any(|&i| m.time_background[i] != Value::Known(0.0))
+        || m.regions
             .iter()
-            .flat_map(|region| means().map(move |m| region.pixels * m))
-            .collect(),
-    ))
+            .any(|r| r.capture_gammas != Value::Known(0.0))
+}
+
+struct Furnace {
+    source: NeutronSource,
+    local_photons: bool,
+}
+
+enum NeutronSource {
+    AreaFractions(Vec<f64>),
+    Measured(Vec<f64>),
+}
+
+impl Furnace {
+    fn new(m: &Measurement) -> Option<Arc<Self>> {
+        let scatter = m.environment_scatter.as_ref()?;
+        if scatter.fraction == Value::Known(0.0) {
+            return None;
+        }
+        let source = match &scatter.source {
+            ScatterSource::FullDetector => {
+                let area: f64 = m.regions.iter().map(|r| r.pixels).sum();
+                NeutronSource::AreaFractions(m.regions.iter().map(|r| r.pixels / area).collect())
+            }
+            ScatterSource::Measured { total, photons } => {
+                let mean: Vec<_> = total
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(run, bins)| {
+                        bins.iter()
+                            .enumerate()
+                            .map(move |(k, t)| t - photons.as_ref().map_or(0.0, |p| p[run][k]))
+                    })
+                    .collect();
+                NeutronSource::Measured(
+                    m.regions
+                        .iter()
+                        .flat_map(|r| mean.iter().map(move |v| r.pixels * v))
+                        .collect(),
+                )
+            }
+        };
+        Some(Arc::new(Self {
+            source,
+            local_photons: measurement_has_photons(m),
+        }))
+    }
+
+    /// Gain minus loss for a unit scattered fraction, or its slope for a fixed measured mean.
+    fn change(&self, local: &[f64], derivative: bool) -> Vec<f64> {
+        match &self.source {
+            NeutronSource::AreaFractions(areas) => {
+                let bins = local.len() / areas.len();
+                let mut total = vec![0.0; bins];
+                for region in local.chunks_exact(bins) {
+                    for (sum, v) in total.iter_mut().zip(region) {
+                        *sum += v;
+                    }
+                }
+                areas
+                    .iter()
+                    .zip(local.chunks_exact(bins))
+                    .flat_map(|(area, region)| {
+                        total.iter().zip(region).map(move |(t, v)| area * t - v)
+                    })
+                    .collect()
+            }
+            NeutronSource::Measured(mean) if !derivative => {
+                mean.iter().zip(local).map(|(m, v)| m - v).collect()
+            }
+            NeutronSource::Measured(_) => local.iter().map(|v| -v).collect(),
+        }
+    }
 }
 
 /// The fit of `measurement` from `beam_starts`, with the spread's shares
@@ -1659,7 +1766,7 @@ pub(crate) fn fit_counts_answer(
         mut base,
         mut resonances_in_span,
     } = checked(measurement, calibration)?;
-    let scattered = scattered_counts(measurement);
+    let scattered = Furnace::new(measurement);
     let pulse = &calibration.pulse;
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
     let beam_origin_us = starts.map_or(start[0], |starts| starts.origin_us);
@@ -1708,6 +1815,15 @@ pub(crate) fn fit_counts_answer(
                     out
                 })
                 .collect(),
+            _ if scattered
+                .as_ref()
+                .is_some_and(|f| matches!(f.source, NeutronSource::AreaFractions(_))) =>
+            {
+                let mut all: Vec<_> = own.into_iter().flatten().collect();
+                all.sort_unstable();
+                all.dedup();
+                vec![all; regions.len()]
+            }
             _ => own,
         }
     };
@@ -3047,7 +3163,7 @@ struct RegionsModel {
     layout: Arc<Layout>,
     clocks: RefCell<Option<Clocks>>,
     mixing: Option<Arc<Vec<Vec<f64>>>>,
-    scattered: Option<Arc<Vec<f64>>>,
+    scattered: Option<Arc<Furnace>>,
     filter: Option<Vec<f64>>,
 }
 
@@ -3298,7 +3414,7 @@ impl RegionsModel {
     }
 
     /// The model with the environment scatter's `P·m` of each region's runs.
-    fn environment(mut self, scattered: Option<Arc<Vec<f64>>>) -> Self {
+    fn environment(mut self, scattered: Option<Arc<Furnace>>) -> Self {
         self.scattered = scattered;
         self
     }
@@ -3528,6 +3644,39 @@ impl RegionsModel {
         [up, down]: [&ResonanceData; 2],
         h: f64,
     ) -> Result<Vec<f64>, PipelineError> {
+        let total = self.arriving_resonance_slope(params, region, isotope, [up, down], h)?;
+        if let Some(shares) = &self.mixing {
+            return Ok(mixed(shares, params[self.layout.spread], &total));
+        }
+        let Some(furnace) = &self.scattered else {
+            return Ok(total);
+        };
+        let local = if furnace.local_photons {
+            self.arriving_resonance_slope(
+                &self.without_photons(params),
+                region,
+                isotope,
+                [up, down],
+                h,
+            )?
+        } else {
+            total.clone()
+        };
+        Ok(add_scaled(
+            total,
+            params[self.layout.environment],
+            furnace.change(&local, true),
+        ))
+    }
+
+    fn arriving_resonance_slope(
+        &self,
+        params: &[f64],
+        region: usize,
+        isotope: usize,
+        [up, down]: [&ResonanceData; 2],
+        h: f64,
+    ) -> Result<Vec<f64>, PipelineError> {
         let place = &self.layout.regions[region];
         let temperature = params[place.temperature.expect("a material")];
         let density = params[place.densities.start + isotope];
@@ -3582,12 +3731,7 @@ impl RegionsModel {
         let bins = folded.len();
         let mut arriving = vec![0.0; 2 * bins * self.layout.regions.len()];
         arriving[(2 * region + 1) * bins..(2 * region + 2) * bins].copy_from_slice(&folded);
-        let kept = 1.0 - params[self.layout.environment];
-        Ok(match &self.mixing {
-            Some(shares) => mixed(shares, params[self.layout.spread], &arriving),
-            None if self.scattered.is_some() => arriving.iter().map(|a| kept * a).collect(),
-            None => arriving,
-        })
+        Ok(arriving)
     }
 
     /// The time background per pixel that `region` records, and its slopes
@@ -3666,6 +3810,34 @@ fn mixed(shares: &[Vec<f64>], h: f64, arriving: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+fn add_scaled(mut total: Vec<f64>, scale: f64, delta: Vec<f64>) -> Vec<f64> {
+    for (v, d) in total.iter_mut().zip(delta) {
+        *v += scale * d;
+    }
+    total
+}
+
+impl RegionsModel {
+    fn without_photons(&self, params: &[f64]) -> Vec<f64> {
+        let mut values = params.to_vec();
+        for (role, value) in self.layout.roles.iter().zip(&mut values) {
+            if role.photon_amplitude() {
+                *value = 0.0;
+            }
+        }
+        values
+    }
+}
+
+impl Role {
+    fn photon_amplitude(&self) -> bool {
+        matches!(
+            self,
+            Role::TimeBackground(0 | 1 | 3) | Role::CaptureGammas { .. }
+        )
+    }
+}
+
 impl FitModel for RegionsModel {
     /// The counts each region records; under a spread or an environment
     /// scatter, a bin whose arriving counts are negative or not a number
@@ -3674,10 +3846,17 @@ impl FitModel for RegionsModel {
         let arriving = self.arriving(params)?;
         let mut recorded = match (&self.mixing, &self.scattered) {
             (Some(shares), _) => mixed(shares, params[self.layout.spread], &arriving),
-            (None, Some(scattered)) => {
-                let s = params[self.layout.environment];
-                let mix = |(a, m): (&f64, &f64)| (1.0 - s) * a + s * m;
-                arriving.iter().zip(scattered.iter()).map(mix).collect()
+            (None, Some(furnace)) => {
+                let local = if furnace.local_photons {
+                    self.arriving(&self.without_photons(params))?
+                } else {
+                    arriving.clone()
+                };
+                add_scaled(
+                    arriving.clone(),
+                    params[self.layout.environment],
+                    furnace.change(&local, false),
+                )
             }
             (None, None) => return Ok(arriving),
         };
@@ -3690,6 +3869,68 @@ impl FitModel for RegionsModel {
     }
 
     fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let mut jacobian = self.arrival_jacobian(params, free_param_indices, y_current)?;
+        let Some(furnace) = &self.scattered else {
+            if let Some(shares) = &self.mixing {
+                let arriving = self.arriving(params).ok()?;
+                for (col, &index) in free_param_indices.iter().enumerate() {
+                    let values = if index == self.layout.spread {
+                        mixed(shares, 1.0, &arriving)
+                            .iter()
+                            .zip(&arriving)
+                            .map(|(m, a)| m - a)
+                            .collect()
+                    } else {
+                        let slope: Vec<_> =
+                            (0..y_current.len()).map(|i| jacobian.get(i, col)).collect();
+                        mixed(shares, params[self.layout.spread], &slope)
+                    };
+                    for (i, v) in values.into_iter().enumerate() {
+                        *jacobian.get_mut(i, col) = v;
+                    }
+                }
+            }
+            return Some(jacobian);
+        };
+        let local_params = furnace.local_photons.then(|| self.without_photons(params));
+        let local_jacobian = if let Some(p) = &local_params {
+            Some(self.arrival_jacobian(p, free_param_indices, y_current)?)
+        } else {
+            None
+        };
+        for (col, &index) in free_param_indices.iter().enumerate() {
+            let delta = if index == self.layout.environment {
+                let local = self
+                    .arriving(local_params.as_deref().unwrap_or(params))
+                    .ok()?;
+                furnace.change(&local, false)
+            } else {
+                if self.layout.roles[index].photon_amplitude() {
+                    continue;
+                }
+                let source = local_jacobian.as_ref().unwrap_or(&jacobian);
+                let local: Vec<_> = (0..y_current.len()).map(|i| source.get(i, col)).collect();
+                furnace
+                    .change(&local, true)
+                    .into_iter()
+                    .map(|v| v * params[self.layout.environment])
+                    .collect()
+            };
+            for (i, d) in delta.into_iter().enumerate() {
+                *jacobian.get_mut(i, col) += d;
+            }
+        }
+        Some(jacobian)
+    }
+}
+
+impl RegionsModel {
+    fn arrival_jacobian(
         &self,
         params: &[f64],
         free_param_indices: &[usize],
@@ -4067,31 +4308,7 @@ impl FitModel for RegionsModel {
                 }
             }
         }
-        if self.mixing.is_none() && self.scattered.is_none() {
-            return Some(jacobian);
-        }
-        let (h, s) = (params[layout.spread], params[layout.environment]);
-        let arriving = self.arriving(params).ok()?;
-        let less_arriving = |moved: &[f64]| -> Vec<f64> {
-            moved.iter().zip(&arriving).map(|(m, a)| m - a).collect()
-        };
-        let mut recorded = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
-        for (col, &index) in free_param_indices.iter().enumerate() {
-            let slope =
-                || -> Vec<f64> { (0..y_current.len()).map(|i| jacobian.get(i, col)).collect() };
-            let column = match (&self.mixing, &self.scattered, layout.roles[index]) {
-                (Some(shares), _, Role::SpreadShare) => {
-                    less_arriving(&mixed(shares, 1.0, &arriving))
-                }
-                (Some(shares), _, _) => mixed(shares, h, &slope()),
-                (None, Some(scattered), Role::ScatterFraction) => less_arriving(scattered),
-                (None, _, _) => slope().iter().map(|v| (1.0 - s) * v).collect(),
-            };
-            for (i, value) in column.into_iter().enumerate() {
-                *recorded.get_mut(i, col) = value;
-            }
-        }
-        Some(recorded)
+        Some(jacobian)
     }
 }
 
@@ -4180,8 +4397,21 @@ mod tests {
             let lattice = channel_fwhm_us
                 .is_none()
                 .then(|| PhononSpectrum::debye(240.0, 200).expect("Debye"));
-            let scattered = channel_fwhm_us.is_some();
-            jacobian_against_central_differences(&grid(channel_fwhm_us), lattice, scattered);
+            let grid = grid(channel_fwhm_us);
+            if channel_fwhm_us.is_some() {
+                let rows = 6 * (grid.time_edges_us().len() - 1);
+                let measured = (0..rows)
+                    .map(|k| 40.0 + 5.0 * (0.7 * k as f64).cos())
+                    .collect();
+                for source in [
+                    NeutronSource::Measured(measured),
+                    NeutronSource::AreaFractions(vec![4.0 / 15.0, 9.0 / 15.0, 2.0 / 15.0]),
+                ] {
+                    jacobian_against_central_differences(&grid, None, Some(source));
+                }
+            } else {
+                jacobian_against_central_differences(&grid, lattice, None);
+            }
         }
         let bins = starts_and_widths_us(&[350.0, 351.0, 400.0, 470.0]);
         let span = span_us(&bins);
@@ -4379,12 +4609,10 @@ mod tests {
         }
     }
 
-    /// Under a spread between the regions, or under an environment scatter
-    /// when `scattered`.
     fn jacobian_against_central_differences(
         grid: &Arc<FlightTimeGrid>,
         lattice: Option<PhononSpectrum>,
-        scattered: bool,
+        source: Option<NeutronSource>,
     ) {
         let (_, u_hi) = grid.range_us();
         let coarse = BeamSpline::constant(347.0, u_hi, 1.0e4);
@@ -4453,20 +4681,18 @@ mod tests {
             temperature_k: 295.0,
         }))
         .expect("filter")
-        .spread((!scattered).then(|| {
+        .spread(source.is_none().then(|| {
             Arc::new(vec![
                 vec![0.8, 0.1, 0.05],
                 vec![0.1, 0.7, 0.1],
                 vec![0.05, 0.15, 0.8],
             ])
         }))
-        .environment(scattered.then(|| {
-            let rows = 6 * (grid.time_edges_us().len() - 1);
-            Arc::new(
-                (0..rows)
-                    .map(|k| 40.0 + 5.0 * (0.7 * k as f64).cos())
-                    .collect(),
-            )
+        .environment(source.map(|source| {
+            Arc::new(Furnace {
+                source,
+                local_photons: true,
+            })
         }));
         let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
             .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
