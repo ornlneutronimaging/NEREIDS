@@ -1,0 +1,9 @@
+# SAMMY 8.2.b4 (commit c974c02c), executable MD5 091b34fa0229a5793918956006e23f68; Ta-181-mf2.endf (ENDF/B-VIII.1 MAT 7328).
+# eps = max|T(NXTRA 29) - T(NXTRA 99)| over the bins.
+# Columns: temperature (K), eps.
+299 4.350000e-08
+300 4.350000e-08
+301 4.350000e-08
+1099 3.930000e-08
+1100 3.920000e-08
+1101 3.930000e-08
