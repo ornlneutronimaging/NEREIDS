@@ -24,8 +24,10 @@
 //! `σ` is sampled once on a uniform grid of step `h`, the integral is the
 //! trapezoid rule on that grid, and `P_c` comes on the grid's nodes from a
 //! fast Fourier transform of `Φ − e^{−2W}`, sampled at `t = j·dt` up to
-//! `100/ω_max`, which resolves the phonon spectrum's structure, whose weight
-//! `e^{−2W}·2W` the one-phonon term carries.  A resonance of total width `Γ`
+//! `100/ω_max`.  Over the second half of that span the samples roll off by a
+//! raised cosine, which damps the ripple of the spectrum's cutoff.  Structure
+//! in `σ` or in the spectrum finer than about `ω_max/100` is not resolved,
+//! and no check detects it.  A resonance of total width `Γ`
 //! makes the trapezoid rule's error `≈ e^{−πΓ/h}`, so `h ≤ πΓ/30` for every
 //! resonance the kernel reaches, `h ≤ π·ω_max/100`, and `h` is a tenth of
 //! every File-3 knot interval within reach.
@@ -443,6 +445,7 @@ pub fn broaden_in_lattice(
     let dt = 2.0 * PI / (transform as f64 * h);
     let t_max = (100.0 / omega_max).min(PI / h);
     let samples = half.min((t_max / dt).ceil() as usize);
+    let t_end = (samples.max(2) - 1) as f64 * dt;
     let work = spectrum.node_count(t_max) * (samples + 1) as f64
         + energies.len() as f64 * transform as f64 * (transform as f64).log2();
     if work > MAX_WORK {
@@ -465,11 +468,13 @@ pub fn broaden_in_lattice(
             let zero_slope = -zero * r * g0_slope;
             let shift = energy + r - origin;
             let mut buffer = vec![Complex64::new(0.0, 0.0); transform];
-            for j in 0..samples.min(half) {
-                let phi = (r * (phonons.g[j] - g0)).exp();
-                let value = phi - zero;
-                let slope = phi * r * (phonons.g_slope[j] - g0_slope) - zero_slope;
+            for j in 0..samples {
                 let t = j as f64 * dt;
+                let roll = (2.0 * t / t_end - 1.0).clamp(0.0, 1.0);
+                let taper = 0.5 * (1.0 + (PI * roll).cos());
+                let phi = (r * (phonons.g[j] - g0)).exp();
+                let value = taper * (phi - zero);
+                let slope = taper * (phi * r * (phonons.g_slope[j] - g0_slope) - zero_slope);
                 let rotate = Complex64::from_polar(dt / (2.0 * PI), shift * t);
                 buffer[j] = rotate * (value + Complex64::i() * slope);
                 if j > 0 {
