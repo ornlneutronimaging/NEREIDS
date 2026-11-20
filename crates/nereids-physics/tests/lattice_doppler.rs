@@ -85,6 +85,21 @@ fn power(exponent: f64) -> ResonanceData {
     }
 }
 
+/// A constant cross section broadened over a Debye spectrum stays constant at
+/// 0.5 eV, where the zero-phonon line weighs 2.5–35%, and at 197.5 eV.
+#[test]
+fn a_debye_cutoff_leaves_a_constant_cross_section_constant() {
+    let spectrum = PhononSpectrum::debye(240.0, 200).expect("spectrum");
+    let data = power(0.0);
+    for kelvin in [301.79, 1093.0] {
+        let broadened = broaden_in_lattice(&[0.5, 197.5], &data, kelvin, &spectrum, Channel::Total)
+            .unwrap_or_else(|e| panic!("{kelvin} K: {e}"));
+        for value in &broadened.values {
+            assert!((value - 1.0).abs() <= 1e-9, "{kelvin} K: {value}");
+        }
+    }
+}
+
 #[test]
 fn the_lattice_keeps_the_kernel_s_mass_mean_variance_and_skew() {
     let kt = BOLTZMANN_EV_PER_K * KELVIN;
@@ -370,7 +385,7 @@ fn constant_with(table: Vec<(f64, f64)>) -> ResonanceData {
 }
 
 #[test]
-fn spectra_masses_bands_tables_and_spans_the_kernel_cannot_resolve_are_refused() {
+fn spectra_masses_tables_and_spans_the_kernel_cannot_resolve_are_refused() {
     let scaled = PhononSpectrum::new(1e-3, vec![0.0, 1e308, 1e308]).expect("scaled");
     assert_eq!(
         scaled,
@@ -392,10 +407,9 @@ fn spectra_masses_bands_tables_and_spans_the_kernel_cannot_resolve_are_refused()
     let mut band = vec![0.0; 301];
     band[200] = 1.0;
     let band = PhononSpectrum::new(1e-4, band).expect("band");
-    assert!(matches!(
-        broaden(&one, &[2.0], 1.0, &band),
-        Err(LatticeError::Unresolved { .. })
-    ));
+    // A band narrower than the time span resolves keeps its weight over a constant.
+    let lines = broaden(&one, &[2.0], 1.0, &band).expect("a band spectrum");
+    assert!((lines.values[0] - 1.0).abs() <= 1e-7, "{}", lines.values[0]);
     let jump = constant_with(vec![(1e-3, 1.0), (20.0, 1.0), (20.0, 2.0), (1e3, 2.0)]);
     assert!(matches!(
         broaden(&jump, &[20.1], KELVIN, &spectrum()),
