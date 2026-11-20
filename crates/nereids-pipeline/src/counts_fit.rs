@@ -5436,6 +5436,14 @@ mod counts_check {
 
     use super::*;
 
+    /// `value` is above `bound`, or either is NaN.
+    fn exceeds(value: f64, bound: f64) -> bool {
+        !matches!(
+            value.partial_cmp(&bound),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        )
+    }
+
     /// The reference files, relative to this crate.
     const DATA: &str = "../../tests/data/sammy-ta181";
     /// `[α0, α1, β0, β1, R, h², R_high, f, τ_D, p_α, p_β]`, as the reference.
@@ -5654,7 +5662,7 @@ mod counts_check {
         let mut grid =
             Arc::new(FlightTimeGrid::new(&edges, 0.0, FLIGHT_PATH, &pulse).expect("grid"));
         let peak = reference.iter().fold(0.0_f64, |m, r| m.max(r[1]));
-        if !(eps["open"] <= 1e-7 * peak) {
+        if exceeds(eps["open"], 1e-7 * peak) {
             failures.push(format!(
                 "check 2: the reference's open error {:.3e}",
                 eps["open"]
@@ -5719,7 +5727,7 @@ mod counts_check {
             }
         }
         // The open counts' mark; the sample counts' own marks are judged per window below.
-        if !(open_eps <= share * 1e-6 * peak) {
+        if exceeds(open_eps, share * 1e-6 * peak) {
             failures.push(format!(
                 "check 2: NEREIDS's grid moves the open counts by {open_eps:.3e}"
             ));
@@ -5739,7 +5747,7 @@ mod counts_check {
             "check 2: open max|O_N − O_ref| = {open_diff:.3e}, limit {:.3e}",
             1e-6 * peak
         );
-        if !(open_diff <= 1e-6 * peak) {
+        if exceeds(open_diff, 1e-6 * peak) {
             failures.push(format!("check 2: open counts differ by {open_diff:.3e}"));
         }
 
@@ -5809,17 +5817,17 @@ mod counts_check {
                 let max_slope_change = k.iter().fold(0.0_f64, |m, &i| m.max(slope_change[i]));
                 let change_bias = change.iter().zip(&d).map(|(a, b)| a * b.abs()).sum::<f64>()
                     / d.iter().map(|x| x * x).sum::<f64>();
-                if marks[0] && !(change_bias <= share * limit) {
+                if marks[0] && exceeds(change_bias, share * limit) {
                     failures.push(format!(
                         "{label}: NEREIDS's grid moves b by {change_bias:.3e} K"
                     ));
                 }
-                if marks[1] && !(max_change <= share * 0.1 * max_d) {
+                if marks[1] && exceeds(max_change, share * 0.1 * max_d) {
                     failures.push(format!(
                         "{label}: NEREIDS's grid moves S by {max_change:.3e}"
                     ));
                 }
-                if marks[2] && !(max_slope_change <= share * 0.01 * max_d) {
+                if marks[2] && exceeds(max_slope_change, share * 0.01 * max_d) {
                     failures.push(format!(
                         "{label}: NEREIDS's grid moves dS/dT by {max_slope_change:.3e}"
                     ));
@@ -5830,21 +5838,21 @@ mod counts_check {
                     0.1 * max_d + e_t,
                     0.01 * max_d
                 );
-                if marks[0] && !(bias.abs() <= limit) {
+                if marks[0] && exceeds(bias.abs(), limit) {
                     verdict(
                         format!("{label}: (i) |b| = {:.4} K", bias.abs()),
                         &mut failures,
                         &mut undecided,
                     );
                 }
-                if marks[1] && !(max_r <= 0.1 * max_d + e_t) {
+                if marks[1] && exceeds(max_r, 0.1 * max_d + e_t) {
                     verdict(
                         format!("{label}: (ii) max|r| = {max_r:.3e}"),
                         &mut failures,
                         &mut undecided,
                     );
                 }
-                if marks[2] && !(max_slope <= 0.01 * max_d) {
+                if marks[2] && exceeds(max_slope, 0.01 * max_d) {
                     verdict(
                         format!("{label}: (iii) max|D_N − D| = {max_slope:.3e}"),
                         &mut failures,
@@ -5883,7 +5891,7 @@ mod counts_check {
                                 m.max(x)
                             }
                         });
-                    if !(moved <= share * 1e-2 * largest) {
+                    if exceeds(moved, share * 1e-2 * largest) {
                         failures.push(format!(
                             "check 2, ∂{run}/∂p{column} at {kelvin} K: NEREIDS's grid moves it by {moved:.3e}"
                         ));
@@ -5891,7 +5899,7 @@ mod counts_check {
                     eprintln!(
                         "check 2, ∂{run}/∂p{column} at {kelvin} K: max diff {worst:.3e} of {largest:.3e}"
                     );
-                    if !(worst <= 0.01 * largest) {
+                    if exceeds(worst, 0.01 * largest) {
                         let note = format!(
                             "check 2, ∂{run}/∂p{column} at {kelvin} K: {worst:.3e} exceeds 1% of {largest:.3e}"
                         );

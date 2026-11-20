@@ -33,12 +33,12 @@ fn debye_effective_temperature_matches_the_continuous_integral() {
              error {error:.2e} K, sampling change {sampling:.2e} K"
         );
         // The sampling must converge to a tenth of the limit before the error is judged.
-        if !(sampling <= 0.1 * LIMIT_K) {
+        if sampling.is_nan() || sampling > 0.1 * LIMIT_K {
             failures.push(format!(
                 "θ_D {theta} K, T {kelvin} K: sampling change {sampling:.2e} K"
             ));
         }
-        if !(error <= LIMIT_K) {
+        if error.is_nan() || error > LIMIT_K {
             failures.push(format!("θ_D {theta} K, T {kelvin} K: error {error:.2e} K"));
         }
     }
