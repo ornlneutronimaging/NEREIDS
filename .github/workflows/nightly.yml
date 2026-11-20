@@ -51,7 +51,7 @@ jobs:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
       # Restores the per-OS test cache that ci.yml saves on main. A copy saved
       # here would lack what `cargo build` adds to it.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
         with:
           shared-key: test
           save-if: false
@@ -68,7 +68,7 @@ jobs:
         with:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Pin release-tag SHAs only (like security.yml), never taiki-e's
