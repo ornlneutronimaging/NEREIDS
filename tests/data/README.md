@@ -89,7 +89,11 @@ python3 tests/data/sammy-ta181/lattice_reference.py write <sigma file> 5.05e-2 -
 ```
 
 Run them on an analysis server: the SAMMY runs take hours, and the scripts need
-numpy (check 2 also scipy and numba).
+numpy (check 2 also scipy and numba). Both SAMMY writers accept only the executable
+with MD5 `091b34fa0229a5793918956006e23f68`, SAMMY 8.2-beta4 built from RNSD/SAMMY
+commit `c974c02c` in SAMMY's own build environment. Another build of that commit has
+another MD5: set `SAMMY_MD5` in `generate_phase1.py` to it and regenerate every SAMMY
+reference, checks 1 and 2 together.
 
 ## sammy-clm
 

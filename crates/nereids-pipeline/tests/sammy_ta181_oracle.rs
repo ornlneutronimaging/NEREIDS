@@ -203,10 +203,14 @@ fn judgeable(rows: &[Vec<f64>], scored: &Scored, k: &[usize], eps: Option<[f64; 
         .iter()
         .map(|&i| rows[i][scored.columns[3]] - rows[i][scored.columns[1]])
         .collect();
+    // The reference's error enters both differences; at ±½ K it is taken as the largest
+    // measured at T − 1, T and T + 1.
+    let reference_error = 0.5 * (eps[0] + eps[2]) + 2.0 * eps[0].max(eps[1]).max(eps[2]);
     let step_error = 4.0 / 3.0
-        * d.iter()
+        * (d.iter()
             .zip(&half)
-            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()))
+            + reference_error);
     let largest_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     let rms_d = (d.iter().map(|x| x * x).sum::<f64>() / d.len().max(1) as f64).sqrt();
     let mut reasons = Vec::new();
@@ -681,6 +685,12 @@ fn folded(
                 .halved()
                 .unwrap_or_else(|e| panic!("{label}, bins {first}..{last}: {e}"));
             let refined = binned(&finer, data, kelvin, &mut known);
+            assert!(
+                [&values.0, &values.1, &refined.0, &refined.1]
+                    .iter()
+                    .all(|v| v.iter().all(|x| x.is_finite())),
+                "{label}, bins {first}..{last}: a value or slope is not finite"
+            );
             let differences = |a: &[f64], b: &[f64]| -> Vec<f64> {
                 a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect()
             };
@@ -952,6 +962,10 @@ fn check3_lattice_matches_the_independent_reference() {
         .map(|w| (w, members(w, &bins.centres_ev, w.low_ev == SCORED_EV.0)))
         .filter(|(_, k)| !k.is_empty())
         .collect();
+    assert!(
+        groups.iter().any(|(w, _)| w.resonance_ev == LINE_4_28_EV),
+        "check 3 scores the {LINE_4_28_EV} eV window"
+    );
     let mut failures = Vec::new();
     let mut unjudged = Vec::new();
     let mut inconclusive = Vec::new();

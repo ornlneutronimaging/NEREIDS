@@ -96,12 +96,17 @@ class Lattice:
 
 def cubic(x: np.ndarray, y: np.ndarray, at: np.ndarray) -> np.ndarray:
     """Catmull–Rom interpolation of y(x) at ``at``; x piecewise uniform."""
-    k = np.clip(np.searchsorted(x, at) - 1, 1, len(x) - 3)
+    k = np.clip(np.searchsorted(x, at) - 1, 0, len(x) - 3)
     x0, x1 = x[k], x[k + 1]
     s = (at - x0) / (x1 - x0)
-    # Neighbours across a spacing change are rescaled to the local step.
-    ym, y0, y1, y2 = y[k - 1], y[k], y[k + 1], y[k + 2]
-    hm, h0, h2 = x0 - x[k - 1], x1 - x0, x[k + 2] - x1
+    # Neighbours across a spacing change are rescaled to the local step; the first interval
+    # takes a one-sided slope from a mirrored point.
+    first = k == 0
+    km = np.maximum(k - 1, 0)
+    y0, y1, y2 = y[k], y[k + 1], y[k + 2]
+    h0, h2 = x1 - x0, x[k + 2] - x1
+    ym = np.where(first, 2 * y0 - y1, y[km])
+    hm = np.where(first, h0, x0 - x[km])
     m0 = (y1 - ym) / (h0 + hm) * h0
     m1 = (y2 - y0) / (h2 + h0) * h0
     return ((2 * s**3 - 3 * s**2 + 1) * y0 + (s**3 - 2 * s**2 + s) * m0

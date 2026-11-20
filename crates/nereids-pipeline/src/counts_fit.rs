@@ -5598,6 +5598,18 @@ mod counts_check {
         let reference = table("p1b_counts.txt");
         let jacobian_ref = table("p1b_jacobian.txt");
         assert_eq!(reference.len(), bins, "one reference row per bin");
+        assert_eq!(jacobian_ref.len(), bins, "one derivative row per bin");
+        for (row, e) in jacobian_ref.iter().zip(&centres) {
+            assert!(
+                row.len() == 40 && row.iter().all(|x| x.is_finite()),
+                "a derivative row at {e} eV is not 40 finite values"
+            );
+            assert!(
+                (row[0] / e - 1.0).abs() <= 1e-11,
+                "derivative row {} is not the centre {e}",
+                row[0]
+            );
+        }
         for (row, e) in reference.iter().zip(&centres) {
             assert!(
                 (row[0] / e - 1.0).abs() <= 1e-11,
@@ -5631,11 +5643,15 @@ mod counts_check {
                     .map(|&i| 0.5 * (reference[i][cols[4]] - reference[i][cols[0]]))
                     .collect();
                 // For a cubic in T the ±1 K difference's step error is 4/3 of its change from ±½ K.
+                // The reference's error enters both differences; at ±½ K it is taken as the
+                // largest measured at T − 1, T and T + 1.
+                let reference_error = 0.5 * (e3[0] + e3[2]) + 2.0 * e3[0].max(e3[1]).max(e3[2]);
                 let step = 4.0 / 3.0
-                    * k.iter()
+                    * (k.iter()
                         .zip(&d)
                         .map(|(&i, d)| (d - (reference[i][cols[3]] - reference[i][cols[1]])).abs())
-                        .fold(0.0_f64, f64::max);
+                        .fold(0.0_f64, f64::max)
+                        + reference_error);
                 let max_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
                 let rms = (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt();
                 let marks = [
@@ -5774,7 +5790,14 @@ mod counts_check {
             let slope_change: Vec<f64> = (0..bins)
                 .map(|j| (jac.get(bins + j, 13) - jac_coarse.get(bins + j, 13)).abs())
                 .collect();
-            if y.iter().chain(&slope).any(|x| !x.is_finite()) {
+            let coarse_slope = (0..bins).map(|j| jac_coarse.get(bins + j, 13));
+            if y.iter()
+                .chain(&slope)
+                .chain(&y_coarse)
+                .copied()
+                .chain(coarse_slope)
+                .any(|x| !x.is_finite())
+            {
                 failures.push(format!(
                     "check 2 at {kelvin} K: a count or slope is not finite"
                 ));

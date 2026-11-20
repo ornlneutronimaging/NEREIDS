@@ -183,21 +183,26 @@ def brute_cdf(s: float, e_ev: float, p: np.ndarray) -> float:
 
 
 def self_check() -> None:
-    """Compare the closed-form CDF with direct convolution at a few energies and delays."""
+    """Compare the closed-form CDF, in Python and in the compiled kernel the counts use, with
+    direct convolution at a few energies and delays."""
+    import counts_kernel as kernel
+
     worst = 0.0
     for e in (0.5, 4.28, 50.0, 197.0):
         alpha, beta, r = laws(e, NOMINAL)
         c0, terms = delay_terms(alpha, beta, r, NOMINAL[7], NOMINAL[8])
+        k0, lam, coef = kernel.delay_terms(alpha, beta, r, NOMINAL[7], NOMINAL[8])
         h = math.sqrt(NOMINAL[5])
         for s in (-0.3, -0.1, 0.05, 0.2, 0.34, 0.36, 1.0, 3.0, 10.0, 40.0, 150.0):
             closed = arrival_cdf(s, c0, terms, h)
+            compiled = kernel.arrival_cdf(s, k0, lam, coef, h)
             brute = brute_cdf(s, e, NOMINAL)
-            worst = max(worst, abs(closed - brute))
-            print(f"E {e:7.2f} eV  s {s:7.2f} µs  closed {closed:.15f}  brute {brute:.15f}"
-                  f"  diff {closed - brute:+.2e}")
+            worst = max(worst, abs(closed - brute), abs(compiled - brute))
+            print(f"E {e:7.2f} eV  s {s:7.2f} µs  closed {closed:.15f}  compiled {compiled:.15f}"
+                  f"  brute {brute:.15f}  diff {closed - brute:+.2e} {compiled - brute:+.2e}")
     print(f"largest difference {worst:.2e}")
     if worst > 1e-10:
-        raise SystemExit("the closed-form CDF disagrees with direct convolution")
+        raise SystemExit("a closed-form CDF disagrees with direct convolution")
 
 
 # Integration grid in flight time u at the nominal path: du/dw = 1/(1/(C·u²) + 1/STEP_CAP_US)
@@ -362,27 +367,31 @@ def write(exe: Path, work: Path, jobs: int, keep: bool) -> None:
     stamp = [f"# SAMMY {g.SAMMY_BUILD} (commit {g.SAMMY_COMMIT}), executable MD5 {md5}; free gas",
              "# without instrument at the integration grid's energies, NXTRA "
              f"{NXTRA_P1B}. Written by counts_reference.py write."]
-    rows = [" ".join([f"{c:.11e}", f"{o:.15e}", *(f"{sample[k][j]:.15e}" for k in TEMPERATURES)])
-            for j, (c, o) in enumerate(zip(centres, open_counts))]
-    (HERE / "p1b_counts.txt").write_text("\n".join(stamp + [
-        "# Expected counts per bin, beam 1e4 (tau/100 us)^-0.8 per us, n = 7.04e-4 atoms/b,",
-        "# the pulse numbers " + ", ".join(f"{n} {v:g}" for n, v in zip(NAMES, NOMINAL)) + ".",
-        "# Columns: e_ev open " + " ".join(f"T{k}" for k in TEMPERATURES)] + rows) + "\n")
-    (HERE / "p1b_counts_eps.txt").write_text("\n".join(stamp + [
-        "# The largest change of the open counts when the integration grid is halved.",
-        "# Columns: run (open or temperature in K), eps."]
-        + [f"{key} {value:.6e}" for key, value in eps.items()]) + "\n")
+    # Every output is computed and checked before any file is replaced.
     blocks = [jacobian([(energy[level], grid[level][1], ones[level]) for level in (0, 1)], edges)]
     for k in ("300", "1100"):
         blocks.append(jacobian([(energy[0], grid[0][1], transmission[k]), None], edges))
     table = np.hstack(blocks)
     labels = [f"open_{n}" for n in NAMES] + [f"T{k}_{n}" for k in ("300", "1100") for n in NAMES]
-    (HERE / "p1b_jacobian.txt").write_text("\n".join(stamp + [
+    rows = [" ".join([f"{c:.11e}", f"{o:.15e}", *(f"{sample[k][j]:.15e}" for k in TEMPERATURES)])
+            for j, (c, o) in enumerate(zip(centres, open_counts))]
+    (HERE / "p1b_counts.txt").write_text("\n".join([
+        *stamp,
+        "# Expected counts per bin, beam 1e4 (tau/100 us)^-0.8 per us, n = 7.04e-4 atoms/b,",
+        "# the pulse numbers " + ", ".join(f"{n} {v:g}" for n, v in zip(NAMES, NOMINAL)) + ".",
+        "# Columns: e_ev open " + " ".join(f"T{k}" for k in TEMPERATURES), *rows]) + "\n")
+    (HERE / "p1b_counts_eps.txt").write_text("\n".join([
+        *stamp,
+        "# The largest change of the open counts when the integration grid is halved.",
+        "# Columns: run (open or temperature in K), eps.",
+        *(f"{key} {value:.6e}" for key, value in eps.items())]) + "\n")
+    (HERE / "p1b_jacobian.txt").write_text("\n".join([
+        *stamp,
         "# Central differences of the expected counts at the numbers of p1b_counts.txt,",
         "# the beam held in clock time and the energies fixed.",
-        "# Columns: e_ev " + " ".join(labels)]
-        + [" ".join([f"{c:.11e}", *(f"{x:.12e}" for x in row)])
-           for c, row in zip(centres, table)]) + "\n")
+        "# Columns: e_ev " + " ".join(labels),
+        *(" ".join([f"{c:.11e}", *(f"{x:.12e}" for x in row)])
+          for c, row in zip(centres, table))]) + "\n")
 
 
 def main() -> None:
