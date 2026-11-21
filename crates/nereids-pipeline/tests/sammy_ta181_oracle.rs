@@ -193,19 +193,18 @@ fn sensitivity(rows: &[Vec<f64>], columns: [usize; 5], k: &[usize]) -> Vec<f64> 
 
 /// Decides, before NEREIDS runs, which marks a window can judge: each reference
 /// error must be at most a tenth of the mark it enters. `eps` holds the reference
-/// error bounds at T − 1, T and T + 1 K, or `None` where they were not measured.
-fn judgeable(rows: &[Vec<f64>], scored: &Scored, k: &[usize], eps: Option<[f64; 3]>) -> Judgeable {
+/// error bounds at T − 1, T − ½, T, T + ½ and T + 1 K, or `None` where not measured.
+fn judgeable(rows: &[Vec<f64>], scored: &Scored, k: &[usize], eps: Option<[f64; 5]>) -> Judgeable {
     let measured = eps.is_some();
-    let eps = eps.unwrap_or([0.0; 3]);
+    let eps = eps.unwrap_or([0.0; 5]);
     let d = sensitivity(rows, scored.columns, k);
     // For a cubic in T the ±1 K difference's step error is 4/3 of its change from ±½ K.
     let half: Vec<f64> = k
         .iter()
         .map(|&i| rows[i][scored.columns[3]] - rows[i][scored.columns[1]])
         .collect();
-    // The reference's error enters both differences; at ±½ K it is taken as the largest
-    // measured at T − 1, T and T + 1.
-    let reference_error = 0.5 * (eps[0] + eps[2]) + 2.0 * eps[0].max(eps[1]).max(eps[2]);
+    // The reference's error enters both differences.
+    let reference_error = 0.5 * (eps[0] + eps[4]) + eps[1] + eps[3];
     let step_error = 4.0 / 3.0
         * (d.iter()
             .zip(&half)
@@ -214,23 +213,23 @@ fn judgeable(rows: &[Vec<f64>], scored: &Scored, k: &[usize], eps: Option<[f64; 
     let largest_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     let rms_d = (d.iter().map(|x| x * x).sum::<f64>() / d.len().max(1) as f64).sqrt();
     let mut reasons = Vec::new();
-    let bias = rms_d > 0.0 && eps[1] / rms_d <= 0.1 * scored.bias_limit_k;
+    let bias = rms_d > 0.0 && eps[2] / rms_d <= 0.1 * scored.bias_limit_k;
     if !bias {
         reasons.push(format!(
             "(i) eps/RMS(D) = {:.2e} K exceeds {:.2e} K",
-            eps[1] / rms_d,
+            eps[2] / rms_d,
             0.1 * scored.bias_limit_k
         ));
     }
-    let residual = largest_d > 0.0 && eps[1] <= 0.1 * 0.1 * largest_d;
+    let residual = largest_d > 0.0 && eps[2] <= 0.1 * 0.1 * largest_d;
     if !residual {
         reasons.push(format!(
             "(ii) eps = {:.2e} exceeds {:.2e}",
-            eps[1],
+            eps[2],
             0.01 * largest_d
         ));
     }
-    let slope_error = 0.5 * (eps[0] + eps[2]) + step_error;
+    let slope_error = 0.5 * (eps[0] + eps[4]) + step_error;
     let slope = largest_d > 0.0 && slope_error <= 0.1 * 0.01 * largest_d;
     if !slope {
         reasons.push(format!(
@@ -423,9 +422,10 @@ fn eps_table(name: &str) -> Vec<(f64, f64)> {
         .collect()
 }
 
-/// The bounds of `table` at T − 1, T and T + 1 K; `None` unless all three were measured.
-fn eps_around(table: &[(f64, f64)], kelvin: f64) -> Option<[f64; 3]> {
-    let found = [-1.0, 0.0, 1.0].map(|offset| {
+/// The bounds of `table` at T − 1, T − ½, T, T + ½ and T + 1 K; `None` unless all five
+/// were measured.
+fn eps_around(table: &[(f64, f64)], kelvin: f64) -> Option<[f64; 5]> {
+    let found = [-1.0, -0.5, 0.0, 0.5, 1.0].map(|offset| {
         let found: Vec<f64> = table
             .iter()
             .filter(|(k, _)| (k - (kelvin + offset)).abs() < 1e-9)
@@ -439,7 +439,7 @@ fn eps_around(table: &[(f64, f64)], kelvin: f64) -> Option<[f64; 3]> {
         found.first().copied()
     });
     match found {
-        [Some(a), Some(b), Some(c)] => Some([a, b, c]),
+        [Some(a), Some(b), Some(c), Some(d), Some(e)] => Some([a, b, c, d, e]),
         _ => None,
     }
 }
@@ -929,7 +929,7 @@ fn check1_the_4_28_ev_line_matches_sammy_rpi() {
     for (s, judge) in P1A_SCORED.iter().zip(&judged) {
         let label = format!("check 1, {LINE_4_28_EV} eV window at {} K", s.kelvin);
         let fold = folded(&data, &bins.edges_us, &pulse, s.kelvin, &label, true);
-        let at = eps_around(&eps, s.kelvin).map(|e| e[1]);
+        let at = eps_around(&eps, s.kelvin).map(|e| e[2]);
         let bound = rpi_model_bound(&rows, s.columns);
         let (failed, open) = score_window(&label, s, judge, &k, &fold, &rows, at, Some(&bound));
         failures.extend(failed);
@@ -965,6 +965,11 @@ fn check3_lattice_matches_the_independent_reference() {
     assert!(
         groups.iter().any(|(w, _)| w.resonance_ev == LINE_4_28_EV),
         "check 3 scores the {LINE_4_28_EV} eV window"
+    );
+    assert_eq!(
+        groups.iter().map(|(_, k)| k.len()).sum::<usize>(),
+        bins.centres_ev.len(),
+        "every bin is in one window"
     );
     let mut failures = Vec::new();
     let mut unjudged = Vec::new();
@@ -1008,14 +1013,25 @@ fn check3_lattice_matches_the_independent_reference() {
                 (transmission, -transmission * DENSITY * per_k)
             })
             .unzip();
+        // With no grid to refine, NEREIDS's error estimate is its disagreement with the
+        // reference, held to a tenth of each mark like a grid change.
+        let disagreement: (Vec<f64>, Vec<f64>) = (0..bins.centres_ev.len())
+            .map(|i| {
+                let d = 0.5 * (rows[i][s.columns[4]] - rows[i][s.columns[0]]);
+                (
+                    (transmission[i] - rows[i][s.columns[2]]).abs(),
+                    (slope[i] - d).abs(),
+                )
+            })
+            .unzip();
         let fold = Folded {
             transmission,
             slope,
-            change: None,
+            change: Some(disagreement),
         };
         for ((w, k), judge) in groups.iter().zip(&judged) {
             let label = format!("check 3 at {} K, {} eV window", s.kelvin, w.resonance_ev);
-            let at = around.map(|e| e[1]);
+            let at = around.map(|e| e[2]);
             let (failed, open) = score_window(&label, s, judge, k, &fold, &rows, at, None);
             failures.extend(failed);
             inconclusive.extend(open);

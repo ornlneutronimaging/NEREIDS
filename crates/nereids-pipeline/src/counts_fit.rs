@@ -5612,6 +5612,10 @@ mod counts_check {
         }
         for (row, e) in reference.iter().zip(&centres) {
             assert!(
+                row.len() == 12 && row.iter().all(|x| x.is_finite()),
+                "a count row at {e} eV is not 12 finite values"
+            );
+            assert!(
                 (row[0] / e - 1.0).abs() <= 1e-11,
                 "{} is not the centre {e}",
                 row[0]
@@ -5620,22 +5624,29 @@ mod counts_check {
         let eps = eps();
         let windows = windows(&ta, &centres);
         assert_eq!(windows.iter().map(|(_, k)| k.len()).sum::<usize>(), bins);
+        assert!(
+            windows
+                .iter()
+                .any(|(resonance, k)| *resonance == LINE_4_28_EV && !k.is_empty()),
+            "check 2 scores the {LINE_4_28_EV} eV window"
+        );
         let mut failures = Vec::new();
         let mut unjudged = Vec::new();
         // Failures where the reference's grid error is not measured: not attributed to NEREIDS.
         let mut undecided = Vec::new();
 
         // Decided from the reference alone, before NEREIDS runs.
-        let around = |kelvin: f64| -> Option<[f64; 3]> {
-            let found = [-1.0, 0.0, 1.0].map(|d| eps.get(&format!("{}", kelvin + d)).copied());
+        let around = |kelvin: f64| -> Option<[f64; 5]> {
+            let found =
+                [-1.0, -0.5, 0.0, 0.5, 1.0].map(|d| eps.get(&format!("{}", kelvin + d)).copied());
             match found {
-                [Some(a), Some(b), Some(c)] => Some([a, b, c]),
+                [Some(a), Some(b), Some(c), Some(d), Some(e)] => Some([a, b, c, d, e]),
                 _ => None,
             }
         };
         let mut judged = Vec::new();
         for &(kelvin, cols, limit) in &TEMPERATURES {
-            let e3 = around(kelvin).unwrap_or([0.0; 3]);
+            let e5 = around(kelvin).unwrap_or([0.0; 5]);
             let mut per_window = Vec::new();
             for (resonance, k) in &windows {
                 let d: Vec<f64> = k
@@ -5643,9 +5654,8 @@ mod counts_check {
                     .map(|&i| 0.5 * (reference[i][cols[4]] - reference[i][cols[0]]))
                     .collect();
                 // For a cubic in T the ±1 K difference's step error is 4/3 of its change from ±½ K.
-                // The reference's error enters both differences; at ±½ K it is taken as the
-                // largest measured at T − 1, T and T + 1.
-                let reference_error = 0.5 * (e3[0] + e3[2]) + 2.0 * e3[0].max(e3[1]).max(e3[2]);
+                // The reference's error enters both differences.
+                let reference_error = 0.5 * (e5[0] + e5[4]) + e5[1] + e5[3];
                 let step = 4.0 / 3.0
                     * (k.iter()
                         .zip(&d)
@@ -5655,9 +5665,9 @@ mod counts_check {
                 let max_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
                 let rms = (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt();
                 let marks = [
-                    rms > 0.0 && e3[1] / rms <= 0.1 * limit,
-                    max_d > 0.0 && e3[1] <= 0.01 * max_d,
-                    max_d > 0.0 && 0.5 * (e3[0] + e3[2]) + step <= 0.001 * max_d,
+                    rms > 0.0 && e5[2] / rms <= 0.1 * limit,
+                    max_d > 0.0 && e5[2] <= 0.01 * max_d,
+                    max_d > 0.0 && 0.5 * (e5[0] + e5[4]) + step <= 0.001 * max_d,
                 ];
                 if marks.contains(&false) {
                     let note = format!("check 2, {resonance} eV at {kelvin} K: marks {marks:?}");
@@ -5749,9 +5759,11 @@ mod counts_check {
             ));
         }
 
-        // Open counts.
-        let open_diff = (0..bins)
-            .map(|j| (counts[0][j] - reference[j][1]).abs())
+        // Open counts, the same reference at every temperature.
+        let open_diff = counts
+            .iter()
+            .flat_map(|run| run[..bins].iter().enumerate())
+            .map(|(j, &o)| (o - reference[j][1]).abs())
             .fold(0.0_f64, |m, x| {
                 if x.is_nan() || m.is_nan() {
                     f64::NAN
@@ -5803,7 +5815,7 @@ mod counts_check {
                 ));
             }
             let measured = around(kelvin).is_some();
-            let e_t = around(kelvin).map_or(0.0, |e| e[1]);
+            let e_t = around(kelvin).map_or(0.0, |e| e[2]);
             let verdict =
                 |note: String, failures: &mut Vec<String>, undecided: &mut Vec<String>| {
                     if measured {

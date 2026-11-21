@@ -49,8 +49,8 @@ E_P1A_HIGH_EV = 7.313616
 NXTRA = 29
 NXTRA_CHECK = 99
 P1A_K = ("299", "299.5", "300", "300.5", "301", "1099", "1099.5", "1100", "1100.5", "1101")
-# Temperatures whose NXTRA change bounds the error.
-P1A_CHECKED_K = ("299", "300", "301", "1099", "1100", "1101")
+# Temperatures whose NXTRA change bounds the error: all, since the slope budget reads ±½ K.
+P1A_CHECKED_K = P1A_K
 
 # GENERATE PLOT FILE writes SAMMY.LST, whose values carry more digits than SAMMY.LPT.
 COMMANDS = ("INPUT IS ENDF/B FILE", "TWENTY", "DO NOT SOLVE BAYES EQUATIONS",
@@ -168,6 +168,7 @@ def run_case(exe: Path, work: Path, name: str, spec: dict,
     files = f"case.inp\n{ENDF_FILE}\ndata.dat\n"
     log = case / "sammy.out"
     kept = (keep and log.is_file() and "Normal finish to SAMMY" in log.read_text()
+            and (case / ENDF_FILE).is_file()
             and (case / ENDF_FILE).read_bytes() == (HERE / ENDF_FILE).read_bytes()
             and all((case / f).is_file() and (case / f).read_text() == text
                     for f, text in inputs.items()))

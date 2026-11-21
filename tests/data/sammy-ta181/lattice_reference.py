@@ -240,6 +240,8 @@ def check(narrowest: float) -> None:
             a1, a2, a3, a4 = analytic_cumulants(lattice, r)
             errors = [abs(mass - 1.0), abs(mean / a1 - 1.0), abs(k2 / a2 - 1.0),
                       abs(k3 / a3 - 1.0), abs(k4 / a4 - 1.0)]
+            if not all(math.isfinite(x) for x in errors):
+                raise SystemExit(f"{kelvin} K, {energy} eV: a kernel moment is not finite")
             worst = max(worst, *errors[:3])
             print(f"{kelvin} K, {energy} eV: mass-1 {errors[0]:.1e}, mean {errors[1]:.1e},"
                   f" var {errors[2]:.1e}, k3 {errors[3]:.1e}, k4 {errors[4]:.1e} (relative)")

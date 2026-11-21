@@ -197,6 +197,8 @@ def self_check() -> None:
             closed = arrival_cdf(s, c0, terms, h)
             compiled = kernel.arrival_cdf(s, k0, lam, coef, h)
             brute = brute_cdf(s, e, NOMINAL)
+            if not all(math.isfinite(v) for v in (closed, compiled, brute)):
+                raise SystemExit(f"E {e} eV, s {s} µs: a CDF value is not finite")
             worst = max(worst, abs(closed - brute), abs(compiled - brute))
             print(f"E {e:7.2f} eV  s {s:7.2f} µs  closed {closed:.15f}  compiled {compiled:.15f}"
                   f"  brute {brute:.15f}  diff {closed - brute:+.2e} {compiled - brute:+.2e}")
