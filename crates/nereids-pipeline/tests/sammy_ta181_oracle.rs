@@ -1014,13 +1014,19 @@ fn check3_lattice_matches_the_independent_reference() {
             })
             .unzip();
         // With no grid to refine, NEREIDS's error estimate is its disagreement with the
-        // reference, held to a tenth of each mark like a grid change.
+        // reference plus the reference's own error, held to a tenth of each mark.
+        let e = around.expect("measured above");
         let disagreement: (Vec<f64>, Vec<f64>) = (0..bins.centres_ev.len())
             .map(|i| {
-                let d = 0.5 * (rows[i][s.columns[4]] - rows[i][s.columns[0]]);
+                let c = s.columns;
+                let d = 0.5 * (rows[i][c[4]] - rows[i][c[0]]);
+                let half = rows[i][c[3]] - rows[i][c[1]];
+                // As in `judgeable`: the ±1 K values' error plus 4/3 of the stencils' gap.
+                let slope_error = 0.5 * (e[0] + e[4])
+                    + 4.0 / 3.0 * ((d - half).abs() + 0.5 * (e[0] + e[4]) + e[1] + e[3]);
                 (
-                    (transmission[i] - rows[i][s.columns[2]]).abs(),
-                    (slope[i] - d).abs(),
+                    (transmission[i] - rows[i][c[2]]).abs() + e[2],
+                    (slope[i] - d).abs() + slope_error,
                 )
             })
             .unzip();
