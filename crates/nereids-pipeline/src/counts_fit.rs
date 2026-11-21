@@ -5546,11 +5546,13 @@ mod counts_check {
             .collect()
     }
 
-    /// The model on `grid`, its layout and the numbers at `kelvin`.
+    /// The model on `grid`, its layout and the numbers, with one region per temperature
+    /// of [`TEMPERATURES`].
+    ///
+    /// The regions share one clock, so a Jacobian computes the grid's pulse slopes once.
     fn model_at(
         grid: &Arc<FlightTimeGrid>,
         ta: &ResonanceData,
-        kelvin: f64,
     ) -> (RegionsModel, Arc<Layout>, Vec<f64>) {
         let (low, high) = grid.range_us();
         let spline = BeamSpline::constant(low, high, 1.0);
@@ -5563,9 +5565,9 @@ mod counts_check {
             .collect();
         let beam = spline.with_coefficients(&coefficients);
         let mut layout = Layout::new(
-            roles(&[coefficients.len()], &[Some(1)]),
-            &[1.0],
-            &[[false, false]],
+            roles(&[coefficients.len(); 2], &[Some(1), Some(1)]),
+            &[1.0, 1.0],
+            &[[false, false]; 2],
         );
         layout.storage_span = Some(SPAN_EV);
         let layout = Arc::new(layout);
@@ -5575,7 +5577,7 @@ mod counts_check {
             .map(|role| match *role {
                 Role::Beam { coefficient, .. } => coefficients[coefficient],
                 Role::Density { .. } => DENSITY,
-                Role::Temperature { .. } => kelvin,
+                Role::Temperature { region } => TEMPERATURES[region].0,
                 Role::Normalization | Role::GammaTransmission { .. } => 1.0,
                 // The time background's decay constant; its amplitudes stay 0.
                 Role::TimeBackground(2) => 1.0,
@@ -5584,8 +5586,15 @@ mod counts_check {
                 _ => 0.0,
             })
             .collect();
-        let isotopes: [Arc<[ResonanceData]>; 1] = [Arc::new([ta.clone()])];
-        let model = RegionsModel::new(grid, &[beam], &isotopes, (1.0, [1.0, 1.0]), 0.0, &layout);
+        let isotopes: [Arc<[ResonanceData]>; 2] = [Arc::new([ta.clone()]), Arc::new([ta.clone()])];
+        let model = RegionsModel::new(
+            grid,
+            &[beam.clone(), beam],
+            &isotopes,
+            (1.0, [1.0, 1.0]),
+            0.0,
+            &layout,
+        );
         (model, layout, params)
     }
 
@@ -5695,14 +5704,13 @@ mod counts_check {
             ));
         }
         // Halve NEREIDS's grid until no count moves by 1e-7 of the open peak.
-        let evaluate = |grid: &Arc<FlightTimeGrid>, kelvin: f64| {
-            let (model, _, params) = model_at(grid, &ta, kelvin);
-            model.evaluate(&params).expect("counts")
+        // Open then sample counts, per temperature.
+        let evaluate = |grid: &Arc<FlightTimeGrid>| -> Vec<Vec<f64>> {
+            let (model, _, params) = model_at(grid, &ta);
+            let y = model.evaluate(&params).expect("counts");
+            y.chunks(2 * bins).map(<[f64]>::to_vec).collect()
         };
-        let mut counts: Vec<Vec<f64>> = TEMPERATURES
-            .iter()
-            .map(|&(k, _, _)| evaluate(&grid, k))
-            .collect();
+        let mut counts = evaluate(&grid);
         let mut open_eps = f64::NAN;
         let mut previous = Arc::clone(&grid);
         // At the point cap NEREIDS's own error is held to the full mark instead of a tenth.
@@ -5726,10 +5734,7 @@ mod counts_check {
                 }
                 Err(e) => panic!("halved: {e}"),
             };
-            let refined: Vec<Vec<f64>> = TEMPERATURES
-                .iter()
-                .map(|&(k, _, _)| evaluate(&finer, k))
-                .collect();
+            let refined = evaluate(&finer);
             let nereids_eps = counts
                 .iter()
                 .flatten()
@@ -5780,32 +5785,44 @@ mod counts_check {
         }
 
         // The counts and derivatives on the accepted grid and on the grid before it.
-        let solve = |grid: &Arc<FlightTimeGrid>, kelvin: f64| {
-            let (model, layout, params) = model_at(grid, &ta, kelvin);
-            let temperature = layout.regions[0].temperature.expect("a material");
+        // Columns: the 11 pulse numbers, t0, L, then each region's temperature.
+        let solve = |grid: &Arc<FlightTimeGrid>| {
+            let (model, layout, params) = model_at(grid, &ta);
             let mut free: Vec<usize> = (0..11).map(|n| layout.pulse + n).collect();
-            free.extend([layout.t0, layout.flight_path, temperature]);
+            free.extend([layout.t0, layout.flight_path]);
+            free.extend(
+                layout
+                    .regions
+                    .iter()
+                    .map(|r| r.temperature.expect("a material")),
+            );
             let y = model.evaluate(&params).expect("counts");
             let jac = model
                 .analytical_jacobian(&params, &free, &y)
                 .expect("jacobian");
             (y, jac)
         };
+        let (y_all, jac) = solve(&grid);
+        let (y_coarse_all, jac_coarse) = solve(&previous);
+        assert_eq!(y_all.len(), 2 * TEMPERATURES.len() * bins);
         for (t, &(kelvin, cols, limit)) in TEMPERATURES.iter().enumerate() {
-            let (y, jac) = solve(&grid, kelvin);
-            let (y_coarse, jac_coarse) = solve(&previous, kelvin);
+            // This temperature's region: open rows from `base`, sample rows after them.
+            let base = 2 * t * bins;
+            let y = &y_all[base..base + 2 * bins];
+            let y_coarse = &y_coarse_all[base..base + 2 * bins];
+            let at = |jac: &FlatMatrix, row: usize, column: usize| jac.get(base + row, column);
             let sample: Vec<f64> = y[bins..2 * bins].to_vec();
-            let slope: Vec<f64> = (0..bins).map(|j| jac.get(bins + j, 13)).collect();
+            let slope: Vec<f64> = (0..bins).map(|j| at(&jac, bins + j, 13 + t)).collect();
             let sample_change: Vec<f64> = (0..bins)
                 .map(|j| (y[bins + j] - y_coarse[bins + j]).abs())
                 .collect();
             let slope_change: Vec<f64> = (0..bins)
-                .map(|j| (jac.get(bins + j, 13) - jac_coarse.get(bins + j, 13)).abs())
+                .map(|j| (at(&jac, bins + j, 13 + t) - at(&jac_coarse, bins + j, 13 + t)).abs())
                 .collect();
-            let coarse_slope = (0..bins).map(|j| jac_coarse.get(bins + j, 13));
+            let coarse_slope = (0..bins).map(|j| at(&jac_coarse, bins + j, 13 + t));
             if y.iter()
                 .chain(&slope)
-                .chain(&y_coarse)
+                .chain(y_coarse)
                 .copied()
                 .chain(coarse_slope)
                 .any(|x| !x.is_finite())
@@ -5907,7 +5924,7 @@ mod counts_check {
                         .flat_map(|c| jacobian_ref.iter().map(move |row| row[c].abs()))
                         .fold(0.0_f64, f64::max);
                     let worst = (0..bins)
-                        .map(|j| (jac.get(offset + j, column) - jacobian_ref[j][ref_col]).abs())
+                        .map(|j| (at(&jac, offset + j, column) - jacobian_ref[j][ref_col]).abs())
                         .fold(0.0_f64, |m, x| {
                             if x.is_nan() || m.is_nan() {
                                 f64::NAN
@@ -5917,7 +5934,8 @@ mod counts_check {
                         });
                     let moved = (0..bins)
                         .map(|j| {
-                            (jac.get(offset + j, column) - jac_coarse.get(offset + j, column)).abs()
+                            (at(&jac, offset + j, column) - at(&jac_coarse, offset + j, column))
+                                .abs()
                         })
                         .fold(0.0_f64, |m, x| {
                             if x.is_nan() || m.is_nan() {
