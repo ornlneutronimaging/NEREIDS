@@ -17,12 +17,12 @@ jobs:
   slow-tests:
     name: Slow tests (${{ matrix.os }}, ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout || 120 }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        shard: ["1", "2", "3", "4", rest]
+        shard: ["1", "2", "3", "4", "5", rest]
         include:
           - shard: "1"
             filter: >-
@@ -37,6 +37,11 @@ jobs:
           - shard: "4"
             filter: >-
               s3_a_lattice_foil_calibrates_on_sammy_crystal_lattice_counts
+          - shard: "5"
+            # About 100 min on 4 cores, before compiling.
+            timeout: 180
+            filter: >-
+              counts_check::check2_counts_match_the_independent_fold
           - shard: rest
             filter: >-
               --skip pulse_calibration::two_foils_on_the_same_pulse_agree_as_chi_squared_says
@@ -44,6 +49,7 @@ jobs:
               --skip pulse_calibration::calibrated_experiments_have_error_bars_that_are_their_scatter
               --skip maps::
               --skip s3_a_lattice_foil_calibrates_on_sammy_crystal_lattice_counts
+              --skip counts_check::check2_counts_match_the_independent_fold
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
