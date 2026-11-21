@@ -944,6 +944,84 @@ fn check1_the_4_28_ev_line_matches_sammy_rpi() {
     assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
 }
 
+/// Check 3's estimate of NEREIDS's error per bin, for the value and the slope per K.
+///
+/// With no grid to refine, it is NEREIDS's disagreement with the reference plus the
+/// reference's own error, as `judgeable` bounds it; `score_window` holds it to a tenth of each
+/// mark. `columns` and `eps` follow `Scored` and `judgeable`.
+fn lattice_error_estimate(
+    rows: &[Vec<f64>],
+    columns: [usize; 5],
+    eps: [f64; 5],
+    transmission: &[f64],
+    slope: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    (0..rows.len())
+        .map(|i| {
+            let c = columns;
+            let d = 0.5 * (rows[i][c[4]] - rows[i][c[0]]);
+            let half = rows[i][c[3]] - rows[i][c[1]];
+            let slope_error = 0.5 * (eps[0] + eps[4])
+                + 4.0 / 3.0 * ((d - half).abs() + 0.5 * (eps[0] + eps[4]) + eps[1] + eps[3]);
+            (
+                (transmission[i] - rows[i][c[2]]).abs() + eps[2],
+                (slope[i] - d).abs() + slope_error,
+            )
+        })
+        .unzip()
+}
+
+/// A disagreement within a tenth of the value mark fails once the reference's error is added.
+#[test]
+fn check3_error_estimate_counts_the_reference_error() {
+    // T linear in temperature with slope 1e-3 per K: max|D| = 1e-3, a tenth of the value
+    // mark 1e-5. eps = 9e-6 leaves the mark judgeable; NEREIDS is off by 5e-6.
+    let rows: Vec<Vec<f64>> = (0..3)
+        .map(|i| {
+            let base = 0.5 + 0.01 * i as f64;
+            let mut row = vec![1.0 + i as f64];
+            row.extend([-1.0, -0.5, 0.0, 0.5, 1.0].map(|dt| base + 1e-3 * dt));
+            row
+        })
+        .collect();
+    let scored = Scored {
+        kelvin: 1093.0,
+        columns: [1, 2, 3, 4, 5],
+        bias_limit_k: 0.2,
+    };
+    let k = [0, 1, 2];
+    let eps = [9e-6; 5];
+    let judge = judgeable(&rows, &scored, &k, Some(eps));
+    assert!(judge.bias && judge.residual, "{:?}", judge.reasons);
+    let transmission: Vec<f64> = rows.iter().map(|r| r[3] + 5e-6).collect();
+    let slope = vec![1e-3; 3];
+    let fold = Folded {
+        change: Some(lattice_error_estimate(
+            &rows,
+            scored.columns,
+            eps,
+            &transmission,
+            &slope,
+        )),
+        transmission,
+        slope,
+    };
+    let (failures, _) = score_window(
+        "synthetic",
+        &scored,
+        &judge,
+        &k,
+        &fold,
+        &rows,
+        Some(eps[2]),
+        None,
+    );
+    assert!(
+        failures.iter().any(|f| f.contains("moves a value")),
+        "{failures:?}"
+    );
+}
+
 /// Check 3 against an independent lattice calculation: the lattice transmission
 /// without instrument and its slope per K at each bin centre, at 301.79 K and 1093 K,
 /// with NEREIDS's recoil `E/A`.
@@ -1013,23 +1091,13 @@ fn check3_lattice_matches_the_independent_reference() {
                 (transmission, -transmission * DENSITY * per_k)
             })
             .unzip();
-        // With no grid to refine, NEREIDS's error estimate is its disagreement with the
-        // reference plus the reference's own error, held to a tenth of each mark.
-        let e = around.expect("measured above");
-        let disagreement: (Vec<f64>, Vec<f64>) = (0..bins.centres_ev.len())
-            .map(|i| {
-                let c = s.columns;
-                let d = 0.5 * (rows[i][c[4]] - rows[i][c[0]]);
-                let half = rows[i][c[3]] - rows[i][c[1]];
-                // As in `judgeable`: the ±1 K values' error plus 4/3 of the stencils' gap.
-                let slope_error = 0.5 * (e[0] + e[4])
-                    + 4.0 / 3.0 * ((d - half).abs() + 0.5 * (e[0] + e[4]) + e[1] + e[3]);
-                (
-                    (transmission[i] - rows[i][c[2]]).abs() + e[2],
-                    (slope[i] - d).abs() + slope_error,
-                )
-            })
-            .unzip();
+        let disagreement = lattice_error_estimate(
+            &rows,
+            s.columns,
+            around.expect("measured above"),
+            &transmission,
+            &slope,
+        );
         let fold = Folded {
             transmission,
             slope,
