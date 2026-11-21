@@ -5423,3 +5423,541 @@ mod tests {
         assert_eq!(bins(&[506.784921, 506.786155], 0.0287), [0]);
     }
 }
+
+/// Check 2: the counts the model predicts at fixed numbers against an independent fold of
+/// SAMMY's transmission (`tests/data/sammy-ta181/counts_reference.py`).
+#[cfg(test)]
+mod counts_check {
+    use std::collections::HashMap;
+
+    use nereids_core::constants::tof_to_energy;
+    use nereids_endf::parser::parse_endf_file2;
+    use nereids_physics::ikeda_carpenter::{DEFAULT_N_TAU, DetectorPulse};
+
+    use super::*;
+
+    /// `value` is above `bound`, or either is NaN.
+    fn exceeds(value: f64, bound: f64) -> bool {
+        !matches!(
+            value.partial_cmp(&bound),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        )
+    }
+
+    /// The reference files, relative to this crate.
+    const DATA: &str = "../../tests/data/sammy-ta181";
+    /// `[α0, α1, β0, β1, R, h², R_high, f, τ_D, p_α, p_β]`, as the reference.
+    const NUMBERS: [f64; 11] = [0.5, 1.0, 0.01, 0.04, 0.3, 0.1225, 0.1, 0.1, 2.0, 0.5, 0.5];
+    /// Energies in eV over which the pulse laws hold.
+    const SPAN_EV: (f64, f64) = (0.3, 1000.0);
+    const FLIGHT_PATH: f64 = 25.0;
+    const DENSITY: f64 = 7.04e-4;
+    /// Bin-centre energies in eV of the scored bins.
+    const SCORED_BINS_EV: (f64, f64) = (0.5, 197.517_35);
+    /// The scored resonances.
+    const SCORED_EV: (f64, f64) = (0.5, 200.0);
+    const LINE_4_28_EV: f64 = 4.280_412;
+    /// Columns of the reference sample counts: T, then T − 1, T − ½, T, T + ½, T + 1 K.
+    const TEMPERATURES: [(f64, [usize; 5], f64); 2] = [
+        (300.0, [2, 3, 4, 5, 6], 0.05),
+        (1100.0, [7, 8, 9, 10, 11], 0.2),
+    ];
+
+    fn read(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(DATA)
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// The rows of `name` that are not blank or comments.
+    fn table(name: &str) -> Vec<Vec<f64>> {
+        read(name)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                l.split_whitespace()
+                    .map(|x| x.parse().unwrap_or_else(|e| panic!("{name}: {x}: {e}")))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `p1b_counts_eps.txt`: the reference's error bound per measured run.
+    fn eps() -> HashMap<String, f64> {
+        read("p1b_counts_eps.txt")
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let mut it = l.split_whitespace();
+                let key = it.next().expect("key").to_owned();
+                (key, it.next().expect("value").parse().expect("number"))
+            })
+            .collect()
+    }
+
+    /// The scored bins' edges in µs and centre energies in eV, in time order.
+    fn scored_bins() -> (Vec<f64>, Vec<f64>) {
+        let edge = |j: usize| (112 + 16 * j) as f64 / 100.0;
+        let centre = |j: usize| tof_to_energy(0.5 * (edge(j) + edge(j + 1)), FLIGHT_PATH);
+        let kept: Vec<usize> = (0..)
+            .take_while(|&j| centre(j) >= SCORED_BINS_EV.0)
+            .filter(|&j| centre(j) <= SCORED_BINS_EV.1)
+            .collect();
+        (
+            (kept[0]..=kept[kept.len() - 1] + 1).map(edge).collect(),
+            kept.into_iter().map(centre).collect(),
+        )
+    }
+
+    /// Each scored resonance's bins: centre energy in (low, high], the lowest window
+    /// closed below, edges at the midpoints to the neighbours in the whole File 2 list.
+    fn windows(data: &ResonanceData, centres: &[f64]) -> Vec<(f64, Vec<usize>)> {
+        let mut energies: Vec<f64> = data
+            .ranges
+            .iter()
+            .flat_map(|r| &r.l_groups)
+            .flat_map(|g| &g.resonances)
+            .map(|r| r.energy)
+            .collect();
+        energies.sort_by(f64::total_cmp);
+        energies.dedup();
+        (0..energies.len())
+            .filter(|&i| (SCORED_EV.0..=SCORED_EV.1).contains(&energies[i]))
+            .map(|i| {
+                let low = if i == 0 {
+                    SCORED_EV.0
+                } else {
+                    (0.5 * (energies[i - 1] + energies[i])).max(SCORED_EV.0)
+                };
+                let high = energies
+                    .get(i + 1)
+                    .map_or(SCORED_EV.1, |n| (0.5 * (energies[i] + n)).min(SCORED_EV.1));
+                let members = (0..centres.len())
+                    .filter(|&k| {
+                        let e = centres[k];
+                        e <= high && (e > low || (low == SCORED_EV.0 && e == low))
+                    })
+                    .collect();
+                (energies[i], members)
+            })
+            .filter(|(_, k): &(f64, Vec<usize>)| !k.is_empty())
+            .collect()
+    }
+
+    /// The model on `grid`, its layout and the numbers at `kelvin`.
+    fn model_at(
+        grid: &Arc<FlightTimeGrid>,
+        ta: &ResonanceData,
+        kelvin: f64,
+    ) -> (RegionsModel, Arc<Layout>, Vec<f64>) {
+        let (low, high) = grid.range_us();
+        let spline = BeamSpline::constant(low, high, 1.0);
+        let n = spline.intervals();
+        let h = (high.ln() - low.ln()) / n as f64;
+        // ln φ = ln 1e4 − 0.8 (x − ln 100), x = ln u: linear, so a cubic B-spline holds it
+        // exactly with coefficient i at x_low + (i − 1)h.
+        let coefficients: Vec<f64> = (0..n + 3)
+            .map(|i| 1e4_f64.ln() - 0.8 * (low.ln() + (i as f64 - 1.0) * h - 100_f64.ln()))
+            .collect();
+        let beam = spline.with_coefficients(&coefficients);
+        let mut layout = Layout::new(
+            roles(&[coefficients.len()], &[Some(1)]),
+            &[1.0],
+            &[[false, false]],
+        );
+        layout.storage_span = Some(SPAN_EV);
+        let layout = Arc::new(layout);
+        let params = layout
+            .roles
+            .iter()
+            .map(|role| match *role {
+                Role::Beam { coefficient, .. } => coefficients[coefficient],
+                Role::Density { .. } => DENSITY,
+                Role::Temperature { .. } => kelvin,
+                Role::Normalization | Role::GammaTransmission { .. } => 1.0,
+                // The time background's decay constant; its amplitudes stay 0.
+                Role::TimeBackground(2) => 1.0,
+                Role::FlightPath => FLIGHT_PATH,
+                Role::Pulse(k) => NUMBERS[k],
+                _ => 0.0,
+            })
+            .collect();
+        let isotopes: [Arc<[ResonanceData]>; 1] = [Arc::new([ta.clone()])];
+        let model = RegionsModel::new(grid, &[beam], &isotopes, (1.0, [1.0, 1.0]), 0.0, &layout);
+        (model, layout, params)
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn check2_counts_match_the_independent_fold() {
+        let ta = parse_endf_file2(&read("Ta-181-mf2.endf")).expect("Ta-181-mf2.endf");
+        let (edges, centres) = scored_bins();
+        let bins = centres.len();
+        let reference = table("p1b_counts.txt");
+        let jacobian_ref = table("p1b_jacobian.txt");
+        assert_eq!(reference.len(), bins, "one reference row per bin");
+        assert_eq!(jacobian_ref.len(), bins, "one derivative row per bin");
+        for (row, e) in jacobian_ref.iter().zip(&centres) {
+            assert!(
+                row.len() == 40 && row.iter().all(|x| x.is_finite()),
+                "a derivative row at {e} eV is not 40 finite values"
+            );
+            assert!(
+                (row[0] / e - 1.0).abs() <= 1e-11,
+                "derivative row {} is not the centre {e}",
+                row[0]
+            );
+        }
+        for (row, e) in reference.iter().zip(&centres) {
+            assert!(
+                row.len() == 12 && row.iter().all(|x| x.is_finite()),
+                "a count row at {e} eV is not 12 finite values"
+            );
+            assert!(
+                (row[0] / e - 1.0).abs() <= 1e-11,
+                "{} is not the centre {e}",
+                row[0]
+            );
+        }
+        let eps = eps();
+        let windows = windows(&ta, &centres);
+        assert_eq!(windows.iter().map(|(_, k)| k.len()).sum::<usize>(), bins);
+        assert!(
+            windows
+                .iter()
+                .any(|(resonance, k)| *resonance == LINE_4_28_EV && !k.is_empty()),
+            "check 2 scores the {LINE_4_28_EV} eV window"
+        );
+        let mut failures = Vec::new();
+        let mut unjudged = Vec::new();
+        // Failures where the reference's grid error is not measured: not attributed to NEREIDS.
+        let mut undecided = Vec::new();
+
+        // Decided from the reference alone, before NEREIDS runs.
+        let around = |kelvin: f64| -> Option<[f64; 5]> {
+            let found =
+                [-1.0, -0.5, 0.0, 0.5, 1.0].map(|d| eps.get(&format!("{}", kelvin + d)).copied());
+            match found {
+                [Some(a), Some(b), Some(c), Some(d), Some(e)] => Some([a, b, c, d, e]),
+                _ => None,
+            }
+        };
+        let mut judged = Vec::new();
+        for &(kelvin, cols, limit) in &TEMPERATURES {
+            let e5 = around(kelvin).unwrap_or([0.0; 5]);
+            let mut per_window = Vec::new();
+            for (resonance, k) in &windows {
+                let d: Vec<f64> = k
+                    .iter()
+                    .map(|&i| 0.5 * (reference[i][cols[4]] - reference[i][cols[0]]))
+                    .collect();
+                // For a cubic in T the ±1 K difference's step error is 4/3 of its change from ±½ K.
+                // The reference's error enters both differences.
+                let reference_error = 0.5 * (e5[0] + e5[4]) + e5[1] + e5[3];
+                let step = 4.0 / 3.0
+                    * (k.iter()
+                        .zip(&d)
+                        .map(|(&i, d)| (d - (reference[i][cols[3]] - reference[i][cols[1]])).abs())
+                        .fold(0.0_f64, f64::max)
+                        + reference_error);
+                let max_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                let rms = (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt();
+                let marks = [
+                    rms > 0.0 && e5[2] / rms <= 0.1 * limit,
+                    max_d > 0.0 && e5[2] <= 0.01 * max_d,
+                    max_d > 0.0 && 0.5 * (e5[0] + e5[4]) + step <= 0.001 * max_d,
+                ];
+                if marks.contains(&false) {
+                    let note = format!("check 2, {resonance} eV at {kelvin} K: marks {marks:?}");
+                    if *resonance == LINE_4_28_EV {
+                        failures.push(format!("{note}: the 4.280412 eV window must be judged"));
+                    } else {
+                        unjudged.push(note);
+                    }
+                }
+                per_window.push(marks);
+            }
+            judged.push(per_window);
+        }
+
+        let span = SPAN_EV;
+        let pulse =
+            DetectorPulse::new(laws(&NUMBERS, Some(span)), span, DEFAULT_N_TAU).expect("pulse");
+        let mut grid =
+            Arc::new(FlightTimeGrid::new(&edges, 0.0, FLIGHT_PATH, &pulse).expect("grid"));
+        let peak = reference.iter().fold(0.0_f64, |m, r| m.max(r[1]));
+        if exceeds(eps["open"], 1e-7 * peak) {
+            failures.push(format!(
+                "check 2: the reference's open error {:.3e}",
+                eps["open"]
+            ));
+        }
+        // Halve NEREIDS's grid until no count moves by 1e-7 of the open peak.
+        let evaluate = |grid: &Arc<FlightTimeGrid>, kelvin: f64| {
+            let (model, _, params) = model_at(grid, &ta, kelvin);
+            model.evaluate(&params).expect("counts")
+        };
+        let mut counts: Vec<Vec<f64>> = TEMPERATURES
+            .iter()
+            .map(|&(k, _, _)| evaluate(&grid, k))
+            .collect();
+        let mut open_eps = f64::NAN;
+        let mut previous = Arc::clone(&grid);
+        // At the point cap NEREIDS's own error is held to the full mark instead of a tenth.
+        let mut share = 0.1;
+        for halving in 1..=6 {
+            let finer = match grid.halved() {
+                Ok(finer) => Arc::new(finer),
+                Err(
+                    e @ nereids_physics::flight_time_grid::FlightTimeGridError::TooManyPoints {
+                        ..
+                    },
+                ) => {
+                    eprintln!(
+                        "check 2: halving {halving} stopped: {e}; NEREIDS's error held to the full mark"
+                    );
+                    if halving == 1 {
+                        failures.push(format!("check 2: NEREIDS's grid cannot be halved: {e}"));
+                    }
+                    share = 1.0;
+                    break;
+                }
+                Err(e) => panic!("halved: {e}"),
+            };
+            let refined: Vec<Vec<f64>> = TEMPERATURES
+                .iter()
+                .map(|&(k, _, _)| evaluate(&finer, k))
+                .collect();
+            let nereids_eps = counts
+                .iter()
+                .flatten()
+                .zip(refined.iter().flatten())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            open_eps = counts
+                .iter()
+                .zip(&refined)
+                .flat_map(|(a, b)| a[..bins].iter().zip(&b[..bins]))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            eprintln!(
+                "check 2: halving {halving}, largest change {nereids_eps:.3e}, open {open_eps:.3e} \
+                 (peak {peak:.4e})"
+            );
+            previous = std::mem::replace(&mut grid, finer);
+            counts = refined;
+            if nereids_eps <= 1e-7 * peak {
+                break;
+            }
+        }
+        // The open counts' mark; the sample counts' own marks are judged per window below.
+        if exceeds(open_eps, share * 1e-6 * peak) {
+            failures.push(format!(
+                "check 2: NEREIDS's grid moves the open counts by {open_eps:.3e}"
+            ));
+        }
+
+        // Open counts, the same reference at every temperature.
+        let open_diff = counts
+            .iter()
+            .flat_map(|run| run[..bins].iter().enumerate())
+            .map(|(j, &o)| (o - reference[j][1]).abs())
+            .fold(0.0_f64, |m, x| {
+                if x.is_nan() || m.is_nan() {
+                    f64::NAN
+                } else {
+                    m.max(x)
+                }
+            });
+        eprintln!(
+            "check 2: open max|O_N − O_ref| = {open_diff:.3e}, limit {:.3e}",
+            1e-6 * peak
+        );
+        if exceeds(open_diff, 1e-6 * peak) {
+            failures.push(format!("check 2: open counts differ by {open_diff:.3e}"));
+        }
+
+        // The counts and derivatives on the accepted grid and on the grid before it.
+        let solve = |grid: &Arc<FlightTimeGrid>, kelvin: f64| {
+            let (model, layout, params) = model_at(grid, &ta, kelvin);
+            let temperature = layout.regions[0].temperature.expect("a material");
+            let mut free: Vec<usize> = (0..11).map(|n| layout.pulse + n).collect();
+            free.extend([layout.t0, layout.flight_path, temperature]);
+            let y = model.evaluate(&params).expect("counts");
+            let jac = model
+                .analytical_jacobian(&params, &free, &y)
+                .expect("jacobian");
+            (y, jac)
+        };
+        for (t, &(kelvin, cols, limit)) in TEMPERATURES.iter().enumerate() {
+            let (y, jac) = solve(&grid, kelvin);
+            let (y_coarse, jac_coarse) = solve(&previous, kelvin);
+            let sample: Vec<f64> = y[bins..2 * bins].to_vec();
+            let slope: Vec<f64> = (0..bins).map(|j| jac.get(bins + j, 13)).collect();
+            let sample_change: Vec<f64> = (0..bins)
+                .map(|j| (y[bins + j] - y_coarse[bins + j]).abs())
+                .collect();
+            let slope_change: Vec<f64> = (0..bins)
+                .map(|j| (jac.get(bins + j, 13) - jac_coarse.get(bins + j, 13)).abs())
+                .collect();
+            let coarse_slope = (0..bins).map(|j| jac_coarse.get(bins + j, 13));
+            if y.iter()
+                .chain(&slope)
+                .chain(&y_coarse)
+                .copied()
+                .chain(coarse_slope)
+                .any(|x| !x.is_finite())
+            {
+                failures.push(format!(
+                    "check 2 at {kelvin} K: a count or slope is not finite"
+                ));
+            }
+            let measured = around(kelvin).is_some();
+            let e_t = around(kelvin).map_or(0.0, |e| e[2]);
+            let verdict =
+                |note: String, failures: &mut Vec<String>, undecided: &mut Vec<String>| {
+                    if measured {
+                        failures.push(note);
+                    } else {
+                        undecided.push(format!(
+                            "{note} (the reference's grid error here is not measured; measure it \
+                         before attributing this to NEREIDS)"
+                        ));
+                    }
+                };
+            for ((resonance, k), marks) in windows.iter().zip(&judged[t]) {
+                let d: Vec<f64> = k
+                    .iter()
+                    .map(|&i| 0.5 * (reference[i][cols[4]] - reference[i][cols[0]]))
+                    .collect();
+                let r: Vec<f64> = k
+                    .iter()
+                    .map(|&i| sample[i] - reference[i][cols[2]])
+                    .collect();
+                let max_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                let bias = r.iter().zip(&d).map(|(a, b)| a * b).sum::<f64>()
+                    / d.iter().map(|x| x * x).sum::<f64>();
+                let max_r = r.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                let max_slope = k
+                    .iter()
+                    .zip(&d)
+                    .map(|(&i, d)| (slope[i] - d).abs())
+                    .fold(0.0_f64, f64::max);
+                let label = format!("check 2, {resonance} eV at {kelvin} K");
+                // NEREIDS's own error: at most `share` of each mark.
+                let change: Vec<f64> = k.iter().map(|&i| sample_change[i]).collect();
+                let max_change = change.iter().fold(0.0_f64, |m, x| m.max(*x));
+                let max_slope_change = k.iter().fold(0.0_f64, |m, &i| m.max(slope_change[i]));
+                let change_bias = change.iter().zip(&d).map(|(a, b)| a * b.abs()).sum::<f64>()
+                    / d.iter().map(|x| x * x).sum::<f64>();
+                if marks[0] && exceeds(change_bias, share * limit) {
+                    failures.push(format!(
+                        "{label}: NEREIDS's grid moves b by {change_bias:.3e} K"
+                    ));
+                }
+                if marks[1] && exceeds(max_change, share * 0.1 * max_d) {
+                    failures.push(format!(
+                        "{label}: NEREIDS's grid moves S by {max_change:.3e}"
+                    ));
+                }
+                if marks[2] && exceeds(max_slope_change, share * 0.01 * max_d) {
+                    failures.push(format!(
+                        "{label}: NEREIDS's grid moves dS/dT by {max_slope_change:.3e}"
+                    ));
+                }
+                eprintln!(
+                    "{label}: b = {bias:+.4} K, max|r| = {max_r:.3e} (bound {:.3e}), \
+                     max|D_N − D| = {max_slope:.3e} (bound {:.3e}), judged {marks:?}",
+                    0.1 * max_d + e_t,
+                    0.01 * max_d
+                );
+                if marks[0] && exceeds(bias.abs(), limit) {
+                    verdict(
+                        format!("{label}: (i) |b| = {:.4} K", bias.abs()),
+                        &mut failures,
+                        &mut undecided,
+                    );
+                }
+                if marks[1] && exceeds(max_r, 0.1 * max_d + e_t) {
+                    verdict(
+                        format!("{label}: (ii) max|r| = {max_r:.3e}"),
+                        &mut failures,
+                        &mut undecided,
+                    );
+                }
+                if marks[2] && exceeds(max_slope, 0.01 * max_d) {
+                    verdict(
+                        format!("{label}: (iii) max|D_N − D| = {max_slope:.3e}"),
+                        &mut failures,
+                        &mut undecided,
+                    );
+                }
+            }
+            // Derivatives with respect to the 11 pulse numbers, t0 and L.
+            for column in 0..13 {
+                for (run, offset, ref_col) in [
+                    ("open", 0, 1 + column),
+                    ("sample", bins, 14 + 13 * t + column),
+                ] {
+                    // Both runs enter one fit, so a number's derivatives share the larger scale.
+                    let largest = [1 + column, 14 + 13 * t + column]
+                        .into_iter()
+                        .flat_map(|c| jacobian_ref.iter().map(move |row| row[c].abs()))
+                        .fold(0.0_f64, f64::max);
+                    let worst = (0..bins)
+                        .map(|j| (jac.get(offset + j, column) - jacobian_ref[j][ref_col]).abs())
+                        .fold(0.0_f64, |m, x| {
+                            if x.is_nan() || m.is_nan() {
+                                f64::NAN
+                            } else {
+                                m.max(x)
+                            }
+                        });
+                    let moved = (0..bins)
+                        .map(|j| {
+                            (jac.get(offset + j, column) - jac_coarse.get(offset + j, column)).abs()
+                        })
+                        .fold(0.0_f64, |m, x| {
+                            if x.is_nan() || m.is_nan() {
+                                f64::NAN
+                            } else {
+                                m.max(x)
+                            }
+                        });
+                    if exceeds(moved, share * 1e-2 * largest) {
+                        failures.push(format!(
+                            "check 2, ∂{run}/∂p{column} at {kelvin} K: NEREIDS's grid moves it by {moved:.3e}"
+                        ));
+                    }
+                    eprintln!(
+                        "check 2, ∂{run}/∂p{column} at {kelvin} K: max diff {worst:.3e} of {largest:.3e}"
+                    );
+                    if exceeds(worst, 0.01 * largest) {
+                        let note = format!(
+                            "check 2, ∂{run}/∂p{column} at {kelvin} K: {worst:.3e} exceeds 1% of {largest:.3e}"
+                        );
+                        // The reference checks only the open derivatives on its halved grid.
+                        if run == "open" {
+                            failures.push(note);
+                        } else {
+                            undecided.push(format!(
+                                "{note} (the reference's grid error is not measured for sample \
+                                 derivatives; measure it before attributing this to NEREIDS)"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{} marks not judged:\n{}",
+            unjudged.len(),
+            unjudged.join("\n")
+        );
+        eprintln!("{} undecided:\n{}", undecided.len(), undecided.join("\n"));
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert!(undecided.is_empty(), "{}", undecided.join("\n"));
+    }
+}

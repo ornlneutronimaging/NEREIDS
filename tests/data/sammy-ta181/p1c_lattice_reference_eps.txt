@@ -1,0 +1,13 @@
+# eps = max|T − T(refined)| over the bins; refined: Fourier step halved and period
+# doubled, one-phonon panels doubled, sigma interpolated every 1e-5 instead of 2e-5 eV.
+# Columns: temperature (K), eps.
+300.79 5.540200e-09
+301.29 5.537974e-09
+301.79 5.535729e-09
+302.29 5.533465e-09
+302.79 5.531184e-09
+1092 3.081532e-09
+1092.5 3.471175e-09
+1093 4.242396e-09
+1093.5 3.266079e-09
+1094 3.111439e-09
