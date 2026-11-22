@@ -16,7 +16,7 @@ use nereids_endf::retrieval::EndfLibrary;
 use nereids_physics::continuous_doppler::{Channel, QuadratureBudget, broaden_with_budget};
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{DEFAULT_N_TAU, DetectorPulse, IkedaCarpenterParams};
-use nereids_physics::lattice_doppler::PhononSpectrum;
+use nereids_physics::lattice_doppler::{PhononSpectrum, broaden_in_lattice};
 use nereids_physics::thickness::uneven_transmission;
 use nereids_pipeline::counts_fit::{
     CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, Value, fit_counts,
@@ -69,6 +69,380 @@ const LATTICE_FIT_LIMIT_K: f64 = 0.1;
 const LATTICE_D2_LIMIT: f64 = 2.0;
 /// Least `d²` from the true pulse of the S3 free-gas calibration, whose misfit it resolves.
 const FREE_GAS_D2_LEAST: f64 = 25.0;
+/// Check 1's SAMMY transmission: energy, then T − 1 to T + 1 K in ½ K steps at 300 and 1100 K.
+const P1A_FILE: &str = "p1a_rpi_alpha2.txt";
+/// Check 1's SAMMY convergence: temperature in K and `eps` on each line.
+const P1A_EPS: &str = "p1a_rpi_alpha2_eps.txt";
+/// The scored resonances: those from 0.5 to 200 eV.
+const SCORED_EV: (f64, f64) = (0.5, 200.0);
+/// The 4.280412 eV resonance, which every forward-model check must judge.
+const LINE_4_28_EV: f64 = 4.280_412;
+/// Energies in eV over which the pulse laws hold in the forward-model checks.
+const P1_PULSE_SPAN_EV: (f64, f64) = (0.3, 1000.0);
+
+/// Check 3's Debye temperature in K and its spectrum points, both endpoints included.
+const P1C_DEBYE: (f64, usize) = (240.0, 2000);
+/// Bin-centre energies in eV of check 3: to the midpoint of the 194.8900 and
+/// 200.1447 eV resonances.
+const P1C_BINS_EV: (f64, f64) = (0.5, 197.517_35);
+
+/// One temperature of a forward-model check.
+struct Scored {
+    /// Temperature in K.
+    kelvin: f64,
+    /// Columns of the reference at T − 1, T − ½, T, T + ½ and T + 1 K.
+    columns: [usize; 5],
+    /// Limit of `|b|` in K, pass mark (i).
+    bias_limit_k: f64,
+}
+
+const P1A_SCORED: [Scored; 2] = [
+    Scored {
+        kelvin: 300.0,
+        columns: [1, 2, 3, 4, 5],
+        bias_limit_k: 0.05,
+    },
+    Scored {
+        kelvin: 1100.0,
+        columns: [6, 7, 8, 9, 10],
+        bias_limit_k: 0.2,
+    },
+];
+
+/// Check 3's temperatures against the independent lattice reference.
+const P1C_INDEPENDENT: [Scored; 2] = [
+    Scored {
+        kelvin: 301.79,
+        columns: [1, 2, 3, 4, 5],
+        bias_limit_k: 0.05,
+    },
+    Scored {
+        kelvin: 1093.0,
+        columns: [6, 7, 8, 9, 10],
+        bias_limit_k: 0.2,
+    },
+];
+/// Check 3's independent lattice reference (`lattice_reference.py`), recoil `E/A`.
+const P1C_INDEPENDENT_FILE: &str = "p1c_lattice_reference.txt";
+/// Its numerical error: temperature in K and `eps` on each line.
+const P1C_INDEPENDENT_EPS: &str = "p1c_lattice_reference_eps.txt";
+
+/// One resonance's window: bins whose centre energy lies in `(low, high]` eV,
+/// or `[low, high]` for the lowest window.
+struct Window {
+    resonance_ev: f64,
+    low_ev: f64,
+    high_ev: f64,
+}
+
+/// The windows of the resonances in `SCORED_EV`, edges at the midpoints to
+/// their neighbours in the whole File 2 list, clipped to `SCORED_EV`.
+fn windows(data: &ResonanceData) -> Vec<Window> {
+    let mut energies: Vec<f64> = data
+        .ranges
+        .iter()
+        .flat_map(|range| &range.l_groups)
+        .flat_map(|group| &group.resonances)
+        .map(|resonance| resonance.energy)
+        .collect();
+    energies.sort_by(f64::total_cmp);
+    energies.dedup();
+    (0..energies.len())
+        .filter(|&i| (SCORED_EV.0..=SCORED_EV.1).contains(&energies[i]))
+        .map(|i| Window {
+            resonance_ev: energies[i],
+            low_ev: if i == 0 {
+                SCORED_EV.0
+            } else {
+                (0.5 * (energies[i - 1] + energies[i])).max(SCORED_EV.0)
+            },
+            high_ev: energies.get(i + 1).map_or(SCORED_EV.1, |next| {
+                (0.5 * (energies[i] + next)).min(SCORED_EV.1)
+            }),
+        })
+        .collect()
+}
+
+/// The indices of the `centres_ev` in `window`.
+fn members(window: &Window, centres_ev: &[f64], lowest: bool) -> Vec<usize> {
+    (0..centres_ev.len())
+        .filter(|&k| {
+            let e = centres_ev[k];
+            e <= window.high_ev && (e > window.low_ev || (lowest && e == window.low_ev))
+        })
+        .collect()
+}
+
+/// Which pass marks the reference can judge in one window, from the reference alone.
+struct Judgeable {
+    bias: bool,
+    residual: bool,
+    slope: bool,
+    /// Whether the reference's numerical error was measured; a failure without it is undecided.
+    measured: bool,
+    /// Why a mark cannot be judged.
+    reasons: Vec<String>,
+}
+
+/// The reference's change per K, `D = [Q(T + 1) − Q(T − 1)]/2 K`, at the bins `k`.
+fn sensitivity(rows: &[Vec<f64>], columns: [usize; 5], k: &[usize]) -> Vec<f64> {
+    k.iter()
+        .map(|&i| 0.5 * (rows[i][columns[4]] - rows[i][columns[0]]))
+        .collect()
+}
+
+/// Decides, before NEREIDS runs, which marks a window can judge: each reference
+/// error must be at most a tenth of the mark it enters. `eps` holds the reference
+/// error bounds at T − 1, T − ½, T, T + ½ and T + 1 K, or `None` where not measured.
+fn judgeable(rows: &[Vec<f64>], scored: &Scored, k: &[usize], eps: Option<[f64; 5]>) -> Judgeable {
+    let measured = eps.is_some();
+    let eps = eps.unwrap_or([0.0; 5]);
+    let d = sensitivity(rows, scored.columns, k);
+    // For a cubic in T the ±1 K difference's step error is 4/3 of its change from ±½ K.
+    let half: Vec<f64> = k
+        .iter()
+        .map(|&i| rows[i][scored.columns[3]] - rows[i][scored.columns[1]])
+        .collect();
+    // The reference's error enters both differences.
+    let reference_error = 0.5 * (eps[0] + eps[4]) + eps[1] + eps[3];
+    let step_error = 4.0 / 3.0
+        * (d.iter()
+            .zip(&half)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()))
+            + reference_error);
+    let largest_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    let rms_d = (d.iter().map(|x| x * x).sum::<f64>() / d.len().max(1) as f64).sqrt();
+    let mut reasons = Vec::new();
+    let bias = rms_d > 0.0 && eps[2] / rms_d <= 0.1 * scored.bias_limit_k;
+    if !bias {
+        reasons.push(format!(
+            "(i) eps/RMS(D) = {:.2e} K exceeds {:.2e} K",
+            eps[2] / rms_d,
+            0.1 * scored.bias_limit_k
+        ));
+    }
+    let residual = largest_d > 0.0 && eps[2] <= 0.1 * 0.1 * largest_d;
+    if !residual {
+        reasons.push(format!(
+            "(ii) eps = {:.2e} exceeds {:.2e}",
+            eps[2],
+            0.01 * largest_d
+        ));
+    }
+    let slope_error = 0.5 * (eps[0] + eps[4]) + step_error;
+    let slope = largest_d > 0.0 && slope_error <= 0.1 * 0.01 * largest_d;
+    if !slope {
+        reasons.push(format!(
+            "(iii) slope error {slope_error:.2e} exceeds {:.2e}",
+            0.001 * largest_d
+        ));
+    }
+    Judgeable {
+        bias,
+        residual,
+        slope,
+        measured,
+        reasons,
+    }
+}
+
+/// Bounds per bin the effect of SAMMY's RPI tail cut at 16/α and of its 1 ns FWHM burst.
+///
+/// The cut term is 145·e^(−16) times the largest change of the value, and of D, over delays
+/// of 0–30 µs (T in [0, 1], D = 0 before the first bin); the burst term is σ² times the
+/// second difference per bin width².
+fn rpi_model_bound(rows: &[Vec<f64>], columns: [usize; 5]) -> ModelBound {
+    let omitted = 145.0 * (-16.0_f64).exp();
+    let reach = (30.0 / (BIN_CENTI_US as f64 / 100.0)).ceil() as usize;
+    let sigma_us = 1e-3 / (8.0 * 2.0_f64.ln()).sqrt();
+    let width_us = BIN_CENTI_US as f64 / 100.0;
+    let at = columns[2];
+    let d: Vec<f64> = rows
+        .iter()
+        .map(|row| 0.5 * (row[columns[4]] - row[columns[0]]))
+        .collect();
+    let spread = |values: &dyn Fn(usize) -> f64, j: usize, outside: (f64, f64)| {
+        let first = j.saturating_sub(reach);
+        let (mut low, mut high) = (values(j), values(j));
+        for i in first..=j {
+            low = low.min(values(i));
+            high = high.max(values(i));
+        }
+        if j < reach {
+            low = low.min(outside.0);
+            high = high.max(outside.1);
+        }
+        high - low
+    };
+    let value = (0..rows.len())
+        .map(|j| {
+            let curvature = if j == 0 || j + 1 == rows.len() {
+                0.0
+            } else {
+                (rows[j + 1][at] - 2.0 * rows[j][at] + rows[j - 1][at]).abs() / width_us.powi(2)
+            };
+            omitted * spread(&|i| rows[i][at], j, (0.0, 1.0)) + sigma_us * sigma_us * curvature
+        })
+        .collect();
+    let slope = (0..rows.len())
+        .map(|j| omitted * spread(&|i| d[i], j, (0.0, 0.0)))
+        .collect();
+    ModelBound { value, slope }
+}
+
+/// Bounds, per bin, of differences in what the reference computes that are not
+/// numerical error: on its transmission and on its slope per K.
+struct ModelBound {
+    value: Vec<f64>,
+    slope: Vec<f64>,
+}
+
+/// Scores one window's judgeable marks; returns its failures and its inconclusive ones.
+///
+/// A failure is inconclusive when `model` (indexed like `ours`) explains it or the reference's
+/// error is unmeasured. NEREIDS's change on its last grid halving must stay within a tenth of
+/// each mark.
+#[allow(clippy::too_many_arguments)]
+fn score_window(
+    label: &str,
+    scored: &Scored,
+    judge: &Judgeable,
+    k: &[usize],
+    fold: &Folded,
+    rows: &[Vec<f64>],
+    eps: Option<f64>,
+    model: Option<&ModelBound>,
+) -> (Vec<String>, Vec<String>) {
+    let eps = eps.unwrap_or(0.0);
+    let (ours, slope) = (&fold.transmission, &fold.slope);
+    let at = scored.columns[2];
+    let d = sensitivity(rows, scored.columns, k);
+    let r: Vec<f64> = k.iter().map(|&i| ours[i] - rows[i][at]).collect();
+    let slope_error: Vec<f64> = k.iter().zip(&d).map(|(&i, d)| slope[i] - d).collect();
+    let largest_d = d.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    let bias_k = dot(&r, &d) / dot(&d, &d);
+    let largest_r = r.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    let largest_slope = slope_error.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    let residual_bound = 0.1 * largest_d + eps;
+    let slope_bound = 0.01 * largest_d;
+    eprintln!(
+        "{label}: {} bins, b = {bias_k:+.4} K (limit {} K, judged {}); max|r| = {largest_r:.3e} \
+         (bound {residual_bound:.3e}, judged {}); max|D_N - D| = {largest_slope:.3e} /K \
+         (bound {slope_bound:.3e}, judged {})",
+        k.len(),
+        scored.bias_limit_k,
+        judge.bias,
+        judge.residual,
+        judge.slope
+    );
+    let mut failures = Vec::new();
+    let mut inconclusive = Vec::new();
+    let finite = k
+        .iter()
+        .all(|&i| ours[i].is_finite() && slope[i].is_finite());
+    if !finite {
+        failures.push(format!("{label}: a NEREIDS value is not finite"));
+    }
+    // NEREIDS's own error: at most a tenth of each mark.
+    if let Some((value_change, slope_change)) = &fold.change {
+        let moved: Vec<f64> = k.iter().map(|&i| value_change[i]).collect();
+        let moved_bias = moved.iter().zip(&d).map(|(a, b)| a * b.abs()).sum::<f64>() / dot(&d, &d);
+        let moved_value = moved.iter().fold(0.0_f64, |m, x| m.max(*x));
+        let moved_slope = k.iter().fold(0.0_f64, |m, &i| m.max(slope_change[i]));
+        if judge.bias && !within(moved_bias, 0.1 * scored.bias_limit_k) {
+            failures.push(format!(
+                "{label}: NEREIDS's grid moves b by {moved_bias:.3e} K"
+            ));
+        }
+        if judge.residual && !within(moved_value, 0.01 * largest_d) {
+            failures.push(format!(
+                "{label}: NEREIDS's grid moves a value by {moved_value:.3e}"
+            ));
+        }
+        if judge.slope && !within(moved_slope, 0.001 * largest_d) {
+            failures.push(format!(
+                "{label}: NEREIDS's grid moves a slope by {moved_slope:.3e}"
+            ));
+        }
+    }
+    // A failure the reference's model bound covers is not attributed to NEREIDS.
+    let mut verdict = |failed: bool, explained: bool, note: String| {
+        if failed {
+            if explained {
+                inconclusive.push(format!("{note} (within the reference's model bound)"));
+            } else if !judge.measured {
+                inconclusive.push(format!(
+                    "{note} (the reference's numerical error here is not measured; measure it \
+                     before attributing this to NEREIDS)"
+                ));
+            } else {
+                failures.push(note);
+            }
+        }
+    };
+    let bound_of =
+        |values: &dyn Fn(&ModelBound) -> &[f64], i: usize| model.map_or(0.0, |m| values(m)[i]);
+    let bias_bound = k
+        .iter()
+        .zip(&d)
+        .map(|(&i, d)| bound_of(&|m| &m.value, i) * d.abs())
+        .sum::<f64>()
+        / dot(&d, &d);
+    verdict(
+        judge.bias && !within(bias_k.abs(), scored.bias_limit_k),
+        model.is_some() && within(bias_k.abs(), scored.bias_limit_k + bias_bound),
+        format!("{label}: (i) |b| = {:.4} K", bias_k.abs()),
+    );
+    let residual_explained = k
+        .iter()
+        .zip(&r)
+        .all(|(&i, r)| within(r.abs(), residual_bound + bound_of(&|m| &m.value, i)));
+    verdict(
+        judge.residual && !within(largest_r, residual_bound),
+        model.is_some() && residual_explained,
+        format!("{label}: (ii) max|r| = {largest_r:.3e}"),
+    );
+    let slope_explained = k
+        .iter()
+        .zip(&slope_error)
+        .all(|(&i, e)| within(e.abs(), slope_bound + bound_of(&|m| &m.slope, i)));
+    verdict(
+        judge.slope && !within(largest_slope, slope_bound),
+        model.is_some() && slope_explained,
+        format!("{label}: (iii) max|D_N - D| = {largest_slope:.3e} /K"),
+    );
+    (failures, inconclusive)
+}
+
+/// A reference error bound per temperature from `name`: temperature in K and the bound.
+fn eps_table(name: &str) -> Vec<(f64, f64)> {
+    table(name, 2)
+        .into_iter()
+        .map(|row| (row[0], row[1]))
+        .collect()
+}
+
+/// The bounds of `table` at T − 1, T − ½, T, T + ½ and T + 1 K; `None` unless all five
+/// were measured.
+fn eps_around(table: &[(f64, f64)], kelvin: f64) -> Option<[f64; 5]> {
+    let found = [-1.0, -0.5, 0.0, 0.5, 1.0].map(|offset| {
+        let found: Vec<f64> = table
+            .iter()
+            .filter(|(k, _)| (k - (kelvin + offset)).abs() < 1e-9)
+            .map(|(_, e)| *e)
+            .collect();
+        assert!(
+            found.len() <= 1,
+            "at most one error bound at {} K",
+            kelvin + offset
+        );
+        found.first().copied()
+    });
+    match found {
+        [Some(a), Some(b), Some(c), Some(d), Some(e)] => Some([a, b, c, d, e]),
+        _ => None,
+    }
+}
 
 /// One compared temperature.
 struct Case {
@@ -123,7 +497,7 @@ fn table(name: &str, columns: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// The VENUS bins with a centre energy in `WINDOW_EV`, in time order.
+/// The VENUS bins with a centre energy in a window, in time order.
 struct Bins {
     /// Time edges in µs, ascending.
     edges_us: Vec<f64>,
@@ -132,11 +506,16 @@ struct Bins {
 }
 
 fn bins() -> Bins {
+    bins_in(WINDOW_EV)
+}
+
+/// The bins with a centre energy in `[window.0, window.1]` eV.
+fn bins_in(window: (f64, f64)) -> Bins {
     let edge = |j: usize| (FIRST_EDGE_CENTI_US + BIN_CENTI_US * j) as f64 / 100.0;
     let centre = |j: usize| tof_to_energy(0.5 * (edge(j) + edge(j + 1)), FLIGHT_PATH_M);
     let kept: Vec<usize> = (0..)
-        .take_while(|&j| centre(j) >= WINDOW_EV.0)
-        .filter(|&j| centre(j) <= WINDOW_EV.1)
+        .take_while(|&j| centre(j) >= window.0)
+        .filter(|&j| centre(j) <= window.1)
         .collect();
     Bins {
         edges_us: (kept[0]..=kept[kept.len() - 1] + 1).map(edge).collect(),
@@ -264,8 +643,33 @@ fn resolved(
     kelvin: f64,
     label: &str,
 ) -> (Vec<f64>, Vec<f64>) {
+    let folded = folded(data, edges_us, pulse, kelvin, label, false);
+    (folded.transmission, folded.slope)
+}
+
+/// A fold over the bins and each bin's change on the last halving of its grid.
+struct Folded {
+    transmission: Vec<f64>,
+    slope: Vec<f64>,
+    /// Each bin's change of transmission and of slope on the last halving; `None`
+    /// where the calculation has no grid to halve.
+    change: Option<(Vec<f64>, Vec<f64>)>,
+}
+
+/// [`resolved`]; with `slopes_too` each grid is also halved until no slope per K
+/// changes by `GRID_CHANGE`.
+fn folded(
+    data: &ResonanceData,
+    edges_us: &[f64],
+    pulse: &DetectorPulse,
+    kelvin: f64,
+    label: &str,
+    slopes_too: bool,
+) -> Folded {
     let bins = edges_us.len() - 1;
     let (mut transmission, mut slope) = (Vec::with_capacity(bins), Vec::with_capacity(bins));
+    let (mut transmission_change, mut slope_change) =
+        (Vec::with_capacity(bins), Vec::with_capacity(bins));
     // A grid per block keeps the point cap far from the step S2 needs.
     for first in (0..bins).step_by(BLOCK_BINS) {
         let last = (first + BLOCK_BINS).min(bins);
@@ -275,19 +679,31 @@ fn resolved(
             .unwrap_or_else(|e| panic!("{label}, bins {first}..{last}: {e}"));
         let mut values = binned(&grid, data, kelvin, &mut known);
         let mut halvings = 0;
+        let mut last_moved: (Vec<f64>, Vec<f64>);
         loop {
             let finer = grid
                 .halved()
                 .unwrap_or_else(|e| panic!("{label}, bins {first}..{last}: {e}"));
             let refined = binned(&finer, data, kelvin, &mut known);
-            let change = values
-                .0
-                .iter()
-                .zip(&refined.0)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f64::max);
+            assert!(
+                [&values.0, &values.1, &refined.0, &refined.1]
+                    .iter()
+                    .all(|v| v.iter().all(|x| x.is_finite())),
+                "{label}, bins {first}..{last}: a value or slope is not finite"
+            );
+            let differences = |a: &[f64], b: &[f64]| -> Vec<f64> {
+                a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect()
+            };
+            let (moved, moved_slope) = (
+                differences(&values.0, &refined.0),
+                differences(&values.1, &refined.1),
+            );
+            let largest = |v: &[f64]| v.iter().fold(0.0, |m: f64, x| m.max(*x));
+            let change = largest(&moved);
+            let slope_moved = largest(&moved_slope);
             (grid, values, halvings) = (finer, refined, halvings + 1);
-            if change < GRID_CHANGE {
+            last_moved = (moved, moved_slope);
+            if change < GRID_CHANGE && (!slopes_too || slope_moved < GRID_CHANGE) {
                 eprintln!(
                     "{label}, bins {first}..{last}: {halvings} halvings, step {:.2e} µs, \
                      {} points, change {change:.1e}",
@@ -299,8 +715,14 @@ fn resolved(
         }
         transmission.extend(values.0);
         slope.extend(values.1);
+        transmission_change.extend(last_moved.0);
+        slope_change.extend(last_moved.1);
     }
-    (transmission, slope)
+    Folded {
+        transmission,
+        slope,
+        change: Some((transmission_change, slope_change)),
+    }
 }
 
 /// Whether `value` is at most `bound`; false for NaN.
@@ -449,6 +871,258 @@ fn s2_ikeda_carpenter_transmission_matches_sammy_rpi() {
         ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Check 1: the free-gas transmission and its slope per K over the window of the
+/// 4.280412 eV resonance, folded with only the prompt Ikeda-Carpenter term
+/// (α = 2 per µs, R = 0), with a unit beam.
+#[test]
+#[ignore = "slow; runs nightly"]
+fn check1_the_4_28_ev_line_matches_sammy_rpi() {
+    let data = ta181();
+    let line = windows(&data)
+        .into_iter()
+        .find(|w| w.resonance_ev == LINE_4_28_EV)
+        .expect("the 4.280412 eV window");
+    assert!(
+        line.low_ev == SCORED_EV.0 && (line.high_ev - 7.313_616).abs() < 1e-9,
+        "the 4.280412 eV window is {}-{} eV",
+        line.low_ev,
+        line.high_ev
+    );
+    let bins = bins_in((line.low_ev, line.high_ev));
+    let rows = reference(&bins, P1A_FILE, 11);
+    let k = members(&line, &bins.centres_ev, true);
+    assert_eq!(k.len(), bins.centres_ev.len(), "every bin is in the window");
+    let eps = eps_table(P1A_EPS);
+    let mut failures = Vec::new();
+    // Decided from the reference alone, before NEREIDS runs.
+    let judged: Vec<Judgeable> = P1A_SCORED
+        .iter()
+        .map(|s| {
+            let around = eps_around(&eps, s.kelvin);
+            assert!(
+                around.is_some(),
+                "check 1's SAMMY error is measured around {} K",
+                s.kelvin
+            );
+            judgeable(&rows, s, &k, around)
+        })
+        .collect();
+    for (s, judge) in P1A_SCORED.iter().zip(&judged) {
+        if !judge.reasons.is_empty() {
+            failures.push(format!(
+                "check 1 at {} K: not judged: {}",
+                s.kelvin,
+                judge.reasons.join("; ")
+            ));
+        }
+    }
+    // R = 0, so β does not change the pulse.
+    let pulse = DetectorPulse::new(
+        IkedaCarpenterParams::constant(ALPHA, 1.0, 0.0),
+        P1_PULSE_SPAN_EV,
+        DEFAULT_N_TAU,
+    )
+    .expect("pulse");
+    let mut inconclusive = Vec::new();
+    for (s, judge) in P1A_SCORED.iter().zip(&judged) {
+        let label = format!("check 1, {LINE_4_28_EV} eV window at {} K", s.kelvin);
+        let fold = folded(&data, &bins.edges_us, &pulse, s.kelvin, &label, true);
+        let at = eps_around(&eps, s.kelvin).map(|e| e[2]);
+        let bound = rpi_model_bound(&rows, s.columns);
+        let (failed, open) = score_window(&label, s, judge, &k, &fold, &rows, at, Some(&bound));
+        failures.extend(failed);
+        inconclusive.extend(open);
+    }
+    eprintln!(
+        "{} inconclusive:\n{}",
+        inconclusive.len(),
+        inconclusive.join("\n")
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
+}
+
+/// Check 3's estimate of NEREIDS's error per bin, for the value and the slope per K.
+///
+/// With no grid to refine, it is NEREIDS's disagreement with the reference plus the
+/// reference's own error, as `judgeable` bounds it; `score_window` holds it to a tenth of each
+/// mark. `columns` and `eps` follow `Scored` and `judgeable`.
+fn lattice_error_estimate(
+    rows: &[Vec<f64>],
+    columns: [usize; 5],
+    eps: [f64; 5],
+    transmission: &[f64],
+    slope: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    (0..rows.len())
+        .map(|i| {
+            let c = columns;
+            let d = 0.5 * (rows[i][c[4]] - rows[i][c[0]]);
+            let half = rows[i][c[3]] - rows[i][c[1]];
+            let slope_error = 0.5 * (eps[0] + eps[4])
+                + 4.0 / 3.0 * ((d - half).abs() + 0.5 * (eps[0] + eps[4]) + eps[1] + eps[3]);
+            (
+                (transmission[i] - rows[i][c[2]]).abs() + eps[2],
+                (slope[i] - d).abs() + slope_error,
+            )
+        })
+        .unzip()
+}
+
+/// A disagreement within a tenth of the value mark fails once the reference's error is added.
+#[test]
+fn check3_error_estimate_counts_the_reference_error() {
+    // T linear in temperature with slope 1e-3 per K: max|D| = 1e-3, a tenth of the value
+    // mark 1e-5. eps = 9e-6 leaves the mark judgeable; NEREIDS is off by 5e-6.
+    let rows: Vec<Vec<f64>> = (0..3)
+        .map(|i| {
+            let base = 0.5 + 0.01 * i as f64;
+            let mut row = vec![1.0 + i as f64];
+            row.extend([-1.0, -0.5, 0.0, 0.5, 1.0].map(|dt| base + 1e-3 * dt));
+            row
+        })
+        .collect();
+    let scored = Scored {
+        kelvin: 1093.0,
+        columns: [1, 2, 3, 4, 5],
+        bias_limit_k: 0.2,
+    };
+    let k = [0, 1, 2];
+    let eps = [9e-6; 5];
+    let judge = judgeable(&rows, &scored, &k, Some(eps));
+    assert!(judge.bias && judge.residual, "{:?}", judge.reasons);
+    let transmission: Vec<f64> = rows.iter().map(|r| r[3] + 5e-6).collect();
+    let slope = vec![1e-3; 3];
+    let fold = Folded {
+        change: Some(lattice_error_estimate(
+            &rows,
+            scored.columns,
+            eps,
+            &transmission,
+            &slope,
+        )),
+        transmission,
+        slope,
+    };
+    let (failures, _) = score_window(
+        "synthetic",
+        &scored,
+        &judge,
+        &k,
+        &fold,
+        &rows,
+        Some(eps[2]),
+        None,
+    );
+    assert!(
+        failures.iter().any(|f| f.contains("moves a value")),
+        "{failures:?}"
+    );
+}
+
+/// Check 3 against an independent lattice calculation: the lattice transmission
+/// without instrument and its slope per K at each bin centre, at 301.79 K and 1093 K,
+/// with NEREIDS's recoil `E/A`.
+#[test]
+#[ignore = "slow; runs nightly"]
+fn check3_lattice_matches_the_independent_reference() {
+    let data = ta181();
+    let all = windows(&data);
+    let bins = bins_in(P1C_BINS_EV);
+    let rows = reference(&bins, P1C_INDEPENDENT_FILE, 11);
+    let eps = eps_table(P1C_INDEPENDENT_EPS);
+    let spectrum = PhononSpectrum::debye(P1C_DEBYE.0, P1C_DEBYE.1).expect("spectrum");
+    let ascending: Vec<f64> = bins.centres_ev.iter().rev().copied().collect();
+    let groups: Vec<(&Window, Vec<usize>)> = all
+        .iter()
+        .map(|w| (w, members(w, &bins.centres_ev, w.low_ev == SCORED_EV.0)))
+        .filter(|(_, k)| !k.is_empty())
+        .collect();
+    assert!(
+        groups.iter().any(|(w, _)| w.resonance_ev == LINE_4_28_EV),
+        "check 3 scores the {LINE_4_28_EV} eV window"
+    );
+    assert_eq!(
+        groups.iter().map(|(_, k)| k.len()).sum::<usize>(),
+        bins.centres_ev.len(),
+        "every bin is in one window"
+    );
+    let mut failures = Vec::new();
+    let mut unjudged = Vec::new();
+    let mut inconclusive = Vec::new();
+    for s in &P1C_INDEPENDENT {
+        let around = eps_around(&eps, s.kelvin);
+        assert!(
+            around.is_some(),
+            "the reference's error is measured around {} K",
+            s.kelvin
+        );
+        let judged: Vec<Judgeable> = groups
+            .iter()
+            .map(|(_, k)| judgeable(&rows, s, k, around))
+            .collect();
+        for ((w, _), judge) in groups.iter().zip(&judged) {
+            if judge.reasons.is_empty() {
+                continue;
+            }
+            let note = format!(
+                "check 3 at {} K, {} eV window: not judged: {}",
+                s.kelvin,
+                w.resonance_ev,
+                judge.reasons.join("; ")
+            );
+            if w.resonance_ev == LINE_4_28_EV {
+                failures.push(note);
+            } else {
+                unjudged.push(note);
+            }
+        }
+        let broadened = broaden_in_lattice(&ascending, &data, s.kelvin, &spectrum, Channel::Total)
+            .unwrap_or_else(|e| panic!("lattice at {} K: {e}", s.kelvin));
+        let (transmission, slope): (Vec<f64>, Vec<f64>) = broadened
+            .values
+            .iter()
+            .zip(&broadened.derivatives)
+            .rev()
+            .map(|(&sigma, &per_k)| {
+                let transmission = (-DENSITY * sigma).exp();
+                (transmission, -transmission * DENSITY * per_k)
+            })
+            .unzip();
+        let disagreement = lattice_error_estimate(
+            &rows,
+            s.columns,
+            around.expect("measured above"),
+            &transmission,
+            &slope,
+        );
+        let fold = Folded {
+            transmission,
+            slope,
+            change: Some(disagreement),
+        };
+        for ((w, k), judge) in groups.iter().zip(&judged) {
+            let label = format!("check 3 at {} K, {} eV window", s.kelvin, w.resonance_ev);
+            let at = around.map(|e| e[2]);
+            let (failed, open) = score_window(&label, s, judge, k, &fold, &rows, at, None);
+            failures.extend(failed);
+            inconclusive.extend(open);
+        }
+    }
+    eprintln!(
+        "{} marks not judged:\n{}",
+        unjudged.len(),
+        unjudged.join("\n")
+    );
+    eprintln!(
+        "{} inconclusive:\n{}",
+        inconclusive.len(),
+        inconclusive.join("\n")
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
 }
 
 /// S2b: the temperature, convergence and finite σ_T of a `fit_counts` fit to counts made

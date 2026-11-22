@@ -1,0 +1,5 @@
+# SAMMY 8.2.b4 (commit c974c02c), executable MD5 091b34fa0229a5793918956006e23f68; free gas
+# without instrument at the integration grid's energies, NXTRA 3. Written by counts_reference.py write.
+# The largest change of the open counts when the integration grid is halved.
+# Columns: run (open or temperature in K), eps.
+open 1.027728e-07
