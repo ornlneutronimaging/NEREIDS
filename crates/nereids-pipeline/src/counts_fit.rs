@@ -5599,7 +5599,7 @@ mod counts_check {
     }
 
     #[test]
-    #[ignore = "slow; runs nightly"]
+    #[ignore = "needs about 100 GB of memory; run on an analysis server"]
     fn check2_counts_match_the_independent_fold() {
         let ta = parse_endf_file2(&read("Ta-181-mf2.endf")).expect("Ta-181-mf2.endf");
         let (edges, centres) = scored_bins();

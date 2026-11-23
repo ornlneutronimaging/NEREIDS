@@ -17,12 +17,12 @@ jobs:
   slow-tests:
     name: Slow tests (${{ matrix.os }}, ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.timeout || 120 }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        shard: ["1", "2", "3", "4", "5", rest]
+        shard: ["1", "2", "3", "4", rest]
         include:
           - shard: "1"
             filter: >-
@@ -37,11 +37,8 @@ jobs:
           - shard: "4"
             filter: >-
               s3_a_lattice_foil_calibrates_on_sammy_crystal_lattice_counts
-          - shard: "5"
-            # About 100 min on 4 cores, before compiling.
-            timeout: 180
-            filter: >-
-              counts_check::check2_counts_match_the_independent_fold
+          # check2 needs about 100 GB of memory, and a hosted runner has 16 GB at
+          # most. It runs on an analysis server: tests/data/README.md.
           - shard: rest
             filter: >-
               --skip pulse_calibration::two_foils_on_the_same_pulse_agree_as_chi_squared_says

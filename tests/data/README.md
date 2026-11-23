@@ -71,6 +71,19 @@ Check 1 (`check1_the_4_28_ev_line_matches_sammy_rpi`) and check 3
 in `crates/nereids-pipeline/src/counts_fit.rs`. SAMMY is `8.2.b4` from RNSD/SAMMY
 commit `c974c02c`; each SAMMY file records the executable's MD5.
 
+Checks 1 and 3 run in the nightly workflow. Check 2 does not: it needs about
+100 GB of memory, and a GitHub-hosted runner has 7 to 16 GB. Run check 2 on an
+analysis server after a change to the pulse, the flight-time grid or the
+counts model, and before a release:
+
+```sh
+RAYON_NUM_THREADS=24 cargo test -p nereids-pipeline --lib -- --ignored --nocapture counts_check::check2_counts_match_the_independent_fold
+```
+
+It takes about 22 minutes on 24 threads and about 100 minutes on 4. Most of
+the memory holds the derivatives of each grid point's bin probabilities with
+respect to the pulse numbers, on the finest grid: 71,921 points by 15,172 bins.
+
 | File | Content |
 |---|---|
 | `p1a_rpi_alpha2.txt`, `p1a_rpi_alpha2_eps.txt` | Check 1: SAMMY free-gas transmission with the RPI prompt term over the 4.280412 eV window, at 299–301 and 1099–1101 K in ½ K steps, and its change from NXTRA 29 to 99. |
